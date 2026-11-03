@@ -6,7 +6,7 @@ import { MessageFunction, MessageProperties } from "./delebot/slack/events.ts";
 export const ReplyWorkflow = DefineWorkflow({
   callback_id: WORKFLOW_ID,
   title: "DeleBot replies",
-  description: "Respond to mentions and direct messages",
+  description: "Create and find tasks from mentions and direct messages",
   input_parameters: {
     properties: MessageProperties,
     required: ["channel_id", "channel_type", "user_id", "message_ts"],

@@ -17,12 +17,34 @@ Deno.test("manifest targets Slack hosting and allows people to send DMs", () => 
     const scope of [
       "chat:write",
       "channels:history",
+      "channels:read",
       "groups:history",
+      "groups:read",
       "im:read",
+      "im:write",
       "users:read",
+      "usergroups:read",
+      "datastore:read",
+      "datastore:write",
     ]
   ) {
     if (!scopes.includes(scope)) throw new Error(`Missing required scope: ${scope}`);
+  }
+  if (!manifest.datastores?.tasks) throw new Error("Task datastore must be registered");
+  if (!manifest.datastores?.assignment_notifications) {
+    throw new Error("Assignment notification datastore must be registered");
+  }
+  const attributes = manifest.datastores.tasks.attributes;
+  for (
+    const field of [
+      "priority",
+      "thread_ts",
+      "applied_events",
+      "assignment_events",
+      "deleted",
+    ]
+  ) {
+    if (!(field in attributes)) throw new Error(`Missing task field: ${field}`);
   }
 });
 
