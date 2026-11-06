@@ -1,5 +1,57 @@
 # DeleBot
 
+Replies that edit or respond to a task in its thread now give a short confirmation; the
+existing task cards refresh automatically. Use `print` in that thread, or `123 print`
+elsewhere, to show the complete task again. Delegations display as one chain, e.g.
+`@alice ↪️ Delegated → @james ⏳ Pending`, instead of repeating the recipient separately.
+The all-users display label is **All**; the command value remains `all`.
+
+Displayed task cards refresh after edits, assignment responses and completion. Cards
+already posted in other task threads or list results are updated in place; deleted tasks
+are marked deleted, and copies lose visibility when the viewer's access is removed.
+Previously posted single-task DM cards can be recovered from saved conversation context.
+Task numbers are also stored as exact text to prevent long references being rounded by
+Slack's numeric storage. Restart the local app to register `task_displays` and the
+`number_text` field. If Slack cannot refresh a copy, DeleBot reports the incomplete
+refresh rather than treating it as a successful update of every message.
+
+Empty task fields display blank values. Access displays `all` for everyone; Created by
+continues to show the creator. Creating, editing or looking up one task starts or
+continues a reply thread. Collection lists such as `ls me` send task-picker messages in
+the main DM.
+
+Task cards now show **Access** (the editing access field), regular links, **Jira** links,
+and **GitHub** links. The view-permissions field is omitted from cards. Existing stored
+visibility rules remain enforced for older restricted tasks.
+
+Use `jira https://jira.example/ABC-1`, `github https://github.com/org/repo/pull/1`, and
+`link https://example.com` independently. `edit jira URL` replaces Jira links;
+`delete jira github` clears those categories. `access @person @team` changes editing
+access; `access all` allows everyone who can view the task to edit it.
+
+Each task returned by `ls me`, `ls@username` (select the real person mention), or another
+list command arrives as a separate top-level DM message. Reply to a specific card to edit,
+delete, complete, accept, reject, or `delegate @person` / `delegate @team`. Personal
+commands without a selected task still require a number when several tasks were shown.
+Assignment states are ⏳ pending, ✅ accepted, ❌ rejected, and ↪️ delegated.
+Rejected/delegated people remain in the displayed history; each replacement starts a new
+pending invitation. The completion field is last and displays ✅ or ⬜.
+
+DM DeleBot directly, with no bot mention. `ls me` followed by `done` completes the task
+when exactly one task was shown. Replies in a task-list thread use that list's context;
+lists containing several tasks require a number (`123 done`) or `ls task Name` to select
+one. Permissions are checked again on each update. Task-picker lists appear in the main
+DM; other commands start or continue a thread.
+
+Type `teams` to list team handles, then enter `assign @alphateam`, `ls @alphateam`, or
+`access @alphateam` directly. This works without relying on the Slack composer's team
+autocomplete. Task cards use spaced fields, status emojis and a divider.
+
+Temporary development reset: `@DeleBot delete all` permanently clears the app's entire
+`tasks` and `assignment_notifications` databases, including hidden tasks and deleted-task
+records. Any human who can message the bot can run it; this is intended for development.
+Existing Slack messages and DMs remain. Send the command by itself without a task number.
+
 DeleBot creates and manages tasks from Slack mentions and individual DMs. Create a task
 with a name, then add its details in the same message or in replies to its thread. Task
 numbers are automatic and non-consecutive. Tasks persist in a Slack-hosted datastore.
@@ -19,7 +71,9 @@ A name is always required in the original creation command. This is enough to cr
 A new task is initially incomplete and unassigned unless assignees are provided.
 Description, priority, due date, and links can be left unset. The reply confirms the task
 and displays its current fields, including **Unassigned** and **Not set** where
-appropriate. Priorities display as a plain number, and links display their full URLs.
+appropriate. Priorities display as a plain number, and links display their full URLs. New
+tasks start with `viewPerms all` and `editPerms all`, so everyone can view and edit them
+until those fields are changed. Assignments and permissions are separate.
 
 Add any combination of named fields after the name:
 
@@ -31,17 +85,21 @@ Add any combination of named fields after the name:
 Select actual people and Slack user groups from the mention menu. People and teams can
 share the same assignment field. The supported fields are:
 
-| Command               | Meaning                                | Example                           |
-| --------------------- | -------------------------------------- | --------------------------------- |
-| `assign`              | Add people or teams to the assignees   | `assign @james @frontend`         |
-| `describe`            | Append description text                | `describe Review the open PRs`    |
-| `descibe`             | Accepted spelling alias for `describe` | `descibe Run my errands`          |
-| `description`         | Another alias for `describe`           | `description Read the proposal`   |
-| `p` or `priority`     | Set priority, 1 highest to 5 lowest    | `p 1`                             |
-| `due`                 | Set a UK day/month/year date           | `due 6/11/26`                     |
-| `due -`               | Clear the due date                     | `due -`                           |
-| `link` or `links`     | Add HTTP/HTTPS links                   | `link https://example.com/review` |
-| `done` or `work done` | Mark the task completed                | `done`                            |
+| Command               | Meaning                                        | Example                           |
+| --------------------- | ---------------------------------------------- | --------------------------------- |
+| `assign`              | Add people or teams to the assignees           | `assign @james @frontend`         |
+| `describe`            | Append description text                        | `describe Review the open PRs`    |
+| `descibe`             | Accepted spelling alias for `describe`         | `descibe Run my errands`          |
+| `description`         | Another alias for `describe`                   | `description Read the proposal`   |
+| `desc`                | Another alias for `describe`                   | `desc Review the proposal`        |
+| `p` or `priority`     | Set priority, 1 highest to 5 lowest            | `p 1`                             |
+| `due`                 | Set a UK day/month/year date                   | `due 6/11/26`                     |
+| `due -`               | Clear the due date                             | `due -`                           |
+| `link` or `links`     | Add HTTP/HTTPS links                           | `link https://example.com/review` |
+| `done` or `work done` | Mark the task completed                        | `done`                            |
+| `viewPerms`           | Replace the view permission list               | `viewPerms @james @frontend`      |
+| `editPerms`           | Replace the edit permission list               | `editPerms @frontend`             |
+| `perms match`         | Copy view permissions to edit permissions once | `perms match`                     |
 
 A task name is required even when every other field is supplied. The previous dotted field
 format has been replaced by these named commands.
@@ -69,10 +127,10 @@ update several fields at once, and its reply displays the complete current task 
 saving the changes. Conflicting repeated priority or due values are rejected; repeating
 the same value is accepted.
 
-The task creator and current assignees, including members of assigned teams, can update
-the task. If multiple tasks belong to the same thread, use a task number to select one.
-The bot will not guess which task to update. Creating a task inside an existing thread
-associates it with that thread's root.
+People allowed by both view and edit permissions can update the task. If multiple tasks
+belong to the same thread, use a task number to select one. The bot will not guess which
+task to update. Creating a task inside an existing thread associates it with that thread's
+root.
 
 Outside a task thread, prefix the update with its task number:
 
@@ -83,13 +141,51 @@ Outside a task thread, prefix the update with its task number:
 ```
 
 Use the actual number from the task confirmation or list. `done` is idempotent: marking an
-already completed task done keeps it completed. Reopening tasks is not a supported
-command.
+already completed task done keeps it completed. Use `edit completed no` to reopen it.
+
+## Replace or clear fields
+
+Use `edit` when a field should replace its current contents. It applies to all following
+fields in the same command:
+
+```text
+@DeleBot edit due 6/11/26 p 1 desc "New description"
+@DeleBot edit name "Review due dates" assign @alice link https://example.com/new
+@DeleBot 123 edit completed no
+```
+
+The assignment and link values following `edit` become the complete replacement lists.
+Repeated values of the same field within one command are combined and deduplicated;
+repeated descriptions form paragraphs. Without `edit`, assignments, links, and
+descriptions retain their additive behavior. Do not add and replace the same field in one
+command. Invalid commands apply no changes.
+
+Clear fields with `delete` followed by their names, without values:
+
+```text
+@DeleBot delete due p desc
+@DeleBot 123 delete links assignees
+@DeleBot delete completed
+```
+
+Clearing links, assignments, and description empties them; clearing priority or due date
+unsets it; clearing completed reopens the task. Clearing `viewPerms` or `editPerms` resets
+that permission to `all`. A task must retain a name: rename it with `edit name`. Send
+field clears separately from other changes.
 
 Delete a task from its thread with `@DeleBot delete`, or select it elsewhere with
-`@DeleBot 123 delete`. The creator and current assignees can delete a task. DeleBot
+`@DeleBot 123 delete`. View and edit permission are required to delete a task. DeleBot
 replies in the original thread with a confirmation; deleted tasks no longer appear in
-lists. Send `delete` on its own, without other field changes in the same command.
+lists. Bare `delete` removes the whole task; `delete` followed by field names clears only
+those fields.
+
+## Access
+
+`access @person @team` replaces editing access; `access all` grants editing access to all
+viewers. `edit access @person` works too; `delete access` resets editing access to all.
+Teams and people can be combined. Old `editPerms` commands remain compatible. The
+view-permissions field is omitted from task cards and current help. Existing stored
+visibility restrictions are retained so older private tasks are not silently published.
 
 ## Parsing names and descriptions
 
@@ -148,8 +244,8 @@ Combine filters to require every condition: `ls 1 soon` means your priority 1 ta
 soon. An explicit person or team replaces the implicit personal target, so
 `ls @james soon` means James's tasks due soon, and `ls team 1 soon` means priority 1 tasks
 assigned to any of your teams and due soon. Assignee filters never grant access to another
-person's private tasks. Unassigned tasks can appear in bare `ls` for their creator, but do
-not match personal or team assignment filters.
+person's private tasks. Unassigned tasks can appear in bare `ls` when view permission
+allows, but do not match personal or team assignment filters.
 
 `soon` uses London calendar dates, including today and the following three days. You can
 also write priority as `ls (1)` or `ls p1`, and an exact date as `ls (6/11/26)` or
@@ -164,42 +260,60 @@ defaults as their short forms.
 
 Use `@DeleBot task ?` for full creation and update instructions, `@DeleBot ?` for general
 usage, or `@DeleBot ls ?` for list commands. `ls tasks ?` and `tasks ls ?` are equivalent.
-Help replies appear in the original thread without querying task storage or team
-membership.
+General and creation help replies appear in the original thread; list help arrives by DM.
+Help does not query task storage or team membership.
 
 ## Assignment notifications and access
 
-Newly assigned people receive a private message from DeleBot after the task has been
-saved. Assigning a team notifies its current members, with overlapping people
-deduplicated. Assigning `all` shares a task with everyone without broadcasting assignment
-DMs to the workspace. Existing assignees are not notified again merely because another
-field changes. Notification delivery state is saved separately so a retry can resume
-failed deliveries. A task can be saved even if Slack cannot deliver one of its assignment
-notifications. A later authorized task update also retries saved, undelivered assignment
-notifications.
+Newly assigned people who have view permission receive a private message from DeleBot
+after the task has been saved. Assigning a team notifies its current members who can view
+the task, with overlapping people deduplicated. Assigning `all` marks everyone as an
+assignee without changing permissions or broadcasting assignment DMs to the workspace.
+Existing assignees are not notified again merely because another field changes.
+Notification delivery state is saved separately so a retry can resume failed deliveries. A
+task can be saved even if Slack cannot deliver one of its assignment notifications. A
+later authorized task update also retries saved, undelivered assignment notifications.
+
+Assignment invitations include **Accept**, **Reject**, and **Reassign** buttons:
+
+- **Accept** marks your invitation as accepted in that DM.
+- **Reject** deletes your invitation DM and removes your direct user assignment. If you
+  received it through a team assignment, the team remains assigned to the task.
+- **Reassign** opens a modal with a Slack people picker and an optional teams field. Enter
+  team handles such as `@frontend` or paste Slack user-group mentions. Choose at least one
+  person or team, up to 20 combined. Reassignment requires both view and edit permission.
+  Direct recipients must already have view permission; reassignment does not grant it.
+  Your invitation is updated to show its delegation, and eligible new assignees receive
+  their own invitations.
+
+Each invitation belongs to its recipient. DeleBot checks current task permissions and
+assignment membership again when a button is used. Button availability depends on the
+Slack workflow execution lifetime; use the task's thread or its number if controls are no
+longer available.
 
 Creation and update replies stay in the original thread. In channels, private task details
 are shown only to the requesting user in the thread, following an acknowledgement
 containing no task details. These private replies can disappear after Slack is reloaded.
-Tasks shared with `all` receive ordinary thread replies. List results are always delivered
-by DM. The original commands remain visible to anyone who can read the channel; use a DM
-when entering private details. Task access does not grant access to linked Slack messages
-or documents.
+Tasks whose view permission is `all` receive ordinary thread replies. List results are
+always delivered by DM. The original commands remain visible to anyone who can read the
+channel; use a DM when entering private details. Task access does not grant access to
+linked Slack messages or documents.
 
-The creator can access new tasks after delegation. Named assignees can access tasks
-directly, and team members can access tasks assigned to their current groups. Every list
-and individual lookup enforces visibility before showing fields. Group membership is
-freshly verified, including direct group membership lookup when Slack's group discovery
-omits a selected or saved group. Failed verification grants no team access. On a
-membership lookup failure, directly assigned tasks and shared tasks can still be shown
-with a notice that team results are hidden.
+Every list, lookup, update, deletion, and assignment notification enforces view
+permissions before showing fields. Updates and deletion additionally require edit
+permission. Group membership is freshly verified, including direct group membership lookup
+when Slack's group discovery omits a selected or saved group. Failed verification grants
+no group-based access. On a membership lookup failure, explicitly named viewers and tasks
+with view permission `all` can still be shown with a notice that team results are hidden.
 
 ## Existing tasks and persistence
 
 Existing records retain their task numbers, assignments, and visibility. Old urgency
 values are read as priority, and missing thread references fall back to the original
 creation message. Unset optional fields display **Not set**. Datastore fields are added
-without changing existing attribute types or deleting old task records.
+without changing existing attribute types or deleting old task records. Legacy tasks
+display **Existing task access** for unset permission fields; this preserves their
+previous access rules instead of silently sharing old private data.
 
 The source channel and creation-message timestamp form a task's storage key, so replaying
 the same creation event does not create a second task. Thread updates retain their event
@@ -231,12 +345,12 @@ delebot/
     messages.ts                # Command help, task details, batched task lists
     teams.ts                   # Fresh Slack user-group membership checks
     notifications.ts           # Assignment DMs and durable delivery state
-    actions.ts                 # Future button/modal handlers
+    actions.ts                 # Assignment invitation button and modal handlers
   tasks/
     models.ts                  # Task fields, priority, and lookup filters
-    access.ts                  # Team and legacy-task visibility rules
+    access.ts                  # View/edit permission checks and legacy visibility
     commands.ts                # Explicit task and list command parsing
-    service.ts                 # Automatic numbering, creation, task filtering
+    service.ts                 # Creation, edits, permissions, and task filtering
     repository.ts              # Datastore reads/writes and paginated queries
   ai/
     client.ts                  # Optional future integration

@@ -2,6 +2,8 @@ import { Manifest } from "deno-slack-sdk/mod.ts";
 import ReplyWorkflow from "./app.ts";
 import { APP_NAME } from "./delebot/config.ts";
 import { TasksDatastore } from "./delebot/db.ts";
+import { DmContextsDatastore } from "./delebot/slack/dm_context.ts";
+import { TaskDisplaysDatastore } from "./delebot/slack/task_displays.ts";
 import { AssignmentNotificationsDatastore } from "./delebot/slack/notifications.ts";
 
 export default Manifest({
@@ -15,7 +17,12 @@ export default Manifest({
     },
   },
   workflows: [ReplyWorkflow],
-  datastores: [TasksDatastore, AssignmentNotificationsDatastore],
+  datastores: [
+    TasksDatastore,
+    AssignmentNotificationsDatastore,
+    DmContextsDatastore,
+    TaskDisplaysDatastore,
+  ],
   outgoingDomains: [],
   botScopes: [
     "commands",

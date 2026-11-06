@@ -1,9 +1,17 @@
 import { TasksDatastore } from "../db.ts";
-import { canAccessTask, isTaskAssignees, isTaskTeams } from "./access.ts";
+import { taskNumber } from "./service.ts";
+import {
+  canAccessTask,
+  isTaskAssignees,
+  isTaskPermissions,
+  isTaskTeams,
+} from "./access.ts";
 import type { Task, TaskAccess } from "./models.ts";
 
 export interface TaskRepository {
   findBySource(channelId: string, messageTs: string): Promise<Task | null>;
+  /** Internal lookup; callers must check current task permissions before displaying data. */
+  findById(id: string): Promise<Task | null>;
   findInThread(channelId: string, threadTs: string): Promise<Task[]>;
   save(task: Task): Promise<void>;
   delete(task: Task): Promise<void>;
@@ -56,6 +64,16 @@ function isDate(value: unknown): value is string {
 
 /** Reject malformed rows instead of silently dropping tasks or presenting partial data. */
 function fromRecord(row: Record<string, unknown>): Task {
+  if (!Number.isSafeInteger(row.number) || (row.number as number) < 1) {
+    throw new Error("Task datastore contains an invalid record.");
+  }
+  if (row.number_text !== undefined) {
+    if (
+      typeof row.number_text !== "string" || !/^[1-9][0-9]*$/.test(row.number_text) ||
+      !Number.isSafeInteger(Number(row.number_text))
+    ) throw new Error("Invalid task number.");
+    row = { ...row, number: Number(row.number_text) };
+  }
   // Existing rows predate team visibility; keep them private to their creator.
   const teams = row.teams === undefined ? [] : row.teams;
   const assignmentBased = row.assignment_version === 2;
@@ -81,11 +99,15 @@ function fromRecord(row: Record<string, unknown>): Task {
         (priority as number) > 5)) ||
     typeof row.description !== "string" ||
     !stringArray(row.links) || !stringArray(row.assignees) ||
+    (row.jira_links !== undefined && !stringArray(row.jira_links)) ||
+    (row.github_links !== undefined && !stringArray(row.github_links)) ||
     (assignmentBased && !isTaskAssignees(assignees)) ||
     (row.assignment_version !== undefined && !assignmentBased) ||
     (row.assigned_to !== undefined && !assignmentBased) ||
     typeof completed !== "boolean" ||
     (row.deleted !== undefined && typeof row.deleted !== "boolean") ||
+    (row.view_perms !== undefined && !isTaskPermissions(row.view_perms)) ||
+    (row.edit_perms !== undefined && !isTaskPermissions(row.edit_perms)) ||
     (row.thread_ts !== undefined &&
       (typeof row.thread_ts !== "string" || !row.thread_ts.trim())) ||
     !isTaskTeams(teams) ||
@@ -113,10 +135,25 @@ function fromRecord(row: Record<string, unknown>): Task {
     number: row.number as number,
     name: row.name as string,
     links: [...row.links],
+    ...(row.jira_links === undefined
+      ? {}
+      : { jiraLinks: [...row.jira_links as string[]] }),
+    ...(row.github_links === undefined
+      ? {}
+      : { githubLinks: [...row.github_links as string[]] }),
+    ...(row.assignment_responses === undefined
+      ? {}
+      : { assignmentResponses: parseResponses(row.assignment_responses) }),
     assignees: [...assignees as string[]],
     assignmentBased,
     completed,
     ...(row.deleted === undefined ? {} : { deleted: row.deleted as boolean }),
+    ...(row.view_perms === undefined
+      ? {}
+      : { viewPerms: [...row.view_perms as string[]] }),
+    ...(row.edit_perms === undefined
+      ? {}
+      : { editPerms: [...row.edit_perms as string[]] }),
     description: row.description as string,
     dueDate: dueDate as string | null,
     priority: priority as Task["priority"],
@@ -136,6 +173,33 @@ function fromRecord(row: Record<string, unknown>): Task {
       : { assignmentEvents: parseAssignmentEvents(row.assignment_events) }),
     status: row.status as Task["status"],
   };
+}
+
+async function restoreLegacyNumber(
+  row: Record<string, unknown>,
+  task: Task,
+): Promise<Task> {
+  if (row.number_text === undefined && task.number > 1_000_000_000_000) {
+    const original = await taskNumber(task.channelId, task.messageTs);
+    if (Math.abs(original - task.number) < 1000) task.number = original;
+  }
+  return task;
+}
+
+function parseResponses(value: unknown): NonNullable<Task["assignmentResponses"]> {
+  if (typeof value !== "string") throw new Error("Invalid assignment responses.");
+  const parsed = JSON.parse(value);
+  if (
+    !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+    !Object.entries(parsed).every(([id, raw]) => {
+      const entry = raw as { status?: unknown; delegatedTo?: unknown };
+      return /^[UWS][A-Z0-9]+$/.test(id) && entry && typeof entry === "object" &&
+        ["pending", "accepted", "rejected", "delegated"].includes(
+          entry.status as string,
+        ) && (entry.delegatedTo === undefined || isTaskAssignees(entry.delegatedTo));
+    })
+  ) throw new Error("Invalid assignment responses.");
+  return parsed;
 }
 
 function parseAppliedEvents(value: unknown): string[] {
@@ -161,14 +225,22 @@ function toRecord(task: Task): Record<string, unknown> {
   return {
     id: task.id,
     number: task.number,
+    number_text: String(task.number),
     name: task.name,
     links: task.links,
+    ...(task.jiraLinks === undefined ? {} : { jira_links: task.jiraLinks }),
+    ...(task.githubLinks === undefined ? {} : { github_links: task.githubLinks }),
+    ...(task.assignmentResponses === undefined
+      ? {}
+      : { assignment_responses: JSON.stringify(task.assignmentResponses) }),
     assignees: task.assignees.filter((id) => /^[UW]/.test(id)),
     ...(task.assignmentBased
       ? { assigned_to: task.assignees, assignment_version: 2 }
       : {}),
     completed: task.completed,
     ...(task.deleted === undefined ? {} : { deleted: task.deleted }),
+    ...(task.viewPerms === undefined ? {} : { view_perms: task.viewPerms }),
+    ...(task.editPerms === undefined ? {} : { edit_perms: task.editPerms }),
     description: task.description,
     due_date: task.dueDate ?? "",
     ...(task.priority === null
@@ -201,8 +273,13 @@ export class SlackTaskRepository implements TaskRepository {
         datastore: TasksDatastore.name,
         // Slack's datastore adapter rejects an empty ExpressionAttributeValues
         // map, including for attribute_exists alone. Bind a real size threshold.
-        expression: "attribute_exists(#teams) AND size(#teams) >= :zero",
-        expression_attributes: { "#teams": "teams" },
+        expression:
+          "(attribute_exists(#teams) AND size(#teams) >= :zero) OR (attribute_exists(#view) AND size(#view) >= :zero) OR (attribute_exists(#edit) AND size(#edit) >= :zero)",
+        expression_attributes: {
+          "#teams": "teams",
+          "#view": "view_perms",
+          "#edit": "edit_perms",
+        },
         expression_values: { ":zero": 0 },
         limit: 100,
         ...(cursor ? { cursor } : {}),
@@ -214,11 +291,18 @@ export class SlackTaskRepository implements TaskRepository {
       }
       for (const row of result.items) {
         if (row.deleted === true) continue;
-        if (row.teams === undefined) continue;
-        if (!isTaskTeams(row.teams)) {
-          throw new TaskReferenceError("Invalid task team policy.");
+        for (
+          const [field, valid] of [["teams", isTaskTeams], [
+            "view_perms",
+            isTaskPermissions,
+          ], ["edit_perms", isTaskPermissions]] as const
+        ) {
+          if (row[field] === undefined) continue;
+          if (!valid(row[field])) {
+            throw new TaskReferenceError("Invalid task team policy.");
+          }
+          for (const id of row[field] as string[]) if (/^S/.test(id)) teams.add(id);
         }
-        for (const id of row.teams) if (id !== "all") teams.add(id);
       }
       cursor = result.next_cursor || result.response_metadata?.next_cursor || undefined;
       if (cursor && cursors.has(cursor)) {
@@ -238,11 +322,17 @@ export class SlackTaskRepository implements TaskRepository {
       throw new Error(`Cannot read task: ${result.error ?? "unknown_error"}`);
     }
     if (!result.item || Object.keys(result.item).length === 0) return null;
-    const task = fromRecord(result.item);
+    const task = await restoreLegacyNumber(result.item, fromRecord(result.item));
     if (task.channelId !== channelId || task.messageTs !== messageTs) {
       throw new Error("Task datastore returned a task from another message.");
     }
     return task;
+  }
+
+  async findById(id: string): Promise<Task | null> {
+    const match = /^([^:]+):([^:]+)$/.exec(id);
+    if (!match) throw new Error("Invalid task reference.");
+    return await this.findBySource(match[1], match[2]);
   }
 
   async findInThread(channelId: string, threadTs: string): Promise<Task[]> {
@@ -267,7 +357,7 @@ export class SlackTaskRepository implements TaskRepository {
         throw new Error("Cannot find tasks in this thread.");
       }
       for (const row of result.items) {
-        const task = fromRecord(row);
+        const task = await restoreLegacyNumber(row, fromRecord(row));
         if (!task.deleted && task.channelId === channelId && task.threadTs === threadTs) {
           tasks.push(task);
         }
@@ -303,17 +393,19 @@ export class SlackTaskRepository implements TaskRepository {
       ":user": access.userId,
       ":version": 2,
     };
-    const permissions = [
+    const legacyPermissions = [
       "contains(#teams, :all)",
       "(#version = :version AND contains(#assigned, :user))",
       "(#version = :version AND #creator = :user)",
     ];
+    const viewingPermissions = ["contains(#view, :all)", "contains(#view, :user)"];
     for (const [index, team] of [...new Set(access.teamIds)].entries()) {
       const parameter = `:team${index}`;
       expressionValues[parameter] = team;
-      permissions.push(`contains(#teams, ${parameter})`);
+      legacyPermissions.push(`contains(#teams, ${parameter})`);
+      viewingPermissions.push(`contains(#view, ${parameter})`);
     }
-    permissions.push(
+    legacyPermissions.push(
       "((attribute_not_exists(#teams) OR size(#teams) = :zero) AND #creator = :user)",
     );
     const tasks: Task[] = [];
@@ -322,12 +414,15 @@ export class SlackTaskRepository implements TaskRepository {
     do {
       const result = await this.client.apps.datastore.query({
         datastore: TasksDatastore.name,
-        expression: permissions.join(" OR "),
+        expression: `(${
+          viewingPermissions.join(" OR ")
+        }) OR (attribute_not_exists(#view) AND (${legacyPermissions.join(" OR ")}))`,
         expression_attributes: {
           "#teams": "teams",
           "#creator": "created_by",
           "#version": "assignment_version",
           "#assigned": "assigned_to",
+          "#view": "view_perms",
         },
         expression_values: expressionValues,
         limit: 100,
@@ -340,7 +435,7 @@ export class SlackTaskRepository implements TaskRepository {
         throw new Error("Task datastore returned an invalid task list.");
       }
       for (const row of result.items) {
-        const task = fromRecord(row);
+        const task = await restoreLegacyNumber(row, fromRecord(row));
         // Enforce the policy locally too, regardless of server-side filtering.
         if (canAccessTask(task, access)) tasks.push(task);
       }

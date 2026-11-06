@@ -245,3 +245,22 @@ Deno.test("active groups with a shared-section flag use authoritative membership
   const result = await directory.load("UJAMES", "TWORKSPACE", ["SALPHA"]);
   assert(result.access.teamIds.includes("SALPHA"));
 });
+
+Deno.test("DM team discovery resolves flagged handles only after membership verification", async () => {
+  const { directory, client } = fixture([
+    group("SALPHA", ["UJAMES"], {
+      handle: "alphateam",
+      is_section: true,
+      is_usergroup: false,
+    }),
+  ]);
+  client.usergroups.users.list = () => Promise.resolve({ ok: true, users: ["UJAMES"] });
+  const result = await directory.load("UJAMES", "TWORKSPACE", [], true);
+  assert(
+    result.teamNames.SALPHA === "alphateam" && result.knownTeamIds.includes("SALPHA"),
+  );
+  client.usergroups.users.list = () =>
+    Promise.resolve({ ok: false, error: "usergroup_not_found" });
+  const absent = await directory.load("UJAMES", "TWORKSPACE", [], true);
+  assert(!absent.teamNames.SALPHA && !absent.knownTeamIds.includes("SALPHA"));
+});

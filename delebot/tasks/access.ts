@@ -6,9 +6,15 @@ export function isTaskAssignees(value: unknown): value is string[] {
     (!value.includes("all") || value.length === 1);
 }
 
+export const isTaskPermissions = isTaskAssignees;
+
 export function isPublicTask(
-  task: Pick<Task, "teams" | "assignees" | "assignmentBased">,
+  task: Pick<Task, "teams" | "assignees" | "assignmentBased" | "viewPerms">,
 ): boolean {
+  if (task.viewPerms !== undefined) {
+    return isTaskAssignees(task.viewPerms) && task.viewPerms.length === 1 &&
+      task.viewPerms[0] === "all";
+  }
   return task.assignmentBased
     ? task.assignees.length === 1 && task.assignees[0] === "all"
     : task.teams.length === 1 && task.teams[0] === "all";
@@ -21,30 +27,71 @@ export function isTaskTeams(value: unknown): value is string[] {
   return value.every((team) => typeof team === "string" && /^S[A-Z0-9]+$/.test(team));
 }
 
-/** New tasks allow their creator and assignees; legacy tasks retain their team policy. */
-export function canAccessTask(
-  task:
-    & Pick<Task, "teams" | "createdBy">
-    & Partial<Pick<Task, "assignees" | "assignmentBased" | "deleted">>,
-  access: TaskAccess,
-): boolean {
-  if (
-    task.deleted || !access || typeof access.userId !== "string" || !access.userId ||
-    !Array.isArray(access.teamIds)
-  ) return false;
-  if (task.assignmentBased) {
-    if (!isTaskAssignees(task.assignees)) return false;
-    if (task.createdBy === access.userId) return true;
-    if (task.assignees.includes("all")) return task.assignees.length === 1;
-    return task.assignees.some((id) =>
-      id === access.userId ||
+type AccessTask =
+  & Pick<Task, "teams" | "createdBy">
+  & Partial<
+    Pick<Task, "assignees" | "assignmentBased" | "deleted" | "viewPerms" | "editPerms">
+  >;
+
+function validAccess(access: TaskAccess): boolean {
+  return !!access && typeof access.userId === "string" && !!access.userId &&
+    Array.isArray(access.teamIds);
+}
+
+function matches(policy: unknown, access: TaskAccess): boolean {
+  return isTaskAssignees(policy) &&
+    policy.some((id) =>
+      id === "all" || id === access.userId ||
       (/^S/.test(id) && access.teamIds.includes(id))
     );
+}
+
+/** The legacy policy is retained until that specific permission is configured. */
+export function effectiveTaskViewPerms(task: AccessTask): string[] {
+  if (task.deleted) return [];
+  if (task.viewPerms !== undefined) {
+    return isTaskAssignees(task.viewPerms) ? [...task.viewPerms] : [];
   }
-  const teams = task.teams;
-  if (teams === undefined || (Array.isArray(teams) && teams.length === 0)) {
-    return task.createdBy === access.userId;
+  if (task.assignmentBased) {
+    if (!isTaskAssignees(task.assignees)) return [];
+    if (task.assignees.includes("all")) return ["all"];
+    return [...new Set([task.createdBy, ...task.assignees])];
   }
-  if (!isTaskTeams(teams)) return false;
-  return teams[0] === "all" || teams.some((team) => access.teamIds.includes(team));
+  if (task.teams === undefined || (Array.isArray(task.teams) && !task.teams.length)) {
+    return [task.createdBy];
+  }
+  return isTaskTeams(task.teams) ? [...task.teams] : [];
+}
+
+/** Explicit permissions do not grant implicit access to creators or assignees. */
+export function canAccessTask(task: AccessTask, access: TaskAccess): boolean {
+  if (task.deleted || !validAccess(access)) return false;
+  return matches(effectiveTaskViewPerms(task), access);
+}
+
+export const canViewTask = canAccessTask;
+
+export function canEditTask(task: AccessTask, access: TaskAccess): boolean {
+  if (!canAccessTask(task, access)) return false;
+  if (task.editPerms !== undefined) return matches(task.editPerms, access);
+  // View configuration does not broaden an unchanged legacy editing policy.
+  return matches(effectiveTaskViewPerms({ ...task, viewPerms: undefined }), access);
+}
+
+/** Group discovery must include permission principals as well as assignees. */
+export function taskReferencedTeamIds(
+  task: Partial<Pick<Task, "teams" | "assignees" | "viewPerms" | "editPerms">>,
+): string[] {
+  return [
+    ...new Set(
+      [
+        task.teams,
+        task.assignees,
+        task.viewPerms,
+        task.editPerms,
+      ].flatMap((ids) => Array.isArray(ids) ? ids : []).filter((id) =>
+        typeof id === "string" && /^S[A-Z0-9]+$/.test(id)
+      ),
+    ),
+  ];
 }

@@ -1,5 +1,11 @@
-import { canAccessTask, isTaskAssignees } from "./access.ts";
-import type { TaskPatch } from "./commands.ts";
+import {
+  canAccessTask,
+  canEditTask,
+  effectiveTaskViewPerms,
+  isTaskAssignees,
+  isTaskPermissions,
+} from "./access.ts";
+import type { ClearField, TaskPatch, TaskSet } from "./commands.ts";
 import type { Task, TaskAccess, TaskInput, TaskQuery } from "./models.ts";
 import type { TaskRepository } from "./repository.ts";
 
@@ -65,9 +71,24 @@ function validate(input: TaskInput) {
       date.toISOString().slice(0, 10) !== input.dueDate
     ) throw new TaskCommandError("Use a valid due date.");
   }
+  for (const links of [input.jiraLinks ?? [], input.githubLinks ?? []]) {
+    if (
+      links.length > 10 ||
+      links.some((url) => url.length > 1000 || !/^https?:\/\//i.test(url))
+    ) throw new TaskCommandError("Use up to 10 valid HTTP(S) links in each link field.");
+  }
+  for (const policy of [input.viewPerms, input.editPerms]) {
+    if (policy !== undefined && !isTaskPermissions(policy)) {
+      throw new TaskCommandError(
+        "Choose people or teams for permissions, or use all on its own.",
+      );
+    }
+  }
 }
 export async function createTask(
-  draft: Pick<TaskInput, "name"> & Partial<Omit<TaskInput, "name">>,
+  draft: Pick<TaskInput, "name"> & Partial<Omit<TaskInput, "name">> & {
+    matchPerms?: boolean;
+  },
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
@@ -90,12 +111,24 @@ export async function createTask(
   const input: TaskInput = {
     name: draft.name.trim(),
     links: [...new Set(draft.links ?? [])],
+    jiraLinks: [...new Set(draft.jiraLinks ?? [])],
+    githubLinks: [...new Set(draft.githubLinks ?? [])],
     assignees: [...new Set(draft.assignees ?? [])],
     description: draft.description ?? "",
     dueDate: draft.dueDate ?? null,
     priority: draft.priority ?? null,
     completed: draft.completed ?? false,
+    viewPerms: draft.viewPerms === undefined ? ["all"] : [...new Set(draft.viewPerms)],
+    editPerms: draft.editPerms === undefined ? ["all"] : [...new Set(draft.editPerms)],
   };
+  if (draft.matchPerms) {
+    if (draft.editPerms !== undefined) {
+      throw new TaskCommandError(
+        "Use perms match without setting edit permissions in the same command.",
+      );
+    }
+    input.editPerms = [...input.viewPerms!];
+  }
   validate(input);
   const key = mutationKey(context);
   const task: Task = {
@@ -150,13 +183,48 @@ export async function updateTask(
   repository: TaskRepository,
   access: TaskAccess,
 ): Promise<{ task: Task; updated: boolean }> {
-  if (context.userId !== access.userId || !canAccessTask(task, access)) {
-    throw new TaskAccessError(
-      "Only the creator or current assignees can update this task.",
-    );
+  if (context.userId !== access.userId || !canEditTask(task, access)) {
+    throw new TaskAccessError("You need view and edit permission to update this task.");
   }
   const key = mutationKey(context);
   if (task.appliedEvents?.includes(key)) return { task, updated: false };
+  const replacements = patch.set ?? {};
+  const clears = new Set(patch.clear ?? []);
+  const defaults: Record<ClearField, unknown> = {
+    links: [],
+    jiraLinks: [],
+    githubLinks: [],
+    assignees: [],
+    description: "",
+    priority: null,
+    dueDate: null,
+    completed: false,
+    viewPerms: ["all"],
+    editPerms: ["all"],
+  };
+  for (const field of clears) {
+    if (!Object.hasOwn(defaults, field)) {
+      throw new TaskCommandError("A task name cannot be cleared.");
+    }
+    if (Object.hasOwn(patch, field) || Object.hasOwn(replacements, field)) {
+      throw new TaskCommandError("Set, add, or clear each field once per command.");
+    }
+  }
+  for (const field of Object.keys(replacements) as (keyof TaskSet)[]) {
+    if (field !== "name" && !Object.hasOwn(defaults, field)) {
+      throw new TaskCommandError("Choose a supported task field to edit.");
+    }
+    if (Object.hasOwn(patch, field)) {
+      throw new TaskCommandError("Do not combine adding and replacing the same field.");
+    }
+  }
+  if (
+    patch.matchPerms &&
+    (patch.editPerms !== undefined || replacements.editPerms !== undefined ||
+      clears.has("editPerms"))
+  ) {
+    throw new TaskCommandError("Use perms match without another edit permission change.");
+  }
   let assignees = task.assignees;
   if (patch.assignees !== undefined) {
     if (patch.assignees.length && !isTaskAssignees(patch.assignees)) {
@@ -175,6 +243,8 @@ export async function updateTask(
   const next: Task = {
     ...task,
     links: [...new Set([...task.links, ...patch.links ?? []])],
+    jiraLinks: [...new Set([...task.jiraLinks ?? [], ...patch.jiraLinks ?? []])],
+    githubLinks: [...new Set([...task.githubLinks ?? [], ...patch.githubLinks ?? []])],
     assignees,
     description: patch.description === undefined
       ? task.description
@@ -182,18 +252,47 @@ export async function updateTask(
     priority: patch.priority ?? task.priority,
     dueDate: patch.dueDate === undefined ? task.dueDate : patch.dueDate,
     completed: patch.completed ?? task.completed,
+    ...(patch.viewPerms === undefined
+      ? {}
+      : { viewPerms: [...new Set(patch.viewPerms)] }),
+    ...(patch.editPerms === undefined
+      ? {}
+      : { editPerms: [...new Set(patch.editPerms)] }),
     appliedEvents: [...task.appliedEvents ?? [], key],
   };
+  Object.assign(next, replacements);
+  if (replacements.assignees?.length === 0) next.assignees = [context.userId];
+  for (const field of clears) {
+    Object.assign(next, { [field]: structuredClone(defaults[field]) });
+  }
+  next.name = next.name.trim();
+  next.assignees = [...new Set(next.assignees)];
+  next.links = [...new Set(next.links)];
+  if (next.viewPerms !== undefined) next.viewPerms = [...new Set(next.viewPerms)];
+  if (next.editPerms !== undefined) next.editPerms = [...new Set(next.editPerms)];
+  if (patch.matchPerms) next.editPerms = effectiveTaskViewPerms(next);
   next.status = next.completed ? "completed" : "open";
-  if (patch.assignees !== undefined) {
+  const assignmentChanged = patch.assignees !== undefined ||
+    replacements.assignees !== undefined || clears.has("assignees");
+  if (assignmentChanged) {
+    if (!task.assignmentBased) {
+      if (next.viewPerms === undefined) next.viewPerms = effectiveTaskViewPerms(task);
+      if (next.editPerms === undefined) next.editPerms = effectiveTaskViewPerms(task);
+    }
     next.assignmentBased = true;
     next.teams = next.assignees.filter((id) => /^S/.test(id) || id === "all");
   }
   validate(next);
   const before = new Set([...task.assignees, ...task.teams]);
-  const newlyAssigned = patch.assignees === undefined
+  const newlyAssigned = !assignmentChanged
     ? []
     : next.assignees.filter((id) => !before.has(id));
+  next.assignmentResponses = clears.has("assignees")
+    ? {}
+    : { ...task.assignmentResponses };
+  for (const id of newlyAssigned) {
+    if (/^[UW]/.test(id)) next.assignmentResponses[id] = { status: "pending" };
+  }
   next.assignmentEvents = { ...task.assignmentEvents, [key]: newlyAssigned };
   await repository.save(next);
   return { task: next, updated: true };
@@ -205,12 +304,95 @@ export async function deleteTask(
   repository: TaskRepository,
   access: TaskAccess,
 ): Promise<void> {
-  if (context.userId !== access.userId || !canAccessTask(task, access)) {
-    throw new TaskAccessError(
-      "Only the creator or current assignees can delete this task.",
-    );
+  if (context.userId !== access.userId || !canEditTask(task, access)) {
+    throw new TaskAccessError("You need view and edit permission to delete this task.");
   }
   await repository.delete(task);
+}
+
+export type AssignmentDecision = {
+  kind: "accept" | "reject" | "delegate";
+  assignees?: string[];
+};
+
+/** An invitation recipient can respond without being an editor; delegation still edits the task. */
+export async function respondToAssignment(
+  task: Task,
+  decision: AssignmentDecision,
+  context: TaskContext,
+  repository: TaskRepository,
+  access: TaskAccess,
+): Promise<{ task: Task; updated: boolean }> {
+  if (context.userId !== access.userId || !canAccessTask(task, access)) {
+    throw new TaskAccessError("This assignment is not available to you.");
+  }
+  const key = mutationKey(context);
+  if (task.appliedEvents?.includes(key)) return { task, updated: false };
+  const assigned = task.assignees.includes(access.userId) ||
+    task.assignees.includes("all") ||
+    [...task.assignees, ...task.teams].some((id) =>
+      /^S/.test(id) && access.teamIds.includes(id)
+    );
+  if (!assigned) throw new TaskAccessError("You are no longer assigned this task.");
+  if (!["accept", "reject", "delegate"].includes(decision.kind)) {
+    throw new TaskCommandError("Choose accept, reject, or delegate.");
+  }
+  let assignees = [...task.assignees];
+  if (decision.kind === "reject" || decision.kind === "delegate") {
+    assignees = assignees.filter((id) => id !== access.userId);
+  }
+  if (decision.kind === "delegate") {
+    if (!canEditTask(task, access)) {
+      throw new TaskAccessError(
+        "You need view and edit permission to delegate this task.",
+      );
+    }
+    if (
+      !isTaskAssignees(decision.assignees) || !decision.assignees.length ||
+      decision.assignees.includes("all")
+    ) {
+      throw new TaskCommandError("Choose one or more people or teams to delegate to.");
+    }
+    if (decision.assignees.includes(access.userId)) {
+      throw new TaskCommandError("Choose another person or team to delegate to.");
+    }
+    if (assignees.includes("all")) assignees = [];
+    assignees = [...new Set([...assignees, ...decision.assignees])];
+  }
+  const changesAssignments = decision.kind !== "accept";
+  const next: Task = {
+    ...task,
+    assignmentResponses: {
+      ...task.assignmentResponses,
+      [access.userId]: {
+        status: decision.kind === "accept"
+          ? "accepted"
+          : decision.kind === "reject"
+          ? "rejected"
+          : "delegated",
+        ...(decision.kind === "delegate" ? { delegatedTo: decision.assignees } : {}),
+      },
+      ...Object.fromEntries(
+        (decision.assignees ?? []).map((id) => [id, { status: "pending" as const }]),
+      ),
+    },
+    assignees,
+    ...(changesAssignments && task.assignmentBased
+      ? { teams: assignees.filter((id) => /^S/.test(id) || id === "all") }
+      : {}),
+    appliedEvents: [...task.appliedEvents ?? [], key],
+    assignmentEvents: {
+      ...task.assignmentEvents,
+      [key]: decision.kind === "delegate"
+        ? assignees.filter((id) =>
+          !task.assignees.includes(id) && !task.teams.includes(id)
+        )
+        : [],
+    },
+  };
+  validate(next);
+  await repository.save(next);
+  return { task: next, updated: true };
 }
 
 function soonWindow(now: Date): { start: string; end: string } {

@@ -13,6 +13,7 @@ export interface TeamDirectory {
     userId: string,
     workspaceId?: string,
     referencedTeams?: string[],
+    discoverHandles?: boolean,
   ): Promise<TeamSnapshot>;
 }
 
@@ -97,6 +98,7 @@ export class SlackTeamDirectory implements TeamDirectory {
     requesterId: string,
     workspaceId?: string,
     referencedTeams: string[] = [],
+    discoverHandles = false,
   ): Promise<TeamSnapshot> {
     if (!userId(requesterId)) throw new Error("Cannot verify an invalid Slack user.");
     const result = await this.client.usergroups.list({
@@ -117,6 +119,7 @@ export class SlackTeamDirectory implements TeamDirectory {
     const teamNames: Record<string, string> = {};
     const seen = new Set<string>();
     const excluded = new Set<string>();
+    const candidateNames = new Map<string, string>();
     for (const group of result.usergroups) {
       if (!record(group)) return incomplete();
       if (
@@ -137,7 +140,13 @@ export class SlackTeamDirectory implements TeamDirectory {
       if (
         group.is_section === true ||
         (group.is_usergroup === false && group.is_subteam !== true)
-      ) continue;
+      ) {
+        if (discoverHandles && typeof group.handle === "string" && group.handle.trim()) {
+          referencedTeams = [...referencedTeams, group.id];
+          candidateNames.set(group.id, group.handle.trim());
+        }
+        continue;
+      }
       // Enterprise mentions may use enterprise_subteam_id while the workspace
       // API returns a local id. Both identify this same verified membership.
       const ids = [
@@ -200,6 +209,7 @@ export class SlackTeamDirectory implements TeamDirectory {
         return incomplete();
       }
       knownTeamIds.push(id);
+      if (candidateNames.has(id)) teamNames[id] = candidateNames.get(id)!;
       if (membership.users.includes(requesterId)) teamIds.push(id);
     }
     if (!knownTeamIds.length && workspaceId) {

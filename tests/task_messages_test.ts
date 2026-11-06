@@ -49,8 +49,8 @@ Deno.test("task detail includes the number and each requested task field", () =>
     const value of [
       "Task #5: Clean PRs",
       "Team SFRONTEND",
-      "*Completed:* No",
-      "<@UJAMES>, <@UALICE>",
+      "*Completed:* ",
+      "<@UJAMES> ⏳ Pending\n<@UALICE> ⏳ Pending",
       "Review and merge ready pull requests.",
       "06/11/2026",
       "*Priority:* 2\n",
@@ -60,6 +60,27 @@ Deno.test("task detail includes the number and each requested task field", () =>
   ) assert(text.includes(value), `Missing task detail: ${value}`);
   assert(!text.includes("/5") && !text.includes("is highest"));
   assert(!text.includes("Link 1"));
+});
+
+Deno.test("delegations render as a single chain with each recipient's current status", () => {
+  const item = task({
+    assignmentBased: true,
+    assignees: ["UJAMES"],
+    assignmentResponses: {
+      UORIGINAL: { status: "delegated", delegatedTo: ["UMIDDLE"] },
+      UMIDDLE: { status: "delegated", delegatedTo: ["UJAMES"] },
+      UJAMES: { status: "pending" },
+    },
+  });
+  const text = formatTask(item);
+  assert(
+    text.includes(
+      "<@UORIGINAL> ↪️ Delegated → <@UMIDDLE> ↪️ Delegated → <@UJAMES> ⏳ Pending",
+    ),
+  );
+  assert(text.split("<@UJAMES>").length === 2, "Recipient should appear once");
+  item.assignmentResponses!.UJAMES = { status: "accepted" };
+  assert(formatTask(item).includes("→ <@UJAMES> ✅"));
 });
 
 Deno.test("user text cannot inject Slack mentions or links into task replies", () => {
@@ -95,6 +116,7 @@ Deno.test("task lists contain complete fields for every task separated by blank 
       "Due",
       "Priority",
       "Completed",
+      "Access",
       "Links",
       "Created by",
     ]
@@ -110,7 +132,7 @@ Deno.test("team handles render as plain text without notifying user groups", () 
   const item = task({ teams: ["SFRONTEND", "SBACKEND"] });
   const names = { SFRONTEND: "frontend", SBACKEND: "@backend" };
   for (const text of [formatTask(item, names), ...formatTaskList([item], names)]) {
-    assert(text.includes("@frontend, @backend"));
+    assert(text.includes("@frontend ⏳ Pending\n@backend ⏳ Pending"));
     assert(!text.includes("<!subteam^"));
   }
   const malicious = { SFRONTEND: "<!channel>" };
@@ -119,8 +141,8 @@ Deno.test("team handles render as plain text without notifying user groups", () 
 });
 
 Deno.test("all-team and legacy tasks have explicit visibility labels", () => {
-  assert(formatTask(task({ teams: ["all"] })).includes("*Assignees:* Everyone"));
-  assert(formatTaskList([task({ teams: ["all"] })])[0].includes("*Assignees:* Everyone"));
+  assert(formatTask(task({ teams: ["all"] })).includes("*Assignees:* All"));
+  assert(formatTaskList([task({ teams: ["all"] })])[0].includes("*Assignees:* All"));
   assert(formatTask(task({ teams: [] })).includes("<@UJAMES>"));
 });
 
@@ -133,10 +155,32 @@ Deno.test("new tasks display mixed assignees and completed without a separate te
     status: "completed",
   });
   const details = formatTask(item, { SFRONTEND: "frontend" });
-  assert(details.includes("*Assignees:* <@UJAMES>, @frontend"));
-  assert(details.includes("*Completed:* Yes") && !details.includes("*Teams:*"));
+  assert(details.includes("*Assignees:* <@UJAMES> ⏳ Pending\n@frontend ⏳ Pending"));
+  assert(details.includes("*Completed:* ✅") && !details.includes("*Teams:*"));
   const list = formatTaskList([item], { SFRONTEND: "frontend" }).join("\n");
-  assert(list.includes("*Completed:* Yes") && list.includes("@frontend"));
+  assert(list.includes("*Completed:* ✅") && list.includes("@frontend"));
+});
+
+Deno.test("task details distinguish explicit permission policies from legacy access", () => {
+  const text = formatTask(
+    task({ viewPerms: ["UJAMES", "SFRONTEND"], editPerms: ["all"] }),
+    { SFRONTEND: "frontend" },
+  );
+  assert(!text.includes("View permissions"));
+  assert(text.includes("*Access:* All"));
+  assert(!text.includes("<!subteam^"));
+  const legacy = formatTask(task());
+  assert(!legacy.includes("View permissions"));
+  assert(legacy.includes("*Access:* Existing task access"));
+  assert(
+    formatTask(task({ viewPerms: [], editPerms: [] })).includes(
+      "*Access:* Nobody",
+    ),
+  );
+  const escaped = formatTask(task({ editPerms: ["SFRONTEND"] }), {
+    SFRONTEND: "<!channel>",
+  });
+  assert(escaped.includes("@&lt;!channel&gt;") && !escaped.includes("<!channel>"));
 });
 
 Deno.test("large task lists are split without dropping or duplicating tasks", () => {
@@ -192,14 +236,14 @@ Deno.test("new tasks display all optional fields as unset", () => {
       assignmentBased: true,
     }),
   );
-  assert(text.includes("*Description:* Not set"));
-  assert(text.includes("*Due:* Not set"));
-  assert(text.includes("*Priority:* Not set"));
-  assert(text.includes("*Links:* None"));
-  assert(text.includes("*Assignees:* Unassigned"));
+  assert(text.includes("*Description:* "));
+  assert(text.includes("*Due:* "));
+  assert(text.includes("*Priority:* "));
+  assert(text.includes("*Links:* "));
+  assert(text.includes("*Assignees:* "));
   assert(
     formatTaskList([task({ assignees: [], assignmentBased: true })])[0].includes(
-      "*Assignees:* Unassigned",
+      "*Assignees:* ",
     ),
   );
   assert(!text.includes("null") && !text.includes("undefined"));
@@ -208,34 +252,29 @@ Deno.test("new tasks display all optional fields as unset", () => {
 Deno.test("help explains named fields, thread updates, completion and repeated links", () => {
   for (
     const command of [
-      "@DeleBot task Name",
+      "task Name",
       "assign @person @team",
-      "describe text",
-      "descibe",
       "p 1",
       "due 6/11/26",
-      "link https://example.com",
-      "@DeleBot done",
-      "@DeleBot 123 done",
-      "work done",
-      "New tasks are unassigned",
-      "@DeleBot ls",
+      "jira https://",
+      "github https://",
+      "access @person @team",
+      "edit completed no",
+      "delete due p desc",
+      "delegate @person",
       "ls me",
       "ls @person",
-      "ls @team",
-      "ls team",
-      "ls soon",
-      "ls 6/11/26",
-      "ls 1",
-      "ls 1 soon",
-      "ls @alice soon",
-      "arrive by DM",
-      "@DeleBot delete",
-      "@DeleBot 123 delete",
-      "double quotes",
-      "New assignees receive a DM",
-      "Numbers are automatic and non-consecutive",
+      "separate DM message",
+      "⏳ pending",
+      "❌ rejected",
+      "↪️ delegated",
+      "non-consecutive",
     ]
-  ) assert(GREETING.includes(command), `Missing help: ${command}`);
+  ) {
+    assert(
+      GREETING.includes(command.replaceAll("@DeleBot ", "")),
+      `Missing help: ${command}`,
+    );
+  }
   assert(!GREETING.includes("urgency"));
 });

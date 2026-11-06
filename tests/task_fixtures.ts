@@ -2,7 +2,7 @@ import type { Task, TaskInput } from "../delebot/tasks/models.ts";
 import type { TaskRepository } from "../delebot/tasks/repository.ts";
 import type { TeamDirectory } from "../delebot/slack/teams.ts";
 import type { TaskAccess } from "../delebot/tasks/models.ts";
-import { canAccessTask } from "../delebot/tasks/access.ts";
+import { canAccessTask, taskReferencedTeamIds } from "../delebot/tasks/access.ts";
 
 export function assert(
   condition: unknown,
@@ -19,6 +19,8 @@ export const input: TaskInput = {
   dueDate: "2026-11-06",
   priority: 2,
   completed: false,
+  viewPerms: ["UCREATOR", "SFRONTEND"],
+  editPerms: ["UCREATOR", "SFRONTEND"],
 };
 
 export class MemoryTaskRepository implements TaskRepository {
@@ -28,9 +30,7 @@ export class MemoryTaskRepository implements TaskRepository {
   referencedTeamIds(): Promise<string[]> {
     return Promise.resolve([
       ...new Set(
-        [...this.rows.values()].flatMap((task) => task.teams).filter((id) =>
-          id !== "all"
-        ),
+        [...this.rows.values()].flatMap(taskReferencedTeamIds),
       ),
     ]);
   }
@@ -45,6 +45,10 @@ export class MemoryTaskRepository implements TaskRepository {
 
   findBySource(channelId: string, messageTs: string): Promise<Task | null> {
     return Promise.resolve(this.rows.get(`${channelId}:${messageTs}`) ?? null);
+  }
+
+  findById(id: string): Promise<Task | null> {
+    return Promise.resolve(this.rows.get(id) ?? null);
   }
 
   save(task: Task): Promise<void> {

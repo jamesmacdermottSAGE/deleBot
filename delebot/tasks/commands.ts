@@ -1,27 +1,46 @@
 import type { TaskQuery } from "./models.ts";
 
 export type Priority = 1 | 2 | 3 | 4 | 5;
+export interface TaskSet {
+  name?: string;
+  assignees?: string[];
+  description?: string;
+  priority?: Priority | null;
+  dueDate?: string | null;
+  links?: string[];
+  jiraLinks?: string[];
+  githubLinks?: string[];
+  completed?: boolean;
+  viewPerms?: string[];
+  editPerms?: string[];
+}
+export type ClearField = Exclude<keyof TaskSet, "name">;
 export interface TaskPatch {
   assignees?: string[];
   description?: string;
   priority?: Priority;
   dueDate?: string | null;
   links?: string[];
+  jiraLinks?: string[];
+  githubLinks?: string[];
   completed?: boolean;
+  viewPerms?: string[];
+  editPerms?: string[];
+  set?: TaskSet;
+  clear?: ClearField[];
+  matchPerms?: boolean;
 }
 
 export const TASK_CREATE_USAGE = [
-  "*Create:* `@DeleBot task Name` — a name is required; all other fields are optional.",
-  "New tasks start open and unassigned; description, priority, due date, and links start unset. Add or update fields in the task's thread.",
-  '*Example:* `@DeleBot task "Clean PRs" assign @james @frontend describe "Review open pull requests" p 1 due 6/11/26 link https://example.com/review`',
-  "Select real people or teams from Slack's @ menu. `assign` accepts people, teams, or both; `assign -` assigns yourself; `assign all` shares with everyone. To combine yourself with others, select your own @ mention.",
-  "*Fields:* `assign @person`, `describe text` (also `descibe`), `p 1` or `priority 1`, `due 6/11/26`, and `link https://…`. Priority 1 is highest, 5 lowest. Dates use day/month/year (two- or four-digit year). `due -` clears a due date.",
-  "Combine fields in any order. Repeat `assign` or `link` to add multiple values: `link https://a.example link https://b.example`. Repeated descriptions add paragraphs. Conflicting repeated priority or due values are rejected.",
-  'Quote names or descriptions containing command words, e.g. `task "Review due dates" describe "Please assign owners"`. Names can also use parentheses: `task (Clean PRs)`.',
-  "*In the task's thread:* `@DeleBot assign @james p 2 due 10/11/26`, `@DeleBot link https://example.com/another`, or `@DeleBot done`.",
-  "*By number:* `@DeleBot 123 done` or `@DeleBot 123 link https://example.com/another`. `work done` also marks completion.",
-  "*Delete:* `@DeleBot delete` in the task's thread, or `@DeleBot 123 delete`. Send delete on its own, without other changes.",
-  "DeleBot replies with the current task fields. Use a DM to enter private task details.",
+  "Use print in a task's thread to reprint its latest details, or 123 print elsewhere. Thread edits use short confirmations and update existing cards automatically.",
+  "💬 *Create:* `task Name` in your DM with DeleBot. A name is required; other fields are optional.",
+  "*Fields:* `assign @person @team`, `desc text`, `p 1` (highest) through `p 5`, `due 6/11/26` (day/month/year), `link https://…`, `jira https://…`, `github https://…`, and `access @person @team` or `access all`.",
+  "Assignments start pending ⏳. Each recipient can accept ✅, reject ❌, or delegate ↪️; the next assignee gets a new pending invitation. Rejected and delegated responses remain visible on the task.",
+  "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
+  '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
+  "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
+  "*List:* `ls me` or `ls @person` sends each task as its own message. Reply to that message with edits, delete, done, accept, reject, or delegate @person. Type teams to discover usable team handles. You can also use a task number, e.g. `123 done`.",
+  "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
 ].join("\n\n");
 
 export const TASK_LIST_USAGE = [
@@ -33,6 +52,13 @@ export const TASK_LIST_USAGE = [
 export const TASK_USAGE = `${TASK_CREATE_USAGE}\n\n${TASK_LIST_USAGE}`;
 
 export type TaskCommand =
+  | {
+    kind: "response";
+    number?: number;
+    decision: { kind: "accept" | "reject" | "delegate"; assignees?: string[] };
+  }
+  | { kind: "print"; number?: number }
+  | { kind: "reset" }
   | { kind: "help"; topic: "general" | "create" | "list" }
   | { kind: "create"; name: string; patch: TaskPatch }
   | { kind: "update"; number?: number; patch: TaskPatch }
@@ -97,7 +123,22 @@ interface Token {
   value: string;
   quoted: boolean;
 }
-type Field = "assign" | "describe" | "priority" | "due" | "link" | "done" | "delete";
+type Field =
+  | "assign"
+  | "describe"
+  | "priority"
+  | "due"
+  | "jiraLinks"
+  | "githubLinks"
+  | "link"
+  | "done"
+  | "delete"
+  | "edit"
+  | "name"
+  | "completed"
+  | "viewPerms"
+  | "editPerms"
+  | "matchPerms";
 interface Operation {
   field: Field;
   size: number;
@@ -180,19 +221,46 @@ function tokenize(text: string): Token[] | string {
   return tokens;
 }
 
-function operationAt(tokens: Token[], index: number): Operation | undefined {
+function operationAt(
+  tokens: Token[],
+  index: number,
+  editFields = false,
+): Operation | undefined {
   const token = tokens[index];
   if (!token || token.quoted) return undefined;
   const word = token.value.toLowerCase();
-  if (word === "assign") return { field: "assign", size: 1 };
-  if (["describe", "descibe", "description"].includes(word)) {
+  if (["assign", "assignee", "assignees"].includes(word)) {
+    return { field: "assign", size: 1 };
+  }
+  if (["describe", "descibe", "description", "desc"].includes(word)) {
     return { field: "describe", size: 1 };
   }
   if (["p", "priority", "urgency"].includes(word)) return { field: "priority", size: 1 };
   if (word === "due") return { field: "due", size: 1 };
   if (["link", "links"].includes(word)) return { field: "link", size: 1 };
+  if (["jira", "jiralink", "jiralinks"].includes(word)) {
+    return { field: "jiraLinks", size: 1 };
+  }
+  if (["github", "githublink", "githublinks"].includes(word)) {
+    return { field: "githubLinks", size: 1 };
+  }
   if (word === "done") return { field: "done", size: 1 };
   if (word === "delete") return { field: "delete", size: 1 };
+  if (word === "edit") return { field: "edit", size: 1 };
+  if (word === "viewperms") return { field: "viewPerms", size: 1 };
+  if (["access", "editaccess", "editperms"].includes(word)) {
+    return { field: "editPerms", size: 1 };
+  }
+  if (word === "perms") {
+    return {
+      field: "matchPerms",
+      size: !tokens[index + 1]?.quoted && /^match$/i.test(tokens[index + 1]?.value ?? "")
+        ? 2
+        : 1,
+    };
+  }
+  if (editFields && word === "name") return { field: "name", size: 1 };
+  if (editFields && word === "completed") return { field: "completed", size: 1 };
   if (
     word === "work" && !tokens[index + 1]?.quoted &&
     /^done$/i.test(tokens[index + 1]?.value ?? "")
@@ -234,19 +302,59 @@ function parseLinks(tokens: Token[]): string[] | undefined {
 function parsePatch(tokens: Token[], start: number): TaskPatch | string {
   const patch: TaskPatch = {};
   let selfAssignment = false;
+  let replacing = false;
   let index = start;
   while (index < tokens.length) {
-    const operation = operationAt(tokens, index);
+    const operation = operationAt(tokens, index, replacing);
     if (!operation) {
       return `Unrecognised field '${
         tokens[index].value
-      }'. Use assign, describe, p, due, link, or done.`;
+      }'. Use assign, describe, p, due, link, viewPerms, editPerms, perms match, or edit.`;
     }
     index += operation.size;
+    if (operation.field === "edit") {
+      if (replacing) {
+        return "Use edit once, followed by the fields and replacement values.";
+      }
+      if (index === tokens.length) {
+        return "After edit, include a field and its replacement value, e.g. edit due 6/11/26 p 1.";
+      }
+      replacing = true;
+      continue;
+    }
     const valueStart = index;
-    while (index < tokens.length && !operationAt(tokens, index)) index++;
+    while (index < tokens.length && !operationAt(tokens, index, replacing)) index++;
     const values = tokens.slice(valueStart, index);
     const value = textOf(values);
+    if (operation.field === "matchPerms") {
+      if (operation.size !== 2 || values.length) {
+        return "Use perms match without a value to copy the current view permissions to edit permissions.";
+      }
+      if (patch.editPerms !== undefined || patch.set?.editPerms !== undefined) {
+        return "Use either perms match or editPerms in one command, not both.";
+      }
+      patch.matchPerms = true;
+      continue;
+    }
+    const keys: Partial<Record<Field, keyof TaskSet>> = {
+      assign: "assignees",
+      describe: "description",
+      priority: "priority",
+      due: "dueDate",
+      link: "links",
+      jiraLinks: "jiraLinks",
+      githubLinks: "githubLinks",
+      done: "completed",
+      completed: "completed",
+      name: "name",
+      viewPerms: "viewPerms",
+      editPerms: "editPerms",
+    };
+    const key = keys[operation.field];
+    if (key && Object.hasOwn(replacing ? patch : patch.set ?? {}, key)) {
+      return `Use one operation style for ${key}; do not combine adding and replacing the same field in one command.`;
+    }
+    const target: TaskSet = replacing && key ? patch.set ??= {} : patch;
     switch (operation.field) {
       case "assign": {
         const people = parseAssignees(value);
@@ -254,16 +362,17 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
           return "After assign, select one or more people or teams from Slack's @ menu, use '-' for yourself, or 'all'.";
         }
         if (
-          (!people.length && patch.assignees?.length) || (people.length && selfAssignment)
+          (!people.length && target.assignees?.length) ||
+          (people.length && selfAssignment)
         ) {
           return "Use your own Slack mention when combining yourself with other assignees; do not mix assign - with other assignment values in one command.";
         }
         selfAssignment ||= people.length === 0;
-        patch.assignees = [...new Set([...(patch.assignees ?? []), ...people])];
-        if (patch.assignees.includes("all") && patch.assignees.length > 1) {
+        target.assignees = [...new Set([...(target.assignees ?? []), ...people])];
+        if (target.assignees.includes("all") && target.assignees.length > 1) {
           return "Use assign all by itself; do not combine all with people or teams.";
         }
-        if (patch.assignees.length > 20) {
+        if (target.assignees.length > 20) {
           return "Assign at most 20 people or teams in one command.";
         }
         break;
@@ -272,8 +381,8 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         if (!value) {
           return "Add description text after describe; quote text containing field words.";
         }
-        patch.description = [patch.description, value].filter(Boolean).join("\n\n");
-        if (patch.description.length > 2000) {
+        target.description = [target.description, value].filter(Boolean).join("\n\n");
+        if (target.description.length > 2000) {
           return "Keep the description to 2,000 characters or fewer.";
         }
         break;
@@ -283,10 +392,10 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         if (!priority) {
           return "Priority must be a whole number from 1 (highest) to 5 (lowest), e.g. p 1.";
         }
-        if (patch.priority !== undefined && patch.priority !== priority) {
+        if (target.priority !== undefined && target.priority !== priority) {
           return "Use one priority value per command; conflicting repeated values are not allowed.";
         }
-        patch.priority = priority;
+        target.priority = priority;
         break;
       }
       case "due": {
@@ -298,19 +407,22 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         if (dueDate === undefined) {
           return "Use a valid due date in day/month/year format, e.g. due 6/11/26, or due - to clear it.";
         }
-        if (patch.dueDate !== undefined && patch.dueDate !== dueDate) {
+        if (target.dueDate !== undefined && target.dueDate !== dueDate) {
           return "Use one due date per command; conflicting repeated dates are not allowed.";
         }
-        patch.dueDate = dueDate;
+        target.dueDate = dueDate;
         break;
       }
+      case "jiraLinks":
+      case "githubLinks":
       case "link": {
         const links = parseLinks(values);
         if (!links) {
           return "After link, include one or more valid http:// or https:// URLs, each at most 1,000 characters.";
         }
-        patch.links = [...new Set([...(patch.links ?? []), ...links])];
-        if (patch.links.length > 10) {
+        const field = operation.field === "link" ? "links" : operation.field;
+        target[field] = [...new Set([...(target[field] ?? []), ...links])];
+        if (target[field]!.length > 10) {
           return "Add at most 10 different links in one command.";
         }
         break;
@@ -319,10 +431,52 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         if (values.length) {
           return "Use done (or work done) without a value. Put other changes after their field keyword.";
         }
-        patch.completed = true;
+        if (target.completed === false) return "Use one completed value per command.";
+        target.completed = true;
         break;
+      case "name":
+        if (!value || value.length > 200) {
+          return "After edit name, include a task name of 1–200 characters; quote names containing field words.";
+        }
+        if (target.name !== undefined && target.name !== value) {
+          return "Use one replacement name per command.";
+        }
+        target.name = value;
+        break;
+      case "completed": {
+        const completed = values.length === 1 ? parseCompleted(value) : undefined;
+        if (completed === undefined) {
+          return "After edit completed, use yes/no or true/false.";
+        }
+        if (target.completed !== undefined && target.completed !== completed) {
+          return "Use one completed value per command.";
+        }
+        target.completed = completed;
+        break;
+      }
+      case "viewPerms":
+      case "editPerms": {
+        if (operation.field === "editPerms" && patch.matchPerms) {
+          return "Use either perms match or editPerms in one command, not both.";
+        }
+        const permissions = value === "-" ? undefined : parseAssignees(value);
+        if (!permissions?.length) {
+          return "After viewPerms or editPerms, select people or teams from Slack's @ menu, or use all.";
+        }
+        const combined = [
+          ...new Set([...(target[operation.field] ?? []), ...permissions]),
+        ];
+        if (combined.includes("all") && combined.length > 1) {
+          return "Use all by itself in a permission field; do not combine it with people or teams.";
+        }
+        if (combined.length > 20) {
+          return "Choose at most 20 people or teams in each permission field.";
+        }
+        target[operation.field] = combined;
+        break;
+      }
       case "delete":
-        return "Use delete on its own in the task's thread, or after a task number; do not combine deletion with other changes.";
+        return "Use delete on its own to delete the task, or delete followed only by field names to clear fields. Send edits separately.";
     }
   }
   return patch;
@@ -332,6 +486,45 @@ function numberValue(text: string): number | undefined {
   if (!/^\d+$/.test(text)) return undefined;
   const number = Number(text);
   return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
+function parseClearFields(tokens: Token[]): TaskPatch | string {
+  const aliases: Record<string, ClearField> = {
+    assign: "assignees",
+    assignee: "assignees",
+    assignees: "assignees",
+    describe: "description",
+    descibe: "description",
+    description: "description",
+    desc: "description",
+    p: "priority",
+    priority: "priority",
+    urgency: "priority",
+    due: "dueDate",
+    link: "links",
+    links: "links",
+    jira: "jiraLinks",
+    jiralinks: "jiraLinks",
+    github: "githubLinks",
+    githublinks: "githubLinks",
+    access: "editPerms",
+    editaccess: "editPerms",
+    done: "completed",
+    completed: "completed",
+    viewperms: "viewPerms",
+    editperms: "editPerms",
+  };
+  const clear: ClearField[] = [];
+  for (const token of tokens) {
+    const field = !token.quoted ? aliases[token.value.toLowerCase()] : undefined;
+    if (!field) {
+      return /^name$/i.test(token.value)
+        ? "A task must keep its name. Use edit name followed by a new name."
+        : "After delete, include only field names to clear, e.g. delete due p desc. Use delete alone to delete the whole task.";
+    }
+    if (!clear.includes(field)) clear.push(field);
+  }
+  return { clear };
 }
 
 type FilterQuery = Extract<TaskQuery, { kind: "filters" }>;
@@ -488,10 +681,14 @@ function parseList(command: string): TaskCommand {
 
 /** Parse only explicit commands; applying a patch is a separate, atomic validation step. */
 export function parseTaskCommand(text: string): TaskCommand {
-  const command = text.trim().replace(/^tasks\s+ls(?=\s|$)/i, "ls tasks")
+  const command = text.trim().replace(/^ls(?=<@|@)/i, "ls ").replace(
+    /^tasks\s+ls(?=\s|$)/i,
+    "ls tasks",
+  )
     .replace(/^#(\d+)(?=\s|$)/, "$1")
     .replace(/^\((\d+)\)(?=\s|$)/, "$1");
   if (command === "?") return { kind: "help", topic: "general" };
+  if (/^delete\s+all$/i.test(command)) return { kind: "reset" };
   if (/^task\s+\?$/i.test(command)) return { kind: "help", topic: "create" };
   if (/^ls(?:\s+tasks?)?\s+\?$/i.test(command)) return { kind: "help", topic: "list" };
   if (/^ls(?:\s|$)/i.test(command)) return parseList(command);
@@ -516,6 +713,11 @@ export function parseTaskCommand(text: string): TaskCommand {
       return invalid("Keep the task name to 200 characters or fewer.");
     }
     const patch = parsePatch(tokens, end);
+    if (typeof patch !== "string" && patch.set) {
+      return invalid(
+        "Use field values directly when creating a task; use edit in its thread after creation.",
+      );
+    }
     return typeof patch === "string" ? invalid(patch) : { kind: "create", name, patch };
   }
   let start = 0;
@@ -527,11 +729,49 @@ export function parseTaskCommand(text: string): TaskCommand {
     if (start === tokens.length) {
       return invalid("Add a change after the task number, e.g. 123 done.");
     }
-  } else if (!operationAt(tokens, 0)) return { kind: "unknown" };
+  } else if (
+    !operationAt(tokens, 0) &&
+    !/^(accept|reject|delegate|reassign|print)$/i.test(tokens[0].value)
+  ) return { kind: "unknown" };
+  if (!tokens[start].quoted && /^print$/i.test(tokens[start].value)) {
+    return tokens.length === start + 1
+      ? { kind: "print", ...(number ? { number } : {}) }
+      : invalid("Use print by itself, or put a task number before print.");
+  }
   if (
-    tokens.length === start + 1 && !tokens[start].quoted &&
-    /^delete$/i.test(tokens[start].value)
-  ) return { kind: "delete", ...(number ? { number } : {}) };
+    !tokens[start].quoted &&
+    /^(accept|reject|delegate|reassign)$/i.test(tokens[start].value)
+  ) {
+    const word = tokens[start].value.toLowerCase();
+    const kind = word === "reassign"
+      ? "delegate"
+      : word as "accept" | "reject" | "delegate";
+    if (kind !== "delegate" && tokens.length !== start + 1) {
+      return invalid("Use accept or reject without a value.");
+    }
+    const assignees = kind === "delegate"
+      ? parseAssignees(textOf(tokens.slice(start + 1)))
+      : undefined;
+    if (kind === "delegate" && (!assignees?.length || assignees.includes("all"))) {
+      return invalid("Choose a person or team after delegate.");
+    }
+    return {
+      kind: "response",
+      ...(number ? { number } : {}),
+      decision: { kind, ...(assignees ? { assignees } : {}) },
+    };
+  }
+  if (!tokens[start].quoted && /^delete$/i.test(tokens[start].value)) {
+    if (tokens.length === start + 1) {
+      return { kind: "delete", ...(number ? { number } : {}) };
+    }
+    const patch = parseClearFields(tokens.slice(start + 1));
+    return typeof patch === "string" ? invalid(patch) : {
+      kind: "update",
+      ...(number ? { number } : {}),
+      patch,
+    };
+  }
   const patch = parsePatch(tokens, start);
   return typeof patch === "string"
     ? invalid(patch)

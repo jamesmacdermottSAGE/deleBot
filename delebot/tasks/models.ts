@@ -6,12 +6,17 @@ export type Urgency = Priority;
 export interface TaskInput {
   name: string;
   links: string[];
+  jiraLinks?: string[];
+  githubLinks?: string[];
   assignees: string[];
   description: string;
   /** Calendar date, YYYY-MM-DD; null means no due date. */
   dueDate: string | null;
   priority: Priority | null;
   completed: boolean;
+  /** Absent only on legacy tasks; an explicit empty policy grants nobody access. */
+  viewPerms?: string[];
+  editPerms?: string[];
 }
 export interface TaskAccess {
   userId: string;
@@ -31,6 +36,10 @@ export interface Task extends TaskInput {
   appliedEvents?: string[];
   /** Durable notification intent survives retries between saving and delivery. */
   assignmentEvents?: Record<string, string[]>;
+  assignmentResponses?: Record<
+    string,
+    { status: "pending" | "accepted" | "rejected" | "delegated"; delegatedTo?: string[] }
+  >;
   /** Retained to prevent delayed creation-event replays from restoring a deleted task. */
   deleted?: boolean;
 }

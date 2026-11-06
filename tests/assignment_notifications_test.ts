@@ -113,7 +113,10 @@ Deno.test("assignment notifications include task details and notify each directl
   );
   assert(posts[0].text.includes("&lt;!channel&gt; &amp; &lt;@UOTHER&gt;"));
   assert(!posts[0].text.includes("<!channel>"));
-  assert(posts[0].text.includes("Open task thread"));
+  assert(
+    !posts[0].text.includes("Open task thread") &&
+      posts[0].text.includes("delegate @person"),
+  );
   assert([...store.rows.values()][0].delivered.join() === "UJAMES,UCREATOR");
 });
 
@@ -347,6 +350,91 @@ Deno.test("a non-DM channel response never receives assignment details", async (
   client.conversations.open = () =>
     Promise.resolve({ ok: true, channel: { id: "CPUBLIC" } });
   assert((await notify()).failed.includes("UJAMES") && posts.length === 0);
+});
+
+Deno.test("explicit private viewing permissions fail closed without an access loader", async () => {
+  const { task, posts, client, store } = fixture();
+  task.viewPerms = ["UJAMES"];
+  const result = await notifyAssignments(
+    task,
+    task.assignees,
+    "event1",
+    "TWORKSPACE",
+    client,
+    store,
+    { executionId: "FXORIGIN" },
+  );
+  assert(result.failed.includes("UJAMES") && !result.interactive && posts.length === 0);
+});
+
+Deno.test("fresh viewing permission and current group assignment are both required before sending", async () => {
+  const { task, posts, client, store, groups } = fixture(["SFRONTEND"]);
+  task.viewPerms = ["all"];
+  groups.set("SFRONTEND", ["UJAMES"]);
+  const result = await notifyAssignments(
+    task,
+    task.assignees,
+    "event1",
+    "TWORKSPACE",
+    client,
+    store,
+    {
+      executionId: "FXORIGIN",
+      loadAccess: (_task, userId) => Promise.resolve({ userId, teamIds: [] }),
+    },
+  );
+  assert(!result.interactive && posts.length === 0);
+  assert([...store.rows.values()][0].cancelled.includes("UJAMES"));
+});
+
+Deno.test("revoked viewing permission removes delivered invitations and retries cleanup failures", async () => {
+  const { task, posts, client, store } = fixture();
+  task.viewPerms = ["SREADERS"];
+  let member = true;
+  let failDelete = true;
+  const deleted: string[] = [];
+  client.chat.delete = ({ channel, ts }) => {
+    deleted.push(`${channel}:${ts}`);
+    return Promise.resolve(
+      failDelete ? { ok: false, error: "ratelimited" } : { ok: true },
+    );
+  };
+  const context = {
+    executionId: "FXORIGIN",
+    loadAccess: (_task: unknown, userId: string) =>
+      Promise.resolve({ userId, teamIds: member ? ["SREADERS"] : [] }),
+  };
+  assert(
+    (await notifyAssignments(
+      task,
+      task.assignees,
+      "event1",
+      "TWORKSPACE",
+      client,
+      store,
+      context,
+    )).interactive,
+  );
+  assert(posts.length === 1);
+  member = false;
+  const failed = await notifyAssignments(
+    task,
+    [],
+    "event1",
+    "TWORKSPACE",
+    client,
+    store,
+    context,
+  );
+  assert(failed.failed.includes("UJAMES") && !failed.interactive);
+  assert([...store.rows.values()][0].invitations?.UJAMES.status === "cancelled");
+  failDelete = false;
+  assert(
+    (await notifyAssignments(task, [], "event1", "TWORKSPACE", client, store, context))
+      .failed.length === 0,
+  );
+  assert(posts.length === 1 && deleted.join() === "DUJAMES:10.1,DUJAMES:10.1");
+  assert([...store.rows.values()][0].invitations?.UJAMES.messageRemoved);
 });
 
 Deno.test("notification datastore round trips IDs and rejects corrupt or failed records", async () => {

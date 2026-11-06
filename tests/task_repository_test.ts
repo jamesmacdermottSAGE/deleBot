@@ -1,4 +1,5 @@
 import { TasksDatastore } from "../delebot/db.ts";
+import { taskNumber } from "../delebot/tasks/service.ts";
 import { canAccessTask } from "../delebot/tasks/access.ts";
 import type { Task, TaskAccess } from "../delebot/tasks/models.ts";
 import {
@@ -109,6 +110,29 @@ Deno.test("task persistence maps every field and uses the source message as its 
       JSON.stringify(original, Object.keys(original).sort()),
   );
   assert(gets[0].id === original.id);
+});
+
+Deno.test("exact task-number text survives Slack integer rounding across reload and save", async () => {
+  const { repository, rows } = fixture();
+  const original = task({ number: 4099515726530997 });
+  await repository.save(original);
+  const row = rows.get(original.id)!;
+  row.number = 4099515726531000;
+  assert(row.number_text === "4099515726530997");
+  const restored = await repository.findById(original.id);
+  assert(restored?.number === original.number);
+  await repository.save(restored);
+  assert((await repository.findById(original.id))?.number === original.number);
+});
+
+Deno.test("older rounded hash references recover their deterministic original number", async () => {
+  const { repository, rows } = fixture();
+  const original = task({ number: await taskNumber(task().channelId, task().messageTs) });
+  await repository.save(original);
+  const row = rows.get(original.id)!;
+  delete row.number_text;
+  row.number = Number(original.number.toPrecision(15));
+  assert((await repository.findById(original.id))?.number === original.number);
 });
 
 Deno.test("mixed assignees and completed tasks round trip without changing legacy datastore types", async () => {
@@ -532,4 +556,101 @@ Deno.test("corrupt deletion flags cannot be read or saved", async () => {
       deleted: true,
     }, access),
   );
+});
+
+Deno.test("explicit task permissions round trip and override creator and assignment visibility", async () => {
+  const { repository, puts } = fixture();
+  const item = task({
+    assignmentBased: true,
+    assignees: ["UJAMES"],
+    teams: [],
+    viewPerms: ["UOTHER", "SBACKEND"],
+    editPerms: ["UOTHER"],
+  });
+  await repository.save(item);
+  assert(JSON.stringify(puts[0].item.view_perms) === JSON.stringify(item.viewPerms));
+  assert(JSON.stringify(puts[0].item.edit_perms) === JSON.stringify(item.editPerms));
+  const restored = await repository.findById(item.id);
+  assert(restored?.viewPerms?.join() === "UOTHER,SBACKEND");
+  assert(restored.editPerms?.join() === "UOTHER");
+  assert(
+    (await repository.list(access)).length === 0,
+    "Creator and assignee cannot bypass view permissions",
+  );
+  assert((await repository.list({ userId: "UOTHER", teamIds: [] })).length === 1);
+  assert(
+    (await repository.list({ userId: "UMEMBER", teamIds: ["SBACKEND"] })).length === 1,
+  );
+});
+
+Deno.test("all and empty view permissions are independent of task assignments", async () => {
+  const { repository } = fixture();
+  await repository.save(
+    task({
+      assignmentBased: true,
+      assignees: [],
+      teams: [],
+      viewPerms: ["all"],
+      editPerms: ["all"],
+    }),
+  );
+  assert((await repository.list({ userId: "UANYONE", teamIds: [] })).length === 1);
+  await repository.save(
+    task({
+      assignmentBased: true,
+      assignees: ["UJAMES"],
+      teams: [],
+      viewPerms: [],
+      editPerms: ["all"],
+    }),
+  );
+  assert((await repository.list(access)).length === 0);
+});
+
+Deno.test("permission-only teams are discovered across metadata pages", async () => {
+  const { repository, client } = fixture();
+  client.apps.datastore.query = (args) => {
+    assert(args.expression_attributes["#view"] === "view_perms");
+    assert(args.expression_attributes["#edit"] === "edit_perms");
+    return Promise.resolve(
+      args.cursor
+        ? {
+          ok: true,
+          items: [{ view_perms: ["SVIEW", "UOTHER"], edit_perms: ["SEDIT"] }, {
+            teams: ["SASSIGN"],
+            view_perms: ["SVIEW"],
+          }, { deleted: true, view_perms: ["SDELETED"] }],
+        }
+        : { ok: true, items: [], next_cursor: "next" },
+    );
+  };
+  assert((await repository.referencedTeamIds()).join() === "SVIEW,SEDIT,SASSIGN");
+});
+
+Deno.test("invalid stored permissions fail closed rather than falling back to assignments", async () => {
+  const { repository, client, puts } = fixture();
+  await repository.save(task());
+  for (const value of ["all", ["all", "UJAMES"], ["@frontend"], [42], null]) {
+    for (const field of ["view_perms", "edit_perms"]) {
+      client.apps.datastore.get = () =>
+        Promise.resolve({ ok: true, item: { ...puts[0].item, [field]: value } });
+      await rejects(() => repository.findById(task().id), "invalid record");
+    }
+  }
+  await rejects(() => repository.findById("invalid"), "Invalid task reference");
+});
+
+Deno.test("permission queries bind principals and guard legacy access behind absent view permissions", async () => {
+  const { repository, client } = fixture();
+  client.apps.datastore.query = (args) => {
+    assert(args.expression.includes("contains(#view, :all)"));
+    assert(args.expression.includes("contains(#view, :user)"));
+    assert(args.expression.includes("contains(#view, :team0)"));
+    assert(args.expression.includes("attribute_not_exists(#view) AND"));
+    assert(args.expression_attributes["#view"] === "view_perms");
+    assert(args.expression_values[":user"] === access.userId);
+    assert(args.expression_values[":team0"] === "SFRONTEND");
+    return Promise.resolve({ ok: true, items: [] });
+  };
+  assert((await repository.list(access)).length === 0);
 });

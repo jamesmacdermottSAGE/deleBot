@@ -12,10 +12,15 @@ import { TaskReferenceError } from "../delebot/tasks/repository.ts";
 import type {
   NotificationBatch,
   NotificationClient,
+  NotificationContext,
   NotificationStore,
 } from "../delebot/slack/notifications.ts";
 
-type Notifications = { client: NotificationClient; store: NotificationStore };
+type Notifications = {
+  client: NotificationClient;
+  store: NotificationStore;
+  context?: NotificationContext;
+};
 const notificationFixtures = new WeakMap<MessageClient, Notifications>();
 
 function handleMessage(
@@ -45,6 +50,7 @@ function fixture() {
   > = [];
   const publicPosts: Array<{ channel: string; text: string; thread_ts?: string }> = [];
   const notificationPosts: Array<{ channel: string; text: string }> = [];
+  const notificationDeletes: Array<{ channel: string; ts: string }> = [];
   const openedDms: string[] = [];
   const openedListDms: string[] = [];
   const batches = new Map<string, NotificationBatch>();
@@ -56,6 +62,10 @@ function fixture() {
       },
     },
     chat: {
+      delete: (args) => {
+        notificationDeletes.push(args);
+        return Promise.resolve({ ok: true });
+      },
       postMessage: (args) => {
         notificationPosts.push(args);
         return Promise.resolve({ ok: true, ts: "20.1" });
@@ -106,7 +116,14 @@ function fixture() {
     message_ts: "9.1",
     text: "<@UBOT> hello",
   };
-  const notifications = { client: notificationClient, store: notificationStore };
+  const notifications: Notifications = {
+    client: notificationClient,
+    store: notificationStore,
+    context: {
+      executionId: "FXTEST",
+      loadAccess: async (_task, userId) => (await teamDirectory.load(userId)).access,
+    },
+  };
   notificationFixtures.set(client, notifications);
   return {
     client,
@@ -114,6 +131,8 @@ function fixture() {
     posts,
     publicPosts,
     notificationPosts,
+    notificationDeletes,
+    batches,
     notificationClient,
     notificationStore,
     notifications,
@@ -250,7 +269,8 @@ Deno.test("Slack send failures are reported rather than marked successful", asyn
 const createCommand =
   "task Clean PRs link <https://example.slack.com/archives/C1/p123|Message> " +
   "assign <@UJAMES> <@UALICE> <!subteam^SFRONTEND|@frontend> " +
-  "describe Review open PRs. due 6/11/26 p 2";
+  "describe Review open PRs. due 6/11/26 p 2 " +
+  "viewPerms <@UHUMAN> <@UJAMES> <@UALICE> <!subteam^SFRONTEND|@frontend>";
 
 Deno.test("a restricted channel task command replies privately in its original thread", async () => {
   const { event, client, posts } = fixture();
@@ -500,6 +520,7 @@ Deno.test("explicit all task creation needs no membership API and fallback lists
       createdBy: "UOTHER",
       teams: ["SFRONTEND"],
       assignees: ["SFRONTEND"],
+      viewPerms: ["SFRONTEND"],
     }]);
   const before = posts.length;
   await handleMessage({ ...event, text: "<@UBOT> ls tasks" }, client, repo, failed);
@@ -525,14 +546,14 @@ Deno.test("known teams can receive assignments and unknown teams cannot", async 
     );
   }
   assert(repo.writes === 1 && posts[0].text.includes("Created task"));
-  assert(posts[1].text.includes("could not verify the selected group"));
+  assert(posts.at(-1)!.text.includes("could not verify the selected group"));
 });
 
 Deno.test("every filter hides nonmember tasks from an unassigned reader", async () => {
   const { event, client, posts } = fixture();
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
-    { ...input, assignees: ["SBACKEND"] },
+    { ...input, assignees: ["SBACKEND"], viewPerms: ["SBACKEND"] },
     {
       channelId: "CSECRET",
       messageTs: "1793690000.000001",
@@ -607,7 +628,7 @@ Deno.test("all tasks are accessible to users with no groups, while multiteam tas
     posts.at(-1)!.text.includes("Everyone") && !posts.at(-1)!.text.includes("Clean PRs"),
   );
   await handleMessage({ ...event, text: "<@UBOT> ls tasks" }, client, repo);
-  assert(posts.at(-1)!.text.includes("Clean PRs"));
+  assert(posts.some((post) => post.text.includes("Clean PRs")));
 });
 
 Deno.test("private reply failure never broadcasts restricted task data", async () => {
@@ -780,7 +801,7 @@ Deno.test("person assignment does not require team lookup and completion filters
   assert(
     task.completed && task.assignees.join() === "UHUMAN" && task.status === "completed",
   );
-  assert(posts[0].text.includes("*Completed:* Yes"));
+  assert(posts[0].text.includes("*Completed:* ✅"));
   await handleMessage({ ...event, text: "<@UBOT> tasks ls completed yes" }, client, repo);
   assert(posts.at(-1)!.text.includes("Finished"));
   await handleMessage({ ...event, text: "<@UBOT> tasks ls completed no" }, client, repo);
@@ -793,6 +814,7 @@ Deno.test("name-only creation and combined thread updates show current fields an
   await handleMessage({ ...event, text: "<@UBOT> task Review PRs" }, client, repo);
   const initial = [...repo.rows.values()][0];
   assert(initial.name === "Review PRs" && initial.assignees.length === 0);
+  assert(initial.viewPerms?.join() === "all" && initial.editPerms?.join() === "all");
   assert(
     !initial.completed && initial.description === "" && initial.links.length === 0 &&
       initial.priority === null && initial.dueDate === null,
@@ -817,8 +839,8 @@ Deno.test("name-only creation and combined thread updates show current fields an
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   assert(
     posts.at(-1)!.text.includes(`Updated task #${initial.number}`) &&
-      posts.at(-1)!.text.includes("Review open PRs") &&
-      posts.at(-1)!.text.includes("https://b.example"),
+      !posts.at(-1)!.text.includes("*Task #") &&
+      !posts.at(-1)!.text.includes("https://b.example"),
   );
   assert(openedDms.join() === "UJAMES");
   assert(notificationPosts.at(-1)!.text.includes(`#${initial.number}: Review PRs`));
@@ -903,7 +925,7 @@ Deno.test("a numbered update completes a task outside its original thread", asyn
   const updated = [...repo.rows.values()][0];
   assert(updated.completed && updated.status === "completed" && updated.priority === 2);
   assert(posts.at(-1)!.channel === "COTHER" && posts.at(-1)!.thread_ts === "10.1");
-  assert(posts.at(-1)!.text.includes("*Completed:* Yes"));
+  assert(posts.at(-1)!.text.includes("*Completed:* ✅"));
 });
 
 Deno.test("work done completes the unique task in the current thread", async () => {
@@ -921,7 +943,53 @@ Deno.test("work done completes the unique task in the current thread", async () 
     repo,
   );
   assert([...repo.rows.values()][0].completed && repo.writes === 2);
-  assert(posts.at(-1)!.text.includes("*Completed:* Yes"));
+  assert(
+    posts.at(-1)!.text.includes("Updated task #") &&
+      !posts.at(-1)!.text.includes("*Completed:*"),
+  );
+});
+
+Deno.test("print reprints current task details without editing or assigning it", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage({ ...event, text: "<@UBOT> task Print example" }, client, repo);
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.2",
+      text: '<@UBOT> desc "Current description"',
+    },
+    client,
+    repo,
+  );
+  assert(
+    posts.at(-1)!.text.startsWith("✅ Updated") &&
+      !posts.at(-1)!.text.includes("Current description"),
+  );
+  const writes = repo.writes;
+  await handleMessage(
+    { ...event, thread_ts: event.message_ts, message_ts: "9.3", text: "<@UBOT> print" },
+    client,
+    repo,
+  );
+  assert(
+    posts.at(-1)!.text.includes("*Task #") &&
+      posts.at(-1)!.text.includes("Current description"),
+  );
+  assert(posts.at(-1)!.thread_ts === event.message_ts && repo.writes === writes);
+  const task = [...repo.rows.values()][0];
+  await handleMessage(
+    {
+      ...event,
+      channel_id: "COTHER",
+      message_ts: "9.4",
+      text: `<@UBOT> ${task.number} print`,
+    },
+    client,
+    repo,
+  );
+  assert(posts.at(-1)!.text.includes("Current description") && repo.writes === writes);
 });
 
 Deno.test("thread updates need a unique visible task and numbered updates disambiguate", async () => {
@@ -970,7 +1038,14 @@ Deno.test("thread updates need a unique visible task and numbered updates disamb
 Deno.test("unassigned users cannot update a restricted task by thread or number", async () => {
   const { event, client, posts } = fixture();
   const repo = new MemoryTaskRepository();
-  await handleMessage({ ...event, text: "<@UBOT> task Private review" }, client, repo);
+  await handleMessage(
+    {
+      ...event,
+      text: "<@UBOT> task Private review viewPerms <@UHUMAN> editPerms <@UHUMAN>",
+    },
+    client,
+    repo,
+  );
   const task = [...repo.rows.values()][0];
   // A faulty repository may return inaccessible rows; the service must still deny updates.
   repo.list = () => Promise.resolve([task]);
@@ -1105,7 +1180,11 @@ Deno.test("numbered deletion denies an unassigned user and permits a current ass
   const { event, client, posts } = fixture();
   const repo = new MemoryTaskRepository();
   await handleMessage(
-    { ...event, text: "<@UBOT> task Remove review assign <@UJAMES>" },
+    {
+      ...event,
+      text:
+        "<@UBOT> task Remove review assign <@UJAMES> viewPerms <@UHUMAN> <@UJAMES> editPerms <@UHUMAN> <@UJAMES>",
+    },
     client,
     repo,
   );
@@ -1238,7 +1317,7 @@ Deno.test("composable ls targets and filters return full task details only in th
     }
     assert(text.includes("Review outstanding pull requests."), command);
     assert(text.includes("<https://example.slack.com/archives/C123/p1793690000000001>"));
-    assert(text.includes("*Priority:* 1") && text.includes("*Completed:* No"));
+    assert(text.includes("*Priority:* 1") && text.includes("*Completed:* "));
   }
   assert(openedListDms.length === cases.length);
   assert(publicPosts.every((post) => post.channel === "DLISTUHUMAN"));
@@ -1289,6 +1368,348 @@ Deno.test("listing inside an existing DM keeps its own thread and does not open 
     client,
     new MemoryTaskRepository(),
   );
-  assert(posts[0].channel === "DEXISTING" && posts[0].thread_ts === "1.1");
+  assert(posts[0].channel === "DEXISTING" && posts[0].thread_ts === undefined);
   assert(posts[0].text === "No tasks found." && openedListDms.length === 0);
+});
+
+Deno.test("edit replaces complete fields and delete clears only the named fields", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    {
+      ...event,
+      text:
+        '<@UBOT> task Original assign <@UHUMAN> desc "Old description" link https://old.example due 6/11/26 p 2 done',
+    },
+    client,
+    repo,
+  );
+  const task = [...repo.rows.values()][0];
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.2",
+      text:
+        '<@UBOT> edit name "New title" assign <@UALICE> desc "Replacement text" link https://new.example due 7/11/26 p 1',
+    },
+    client,
+    repo,
+  );
+  const replaced = [...repo.rows.values()][0];
+  assert(replaced.number === task.number && replaced.name === "New title");
+  assert(
+    replaced.assignees.join() === "UALICE" &&
+      replaced.links.join() === "https://new.example",
+  );
+  assert(
+    replaced.description === "Replacement text" && replaced.priority === 1 &&
+      replaced.dueDate === "2026-11-07",
+  );
+  assert(
+    posts.at(-1)!.text.includes("Updated task #") &&
+      !posts.at(-1)!.text.includes("Old description"),
+  );
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.3",
+      text: "<@UBOT> delete due p desc",
+    },
+    client,
+    repo,
+  );
+  const cleared = [...repo.rows.values()][0];
+  assert(
+    cleared.dueDate === null && cleared.priority === null && cleared.description === "",
+  );
+  assert(cleared.links.join() === "https://new.example" && !cleared.deleted);
+  await handleMessage(
+    {
+      ...event,
+      message_ts: "9.4",
+      text: `<@UBOT> ${task.number} delete assignees links completed viewPerms editPerms`,
+    },
+    client,
+    repo,
+  );
+  const empty = [...repo.rows.values()][0];
+  assert(empty.assignees.length === 0 && empty.links.length === 0 && !empty.completed);
+  assert(empty.viewPerms?.join() === "all" && empty.editPerms?.join() === "all");
+  assert(empty.name === "New title" && repo.writes === 4);
+});
+
+Deno.test("replacement assign - explicitly assigns the requesting user", async () => {
+  const { event, client } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...event, text: "<@UBOT> task Reassign assign <@UALICE>" },
+    client,
+    repo,
+  );
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.2",
+      text: "<@UBOT> edit assign -",
+    },
+    client,
+    repo,
+  );
+  assert([...repo.rows.values()][0].assignees.join() === event.user_id);
+});
+
+Deno.test("view permissions deny creators and assignees while editors must also be viewers", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    {
+      ...event,
+      text:
+        '<@UBOT> task Confidential assign <@UJAMES> desc "Secret detail" viewPerms <@UALICE> editPerms <@UHUMAN>',
+    },
+    client,
+    repo,
+  );
+  const task = [...repo.rows.values()][0];
+  assert(
+    posts.some((post) => post.text.includes("Changes saved")) &&
+      posts.every((post) => !post.text.includes("Secret detail")),
+  );
+  for (const userId of [event.user_id, "UJAMES"]) {
+    await handleMessage(
+      { ...event, user_id: userId, text: `<@UBOT> ls task ${task.number}` },
+      client,
+      repo,
+    );
+    assertListDm(posts.at(-1)!, userId);
+    assert(posts.at(-1)!.text === "No matching task available to you.");
+  }
+  await handleMessage(
+    { ...event, user_id: "UALICE", text: `<@UBOT> ls task ${task.number}` },
+    client,
+    repo,
+  );
+  assert(posts.at(-1)!.text.includes("Secret detail"));
+  for (const userId of [event.user_id, "UJAMES", "UALICE"]) {
+    await handleMessage(
+      {
+        ...event,
+        user_id: userId,
+        message_ts: "9.2",
+        text: `<@UBOT> ${task.number} p 1`,
+      },
+      client,
+      repo,
+    );
+  }
+  assert(repo.writes === 1 && [...repo.rows.values()][0].priority === null);
+});
+
+Deno.test("perms match snapshots viewers and later view changes leave editors unchanged", async () => {
+  const { event, client } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    {
+      ...event,
+      text:
+        "<@UBOT> task Permission copy viewPerms <@UHUMAN> <@UALICE> editPerms <@UHUMAN>",
+    },
+    client,
+    repo,
+  );
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.2",
+      text: "<@UBOT> viewPerms <@UHUMAN> <@UJAMES> perms match",
+    },
+    client,
+    repo,
+  );
+  const matched = [...repo.rows.values()][0];
+  assert(
+    matched.viewPerms?.join() === "UHUMAN,UJAMES" &&
+      matched.editPerms?.join() === "UHUMAN,UJAMES",
+  );
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.3",
+      text: "<@UBOT> viewPerms <@UHUMAN> <@UALICE>",
+    },
+    client,
+    repo,
+  );
+  const changed = [...repo.rows.values()][0];
+  assert(
+    changed.viewPerms?.join() === "UHUMAN,UALICE" &&
+      changed.editPerms?.join() === "UHUMAN,UJAMES",
+  );
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      user_id: "UALICE",
+      message_ts: "9.4",
+      text: "<@UBOT> p 1",
+    },
+    client,
+    repo,
+  );
+  assert(repo.writes === 3 && [...repo.rows.values()][0].priority === null);
+});
+
+Deno.test("permission-only groups are verified and lockout replies contain no task details", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...event, text: '<@UBOT> task Sensitive desc "Do not repeat this"' },
+    client,
+    repo,
+  );
+  const references: string[][] = [];
+  const directory: TeamDirectory = {
+    load: (userId, _workspaceId, referenced) => {
+      references.push(referenced ?? []);
+      return teamDirectory.load(userId);
+    },
+  };
+  const before = posts.length;
+  await handleMessage(
+    {
+      ...event,
+      thread_ts: event.message_ts,
+      message_ts: "9.2",
+      text: "<@UBOT> edit viewPerms <!subteam^SBACKEND> editPerms <!subteam^SFRONTEND>",
+    },
+    client,
+    repo,
+    directory,
+  );
+  assert(references.some((ids) => ids.includes("SBACKEND") && ids.includes("SFRONTEND")));
+  assert(
+    repo.writes === 2 && [...repo.rows.values()][0].viewPerms?.join() === "SBACKEND",
+  );
+  const replies = posts.slice(before).map((post) => post.text).join("\n");
+  assert(
+    replies.includes("Changes saved") && !replies.includes("Sensitive") &&
+      !replies.includes("Do not repeat this"),
+  );
+});
+
+Deno.test("unknown permission groups and invalid mixed edits are rejected without partial writes", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage({ ...event, text: "<@UBOT> task Untouched" }, client, repo);
+  for (
+    const command of [
+      'edit desc "Changed" viewPerms <!subteam^SUNKNOWN>',
+      'edit desc "Changed" editPerms <!subteam^SUNKNOWN>',
+      'edit desc "Changed" due 31/11/26',
+      "viewPerms -",
+    ]
+  ) {
+    await handleMessage(
+      {
+        ...event,
+        thread_ts: event.message_ts,
+        message_ts: "9.2",
+        text: `<@UBOT> ${command}`,
+      },
+      client,
+      repo,
+    );
+    assert(repo.writes === 1 && [...repo.rows.values()][0].description === "");
+    assert(!posts.at(-1)!.text.includes("Updated task"));
+  }
+});
+
+Deno.test("explicit empty view permissions fail closed even for a creator and assigned user", async () => {
+  const { event, client, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...event, text: "<@UBOT> task Invisible assign <@UHUMAN>" },
+    client,
+    repo,
+  );
+  const task = [...repo.rows.values()][0];
+  repo.rows.set(task.id, { ...task, viewPerms: [], editPerms: ["all"] });
+  await handleMessage({ ...event, text: "<@UBOT> ls" }, client, repo);
+  assert(posts.at(-1)!.text === "No tasks found.");
+  await handleMessage(
+    { ...event, message_ts: "9.2", text: `<@UBOT> ${task.number} done` },
+    client,
+    repo,
+  );
+  assert(repo.writes === 1 && ![...repo.rows.values()][0].completed);
+});
+
+Deno.test("revoking viewing permissions removes an already delivered assignment DM", async () => {
+  const { event, client, notificationPosts, notificationDeletes, batches, posts } =
+    fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...event, text: "<@UBOT> task Confidential assign <@UJAMES>" },
+    client,
+    repo,
+  );
+  assert(notificationPosts.length === 1);
+  await handleMessage(
+    {
+      ...event,
+      message_ts: "9.2",
+      thread_ts: event.message_ts,
+      text: "<@UBOT> viewPerms <@UHUMAN>",
+    },
+    client,
+    repo,
+  );
+  assert(
+    notificationDeletes.length === 1 && notificationDeletes[0].channel === "DUJAMES",
+  );
+  assert([...batches.values()][0].invitations?.UJAMES.status === "cancelled");
+  await handleMessage(
+    { ...event, user_id: "UJAMES", message_ts: "9.3", text: "<@UBOT> ls" },
+    client,
+    repo,
+  );
+  assert(posts.at(-1)!.text === "No tasks found.");
+  assert(notificationPosts.length === 1);
+});
+
+Deno.test("deleting a task removes its assignment controls without creating another invitation", async () => {
+  const { event, client, notificationPosts, notificationDeletes, posts } = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...event, text: "<@UBOT> task Temporary assign <@UJAMES>" },
+    client,
+    repo,
+  );
+  const task = [...repo.rows.values()][0];
+  await handleMessage(
+    { ...event, message_ts: "9.2", thread_ts: event.message_ts, text: "<@UBOT> delete" },
+    client,
+    repo,
+  );
+  assert(repo.rows.get(task.id)?.deleted === true);
+  assert(notificationPosts.length === 1 && notificationDeletes.length === 1);
+  assert(posts.at(-1)!.text === `Deleted task #${task.number}.`);
+});
+
+Deno.test("a failed channel confirmation preserves the active assignment interaction", async () => {
+  const { event, client, notificationPosts } = fixture();
+  const repo = new MemoryTaskRepository();
+  client.chat.postMessage = () => Promise.resolve({ ok: false, error: "ratelimited" });
+  const result = await handleMessage(
+    { ...event, text: "<@UBOT> task Reply failure assign <@UJAMES>" },
+    client,
+    repo,
+  );
+  assert("error" in result && result.interactive === true);
+  assert(repo.writes === 1 && notificationPosts.length === 1);
 });

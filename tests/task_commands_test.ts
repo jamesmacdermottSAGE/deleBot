@@ -117,7 +117,6 @@ Deno.test("deletion is isolated and works in a thread or with a task number", ()
   }
   for (
     const command of [
-      "delete done",
       "done delete",
       "123 delete p 1",
       "123 assign <@UJAMES> delete",
@@ -132,6 +131,148 @@ Deno.test("deletion is isolated and works in a thread or with a task number", ()
     name: "Delete old data",
     patch: { description: "delete old records" },
   });
+});
+
+Deno.test("edit replaces named fields atomically in threads and with task numbers", () => {
+  equal(parseTaskCommand('edit due 6/11/26 p 1 desc "New text"'), {
+    kind: "update",
+    patch: { set: { dueDate: "2026-11-06", priority: 1, description: "New text" } },
+  });
+  equal(
+    parseTaskCommand(
+      '123 edit name "Review due dates" assign <@UJAMES> links https://a.example link https://b.example completed no',
+    ),
+    {
+      kind: "update",
+      number: 123,
+      patch: {
+        set: {
+          name: "Review due dates",
+          assignees: ["UJAMES"],
+          links: ["https://a.example", "https://b.example"],
+          completed: false,
+        },
+      },
+    },
+  );
+  equal(parseTaskCommand("#123 edit assign - due -"), {
+    kind: "update",
+    number: 123,
+    patch: { set: { assignees: [], dueDate: null } },
+  });
+  equal(
+    parseTaskCommand(
+      'link https://a.example edit desc "Replace existing description" priority 2',
+    ),
+    {
+      kind: "update",
+      patch: {
+        links: ["https://a.example"],
+        set: { description: "Replace existing description", priority: 2 },
+      },
+    },
+  );
+  equal(parseTaskCommand("edit desc First desc Second p 1 priority 1 done"), {
+    kind: "update",
+    patch: { set: { description: "First\n\nSecond", priority: 1, completed: true } },
+  });
+  for (
+    const text of [
+      "edit",
+      "edit name",
+      'edit name ""',
+      "edit name One name Two",
+      "edit p 1 p 2",
+      "edit completed maybe",
+      "edit completed no done",
+      "assign <@UJAMES> edit assign <@UALICE>",
+      "link https://a.example edit link https://b.example",
+      "edit edit due 6/11/26",
+      "task New edit desc Text",
+    ]
+  ) invalid(text);
+});
+
+Deno.test("delete followed by field names clears fields rather than deleting the task", () => {
+  equal(parseTaskCommand("delete due p desc"), {
+    kind: "update",
+    patch: { clear: ["dueDate", "priority", "description"] },
+  });
+  equal(
+    parseTaskCommand("(123) delete links assignees completed viewPerms editPerms links"),
+    {
+      kind: "update",
+      number: 123,
+      patch: { clear: ["links", "assignees", "completed", "viewPerms", "editPerms"] },
+    },
+  );
+  equal(parseTaskCommand("delete done"), {
+    kind: "update",
+    patch: { clear: ["completed"] },
+  });
+  for (
+    const text of [
+      "delete name",
+      "delete due 6/11/26",
+      "delete due p1",
+      "delete due edit desc New",
+      "delete unknown",
+      'delete "due"',
+      "task New delete due",
+    ]
+  ) invalid(text);
+});
+
+Deno.test("view and edit permissions accept people, teams or all independently of assignments", () => {
+  equal(
+    parseTaskCommand("task Review viewPerms <@UJAMES> <!subteam^SALPHA> editPerms all"),
+    {
+      kind: "create",
+      name: "Review",
+      patch: { viewPerms: ["UJAMES", "SALPHA"], editPerms: ["all"] },
+    },
+  );
+  equal(
+    parseTaskCommand(
+      "viewPerms <@UJAMES> viewPerms <!subteam^SALPHA> editPerms <@UALICE>",
+    ),
+    {
+      kind: "update",
+      patch: { viewPerms: ["UJAMES", "SALPHA"], editPerms: ["UALICE"] },
+    },
+  );
+  equal(parseTaskCommand("123 edit viewPerms all editPerms <!subteam^SALPHA>"), {
+    kind: "update",
+    number: 123,
+    patch: { set: { viewPerms: ["all"], editPerms: ["SALPHA"] } },
+  });
+  equal(parseTaskCommand("perms match"), { kind: "update", patch: { matchPerms: true } });
+  equal(parseTaskCommand("viewPerms <!subteam^SALPHA> perms match"), {
+    kind: "update",
+    patch: { viewPerms: ["SALPHA"], matchPerms: true },
+  });
+  equal(parseTaskCommand("task Review viewPerms <@UJAMES> perms match"), {
+    kind: "create",
+    name: "Review",
+    patch: { viewPerms: ["UJAMES"], matchPerms: true },
+  });
+  for (
+    const text of [
+      "viewPerms",
+      "editPerms -",
+      "viewPerms @james",
+      "viewPerms all <@UJAMES>",
+      "viewPerms all viewPerms <@UJAMES>",
+      "perms",
+      "perms all",
+      "perms match now",
+      "perms match editPerms all",
+      "editPerms all perms match",
+      "viewPerms all edit viewPerms <@UJAMES>",
+      "edit viewPerms <@UJAMES> p 6",
+      `viewPerms ${Array.from({ length: 21 }, (_, i) => `<@U${i}>`).join(" ")}`,
+    ]
+  ) invalid(text);
 });
 
 Deno.test("repeat assign and link clauses combine and deduplicate, including Slack links", () => {
