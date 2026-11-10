@@ -36,14 +36,15 @@ export const TASK_CREATE_USAGE = [
   "💬 *Create:* `task Name` in your DM with DeleBot; no bot mention needed. In a channel, start with @DeleBot. A name is required; other fields are optional and tasks start unassigned. Example: `task Review PRs assign @person @team p 1 due 6/11/26`.",
   "*Fields:* `assign @person @team`, `desc text`, `p 1` (highest) through `p 5`, `due 6/11/26` (day/month/year), `link https://…`, `jira https://…`, `github https://…`, and `access @person @team` or `access all`.",
   "*Assignments:* `assign @person @team` adds assignees, `assign -` assigns yourself, and `assign all` replaces specific assignees with everyone. Select people from Slack's @ menu; type `teams` to find team handles you can type directly. Assigning a team sends each current member who can view the task an invitation DM; overlapping recipients receive one invitation per assignment event. Assigning all does not send invitations to everyone.",
-  "*Respond and delegate:* reply to an invitation or task thread with `accept`, `reject`, `delegate @person`, or `delegate @team`. Or use a task number, e.g. `123 accept` or `123 delegate @team`. Invitations also have Accept, Reject and Delegate buttons. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. The next assignee gets a new pending invitation. Rejecting returns the task to your previous delegator, or its creator, with a new invitation to accept, reject or delegate again. Rejections walk back through the delegation chain and stop if the creator rejects their own task. Rejected and delegated responses remain visible on the task. Rejecting a team invitation also keeps the team assigned. Accepting replaces your assigned team with you; delegating replaces it with the chosen assignee. Other members' team invitations then close. Unrelated assignees stay assigned.",
+  "*Respond and delegate:* reply with `accept`, `reject`, `delegate @person @team`, or use the Accept / Reject / Delegate buttons. A number also works, e.g. `123 accept`. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. Delegation changes only your branch; siblings stay pending. A squad snapshots its members when invited and returns only after every member's branch rejects. Returns unwind one delegator at a time; if the creator rejects the returned task, it is deleted. One acceptance selects the single owner and closes all competing invitations with an accepted-by message. Other people cannot claim or reassign an owned task. Only the owner can delegate it further.",
   "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
   '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
   "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
   "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
-  "*Clear chat:* `clear` in a DM removes DeleBot's messages and thread replies. Slack does not let the bot delete your messages. Saved tasks are unchanged; use ls to show them again.",
+  "*Clear chat:* `clear` in a DM clears that chat; in a DM thread it clears only that thread. Large histories run in resumable batches: repeat clear when prompted. Your messages require your Slack user authorization to delete; without it only bot messages are removed. Saved tasks are unchanged.",
   "*Complete:* `done` or `work done` completes a task. `edit completed no` reopens it. Reply in the task's thread or specify its number, e.g. `123 done`. Bare done also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
-  "*Permissions:* `access @person @team` (alias: `editPerms`) controls editing and delegation; `viewPerms @person @team` controls viewing. Use `all` for everyone. `perms match` copies view permissions to edit permissions. Assigning someone does not change their permissions. Both permissions default to all on new tasks.",
+  "*Access:* `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Creators and current access holders administer access. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
+  "*Collaborate:* the accepted owner can use `collab @person` to send a separate collaboration invitation. Recipients use its buttons or `collab accept` / `collab reject` in the task thread. `ls collab` lists accepted collaborations; collaborators are not assignees.",
   "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
 ].join("\n\n");
@@ -65,6 +66,15 @@ export type TaskCommand =
   | { kind: "print"; number?: number }
   | { kind: "reset" }
   | { kind: "clear-chat" }
+  | { kind: "collaborate"; number?: number; users: string[] }
+  | { kind: "collaboration-response"; number?: number; accept: boolean }
+  | {
+    kind: "approval-response";
+    number?: number;
+    kindOfAction: "complete" | "delete";
+    approve: boolean;
+    requestId?: string;
+  }
   | { kind: "help"; topic: "general" | "create" | "list" }
   | { kind: "create"; name: string; patch: TaskPatch }
   | { kind: "update"; number?: number; patch: TaskPatch }
@@ -695,6 +705,44 @@ export function parseTaskCommand(text: string): TaskCommand {
     .replace(/^\((\d+)\)(?=\s|$)/, "$1");
   if (command === "?") return { kind: "help", topic: "general" };
   if (/^clear$/i.test(command)) return { kind: "clear-chat" };
+  if (/^ls\s+collab$/i.test(command)) {
+    return { kind: "list", query: { kind: "collaborator" } };
+  }
+  const participation = /^(?:(\d+)\s+)?(collab|approve|deny)\s+([\s\S]+)$/i.exec(command);
+  if (participation) {
+    const number = participation[1] ? numberValue(participation[1]) : undefined;
+    if (participation[1] && !number) return invalid("Use a valid task number.");
+    const word = participation[2].toLowerCase(), value = participation[3].trim();
+    if (word === "collab") {
+      if (/^(accept|reject)$/i.test(value)) {
+        return {
+          kind: "collaboration-response",
+          ...(number ? { number } : {}),
+          accept: /^accept$/i.test(value),
+        };
+      }
+      const users = parseAssignees(value);
+      if (!users?.length || users.some((id) => !/^[UW]/.test(id))) {
+        return invalid(
+          "Use collab followed by one or more Slack people mentions, or collab accept / collab reject.",
+        );
+      }
+      return { kind: "collaborate", ...(number ? { number } : {}), users };
+    }
+    const request = /^(complete|done|delete)(?:\s+(\S+))?$/i.exec(value);
+    if (!request) {
+      return invalid(
+        "Use approve complete, approve delete, deny complete, or deny delete in the task thread.",
+      );
+    }
+    return {
+      kind: "approval-response",
+      ...(number ? { number } : {}),
+      kindOfAction: /^delete$/i.test(request[1]) ? "delete" : "complete",
+      approve: word === "approve",
+      ...(request[2] ? { requestId: request[2] } : {}),
+    };
+  }
   if (/^delete\s+all$/i.test(command)) return { kind: "reset" };
   if (/^task\s+\?$/i.test(command)) return { kind: "help", topic: "create" };
   if (/^ls(?:\s+tasks?)?\s+\?$/i.test(command)) return { kind: "help", topic: "list" };

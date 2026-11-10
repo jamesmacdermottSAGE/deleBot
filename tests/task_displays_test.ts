@@ -6,6 +6,7 @@ import {
   ASSIGNMENT_DELEGATE,
   ASSIGNMENT_REJECT,
   type MessageBlocks,
+  type NotificationBatch,
   notifyTaskAssignments,
   SlackNotificationStore,
 } from "../delebot/slack/notifications.ts";
@@ -115,6 +116,7 @@ Deno.test("refresh preserves verified team handles on tracked and recovered card
       teamNames: { SJSQUAD: "jsquad" },
     }));
   const task = { ...f.task, assignees: ["SJSQUAD"], teams: ["SJSQUAD"] };
+  delete task.assignmentTree;
   assert(await displays.refresh(task) === 0);
   assert(f.updates.length === 3);
   assert(
@@ -308,7 +310,10 @@ for (const variant of ["person", "team", "returned", "note"]) {
     if (teamAssignment) {
       assert(membershipCalls > 0 && deletions === 0);
       membershipAvailable = false;
-      assert(await displays.refresh(task) > 0);
+      assert(
+        await taskDisplays(client as unknown as Parameters<typeof taskDisplays>[0])
+          .refresh(task) > 0,
+      );
       assert(
         deletions === 0,
         "A failed membership lookup must preserve pending invitations",
@@ -321,3 +326,92 @@ for (const variant of ["person", "team", "returned", "note"]) {
     }
   });
 }
+
+Deno.test("revoked and deleted invitation copies never receive the accepted owner's identity", async () => {
+  for (const variant of ["revoked", "deleted", "completed-revoked"]) {
+    const repo = new MemoryTaskRepository();
+    const { task } = await createTask(
+      { name: "Private ownership", assignees: ["UALICE", "UBOB"] },
+      { channelId: "DTEST", messageTs: "1.1", userId: "UCREATOR" },
+      repo,
+      { userId: "UCREATOR", teamIds: [] },
+    );
+    const accepted = (await respondToAssignment(
+      task,
+      { kind: "accept" },
+      { channelId: "DALICE", messageTs: "2.1", userId: "UALICE" },
+      repo,
+      { userId: "UALICE", teamIds: [] },
+    )).task;
+    const records = new Map<string, Record<string, unknown>>();
+    const updates: string[] = [];
+    const removed: string[] = [];
+    const client = {
+      apps: {
+        datastore: {
+          put: ({ item }: { item: Record<string, unknown> }) => {
+            records.set(item.id as string, structuredClone(item));
+            return Promise.resolve({ ok: true });
+          },
+          get: ({ id }: { id: string }) =>
+            Promise.resolve({ ok: true, item: structuredClone(records.get(id) ?? {}) }),
+          query: ({ datastore }: { datastore: string }) =>
+            Promise.resolve({
+              ok: true,
+              items: datastore === "assignment_notifications"
+                ? [...records.values()]
+                : [],
+            }),
+        },
+      },
+      chat: {
+        update: ({ text }: { text: string }) => {
+          updates.push(text);
+          return Promise.resolve({ ok: true });
+        },
+        delete: ({ channel, ts }: { channel: string; ts: string }) => {
+          removed.push(`${channel}:${ts}`);
+          return Promise.resolve({ ok: true });
+        },
+      },
+    };
+    const batch: NotificationBatch = {
+      id: `${task.id}:event`,
+      taskId: task.id,
+      eventKey: "event",
+      assigned: ["UBOB"],
+      recipients: ["UBOB"],
+      delivered: ["UBOB"],
+      cancelled: [],
+      resolvedGroups: [],
+      invitations: {
+        UBOB: {
+          id: crypto.randomUUID(),
+          recipientId: "UBOB",
+          status: "pending",
+          executionId: "FXTEST",
+          channelId: "DBOB",
+          messageTs: "10.1",
+        },
+      },
+    };
+    await new SlackNotificationStore(client).save(batch);
+    const displays = new SlackTaskDisplays(
+      client,
+      (_task, userId) => Promise.resolve({ userId, teamIds: [] }),
+    );
+    const hidden = variant === "deleted" ? { ...accepted, deleted: true } : {
+      ...accepted,
+      viewPerms: ["UALICE"],
+      ...(variant === "completed-revoked"
+        ? { completed: true, status: "completed" as const }
+        : {}),
+    };
+    assert(await displays.refresh(hidden) === 0);
+    assert(removed.join() === "DBOB:10.1", variant);
+    assert(
+      updates.length === 0,
+      `No ownership or completion details should leak for ${variant}`,
+    );
+  }
+});

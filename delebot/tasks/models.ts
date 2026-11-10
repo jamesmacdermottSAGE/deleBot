@@ -1,3 +1,5 @@
+import type { TaskAssignmentTree } from "./assignment_tree.ts";
+import type { TaskParticipation } from "./participation.ts";
 /** Priority 1 is highest; priority 5 is lowest. */
 export type Priority = 1 | 2 | 3 | 4 | 5;
 /** Legacy type alias for datastore compatibility. */
@@ -36,6 +38,9 @@ export interface Task extends TaskInput {
   appliedEvents?: string[];
   /** Durable notification intent survives retries between saving and delivery. */
   assignmentEvents?: Record<string, string[]>;
+  assignmentTree?: TaskAssignmentTree;
+  assignmentEventNodes?: Record<string, string[]>;
+  participation?: TaskParticipation;
   assignmentResponses?: Record<
     string,
     {
@@ -65,6 +70,7 @@ export type TaskQuery =
   | { kind: "due"; dueDate: string }
   | { kind: "team"; teamId: string }
   | { kind: "completed"; completed: boolean }
+  | { kind: "collaborator" }
   | {
     kind: "filters";
     targets?: TaskTarget[];

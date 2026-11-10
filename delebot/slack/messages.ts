@@ -4,10 +4,11 @@ import type { Task } from "../tasks/models.ts";
 export const GREETING = [
   "💬 Talk directly to DeleBot in a DM; no bot mention needed.",
   "*Create:* `task Name`, or `task Name assign @person @team p 1 due 6/11/26`. Type `teams` to find team handles.",
-  "*List:* `ls` shows available tasks; `ls me` includes your direct and team assignments. Use `ls @person`, `ls @team`, or `ls soon` to narrow the results. Each task arrives as a separate DM message.",
+  "*List:* `ls` shows available tasks; `ls me` includes your direct and team assignments. `ls collab` shows your collaborations. Each task arrives as a separate DM message.",
   "Reply in a task's thread with `accept`, `reject`, `delegate @person`, edits, or `done`. You can also select a task by number, e.g. `123 done`.",
   "*Help:* `task ?` for full task creation, editing and delegation instructions; `ls ?` for all list filters.",
-  "*Clear chat:* `clear` removes DeleBot's messages from this DM. Your messages and saved tasks remain.",
+  "The accepted owner can invite collaborators with `collab @person`. Access holders approve completion/deletion requests.",
+  "*Clear:* in a DM clears that chat; in a DM thread clears that thread. Your own messages require Slack user authorization. Repeat when prompted; tasks remain.",
 ].join("\n\n");
 
 export const UNKNOWN_COMMAND =
@@ -23,6 +24,39 @@ function mention(userId: string): string {
 }
 
 function assignees(task: Task, teamNames: Record<string, string>): string {
+  if (task.assignmentTree) {
+    const tree = task.assignmentTree;
+    const render = (id: string, depth = 0): string => {
+      const node = tree.nodes[id];
+      const label = node.kind === "team"
+        ? escapeText(
+          teamNames[node.principalId]
+            ? `@${teamNames[node.principalId].replace(/^@/, "")}`
+            : `Team ${node.principalId}`,
+        )
+        : mention(node.principalId);
+      const state = node.status === "accepted"
+        ? "✅ Accepted"
+        : node.status === "rejected"
+        ? "❌ Rejected"
+        : node.status === "cancelled"
+        ? (tree.acceptedBy
+          ? `Closed — accepted by ${mention(tree.acceptedBy)}`
+          : "Closed")
+        : node.status === "delegated"
+        ? "↪️ Delegated"
+        : "⏳ Pending";
+      return `${"  ".repeat(depth)}${label} ${state}${
+        node.children.length
+          ? "\n" + node.children.map((child) => render(child, depth + 1)).join("\n")
+          : ""
+      }`;
+    };
+    const root = tree.nodes[tree.rootId];
+    return root.status === "delegated" && !root.returned && !root.explicit
+      ? root.children.map((id) => render(id)).join("\n")
+      : render(root.id);
+  }
   const ids = task.assignmentBased
     ? task.assignees
     : [...new Set([...task.assignees, ...task.teams])];
@@ -89,6 +123,21 @@ export function formatTask(task: Task, teamNames: Record<string, string> = {}): 
   return [
     `*Task #${task.number}: ${escapeText(task.name)}*`,
     `*Assignees:* ${assignees(task, teamNames)}`,
+    ...(task.assignmentTree?.acceptedBy
+      ? [`*Accepted by:* ${mention(task.assignmentTree.acceptedBy)}`]
+      : []),
+    ...(task.participation &&
+        Object.entries(task.participation.collaborators).some(([, entry]) =>
+          entry.status === "accepted"
+        )
+      ? [
+        `*Collaborators:* ${
+          Object.entries(task.participation.collaborators).filter(([, entry]) =>
+            entry.status === "accepted"
+          ).map(([id]) => mention(id)).join(", ")
+        }`,
+      ]
+      : []),
     `*Description:* ${task.description ? escapeText(task.description) : ""}`,
     `*Due:* ${dueDate(task.dueDate)}`,
     `*Priority:* ${task.priority == null ? "" : task.priority}`,

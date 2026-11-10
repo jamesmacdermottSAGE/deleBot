@@ -67,7 +67,14 @@ Deno.test("assignment decisions retain history and delegation repeats the pendin
     repo,
     access,
   );
-  assert(formatTask(delegated.task).includes("<@UALICE> ↪️ Delegated → <@UBOB>"));
+  assert(
+    delegated.task.assignmentTree?.nodes[delegated.task.assignmentTree.rootId].status ===
+      "delegated",
+  );
+  assert(
+    delegated.task.assignmentTree?.nodes[delegated.task.assignmentTree.rootId]
+      .principalId === "UALICE",
+  );
   assert(formatTask(delegated.task).includes("<@UBOB> ⏳ Pending"));
   const rejected = await respondToAssignment(
     delegated.task,

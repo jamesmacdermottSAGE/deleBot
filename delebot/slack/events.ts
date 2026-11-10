@@ -1,6 +1,21 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 import { resetTaskDatabase } from "../tasks/reset.ts";
 import { clearDmHistory } from "./clear.ts";
+import { taskAccessLoader } from "./access_context.ts";
+import { SlackAPI } from "deno-slack-api/mod.ts";
+import { canManageTask } from "../tasks/access.ts";
+import {
+  inviteCollaborators,
+  requestTaskAction,
+  respondToCollaboration,
+  respondToTaskAction,
+} from "../tasks/participation.ts";
+import {
+  handleParticipationAction,
+  notifyParticipation,
+  PARTICIPATION_ACTION_IDS,
+  type ParticipationClient,
+} from "./participation_messages.ts";
 import { type TaskDisplays, taskDisplays } from "./task_displays.ts";
 import { type DmContexts, expandTeamHandles, SlackDmContexts } from "./dm_context.ts";
 import type { TaskAccess } from "../tasks/models.ts";
@@ -76,7 +91,7 @@ import {
   type TeamSnapshot,
 } from "./teams.ts";
 import { resolveWorkspace, type WorkspaceClient } from "./workspace.ts";
-import { canAccessTask, isPublicTask, taskReferencedTeamIds } from "../tasks/access.ts";
+import { canAccessTask, isPublicTask } from "../tasks/access.ts";
 import {
   ASSIGNMENT_ACTION_IDS,
   ASSIGNMENT_DELEGATE_VIEW,
@@ -159,7 +174,15 @@ export async function handleMessage(
     userId: string,
     botUserId: string,
     boundary: string,
-  ) => Promise<{ deleted: number; failed: number }>,
+    threadTs?: string,
+  ) => Promise<
+    {
+      deleted: number;
+      failed: number;
+      remaining?: boolean;
+      userMessagesRemaining?: boolean;
+    }
+  >,
 ): Promise<MessageResult> {
   const ignored = { outputs: { ignored: true } };
   if (event.bot_id || event.subtype || !event.user_id || !event.message_ts) {
@@ -218,7 +241,7 @@ export async function handleMessage(
   const command = parseTaskCommand(text);
   // Help, validation errors and task results from list commands all stay in DMs.
   const directReply = /^(?:ls(?:\s|$|<@|@)|tasks\s+ls(?:\s|$))/i.test(text);
-  const context = {
+  const context: TaskContext = {
     channelId: event.channel_id,
     messageTs: event.message_ts,
     userId: event.user_id,
@@ -232,6 +255,7 @@ export async function handleMessage(
   let listedTasks: Task[] = [];
   let replies = [text ? UNKNOWN_COMMAND : GREETING];
   let hasTaskCards = false;
+  let replyWorkspaceId: string | undefined;
   if (teamMenu) {
     replies = [teamMenu];
   } else if (command.kind === "clear-chat") {
@@ -247,10 +271,23 @@ export async function handleMessage(
           event.user_id,
           identity.user_id,
           event.message_ts,
+          event.thread_ts && event.thread_ts !== event.message_ts
+            ? event.thread_ts
+            : undefined,
         );
         shownTaskIds = [];
         replies = [
-          `Cleared ${result.deleted} DeleBot messages from this DM. Slack only lets me delete my own messages, so your messages remain. Saved tasks are unchanged.${
+          `Cleared ${result.deleted} messages from this ${
+            event.thread_ts && event.thread_ts !== event.message_ts ? "DM thread" : "DM"
+          }. ${
+            result.userMessagesRemaining !== false
+              ? "User messages require your Slack user authorization and remain until it is configured. "
+              : ""
+          }Saved tasks are unchanged.${
+            result.remaining
+              ? " More history remains; send clear again to continue from the saved position."
+              : ""
+          }${
             result.failed
               ? " Some messages or cleanup records could not be cleared; run clear again to retry."
               : ""
@@ -290,7 +327,10 @@ export async function handleMessage(
     replies = [command.message];
   } else if (
     command.kind === "create" || command.kind === "list" || command.kind === "update" ||
-    command.kind === "delete" || command.kind === "response" || command.kind === "print"
+    command.kind === "delete" || command.kind === "response" ||
+    command.kind === "print" ||
+    command.kind === "collaborate" || command.kind === "collaboration-response" ||
+    command.kind === "approval-response"
   ) {
     if (!repository || !teamDirectory) {
       return { error: "Task storage and team membership must be configured." };
@@ -347,6 +387,8 @@ export async function handleMessage(
         }
       }
       const { access, knownTeamIds, teamNames, disabledTeamIds = [] } = snapshot;
+      context.groupMembers = snapshot.teamMembers;
+      replyWorkspaceId = workspaceId;
       if (access.userId !== event.user_id) {
         throw new TaskAccessError("Membership verification did not match the requester.");
       }
@@ -399,29 +441,43 @@ export async function handleMessage(
             ? event.thread_ts
             : "latest",
         );
-        await deleteTask(target, context, repository, access);
-        changedTask = { ...target, deleted: true };
-        privateReply = !isDm && !isPublicTask(target);
-        replies = [`Deleted task #${target.number}.`];
-        shownTaskIds = [];
-        if (notifications) {
-          try {
-            const cleanup = await notifyTaskAssignments(
-              { ...target, deleted: true },
-              workspaceId,
-              notifications.client,
-              notifications.store,
-              notifications.context,
-            );
-            if (cleanup.failed.length) {
+        if (!canManageTask(target, access)) {
+          const request = await requestTaskAction(
+            target,
+            "delete",
+            context,
+            repository,
+            access,
+          );
+          changedTask = request.task;
+          replies = [
+            "Deletion requested. The task stays available until someone in its Access field approves.",
+          ];
+        } else {
+          await deleteTask(target, context, repository, access);
+          changedTask = { ...target, deleted: true };
+          privateReply = !isDm && !isPublicTask(target);
+          replies = [`Deleted task #${target.number}.`];
+          shownTaskIds = [];
+          if (notifications) {
+            try {
+              const cleanup = await notifyTaskAssignments(
+                { ...target, deleted: true },
+                workspaceId,
+                notifications.client,
+                notifications.store,
+                notifications.context,
+              );
+              if (cleanup.failed.length) {
+                replies.push(
+                  "The task was deleted, but some assignment messages could not be removed. Their task controls can no longer change the deleted task.",
+                );
+              }
+            } catch {
               replies.push(
-                "The task was deleted, but some assignment messages could not be removed. Their task controls can no longer change the deleted task.",
+                "The task was deleted, but assignment-message cleanup could not be confirmed.",
               );
             }
-          } catch {
-            replies.push(
-              "The task was deleted, but assignment-message cleanup could not be confirmed.",
-            );
           }
         }
       } else {
@@ -453,7 +509,38 @@ export async function handleMessage(
               ? event.thread_ts
               : "latest",
           );
-          const result = command.kind === "response"
+          const result = command.kind === "collaborate"
+            ? await inviteCollaborators(
+              target,
+              command.users,
+              context,
+              repository,
+              access,
+            )
+            : command.kind === "collaboration-response"
+            ? await respondToCollaboration(
+              target,
+              command.accept ? "accept" : "reject",
+              context,
+              repository,
+              access,
+            )
+            : command.kind === "approval-response"
+            ? await respondToTaskAction(
+              target,
+              command.requestId ?? uniqueRequest(target, command.kindOfAction),
+              command.approve ? "approve" : "reject",
+              context,
+              repository,
+              access,
+            )
+            : command.kind === "update" && command.patch.completed === true &&
+                !canManageTask(target, access)
+            ? await requestTaskAction(target, "complete", context, repository, access)
+            : command.kind === "update" && command.patch.set?.completed === true &&
+                !canManageTask(target, access)
+            ? await requestTaskAction(target, "complete", context, repository, access)
+            : command.kind === "response"
             ? await respondToAssignment(
               target,
               command.decision,
@@ -470,6 +557,11 @@ export async function handleMessage(
             );
           task = result.task;
           acknowledgement = result.updated ? "Updated" : "Already applied to";
+          if (
+            command.kind === "update" &&
+            (command.patch.completed || command.patch.set?.completed) &&
+            !canManageTask(target, access)
+          ) acknowledgement = "Requested completion of";
         }
         const stillVisible = canAccessTask(task, access);
         const quiet = command.kind !== "create" && !!event.thread_ts &&
@@ -486,7 +578,13 @@ export async function handleMessage(
                 formatTask(task, teamNames)
               }`,
           ]
-          : ["Changes saved. Your viewing permissions no longer include this task."];
+          : [
+            task.deleted
+              ? (command.kind === "response" && command.decision.kind === "reject"
+                ? `Task #${task.number} was deleted after its creator rejected the returned assignment.`
+                : `Deleted task #${task.number}.`)
+              : "Changes saved. Your viewing permissions no longer include this task.",
+          ];
         const key = mutationKey(context);
         const assigned = task.assignmentEvents?.[key] ?? [];
         if (notifications) {
@@ -543,6 +641,27 @@ export async function handleMessage(
     }
   }
 
+  if (changedTask?.participation && notifications?.client.chat.update && repository) {
+    try {
+      const delivery = await notifyParticipation(
+        changedTask,
+        replyWorkspaceId,
+        notifications.client as ParticipationClient,
+        notifications.context ?? {},
+        repository,
+      );
+      interactive ||= delivery.interactive;
+      changedTask = await repository.findById(changedTask.id) ?? changedTask;
+      if (delivery.failed.length) {
+        replies.push(
+          "Your change was saved, but some collaboration or approval messages could not be delivered. Update the task to retry.",
+        );
+      }
+    } catch {
+      replies.push("Your change was saved, but request delivery could not be confirmed.");
+    }
+  }
+
   if (displays && (changedTask || listedTasks.length)) {
     try {
       let failed = 0;
@@ -563,6 +682,7 @@ export async function handleMessage(
   let replyChannel = event.channel_id;
   const sourceThread = event.thread_ts || event.message_ts;
   let replyThread: string | undefined = sourceThread;
+  if (command.kind === "clear-chat") replyThread = undefined;
   // Lists are task pickers in the main DM; individual lookups and mutations
   // create or continue the thread of the user's message.
   if (
@@ -715,7 +835,7 @@ export const MessageFunction = DefineFunction({
   },
 });
 
-export default SlackFunction(MessageFunction, async ({ inputs, client, event }) => {
+export default SlackFunction(MessageFunction, async ({ inputs, client, event, env }) => {
   try {
     const repository = new SlackTaskRepository(client);
     const directory = new SlackTeamDirectory(client);
@@ -728,39 +848,40 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event }) 
         client,
         store: new SlackNotificationStore(client),
         context: {
+          loadTask: (id) => repository.findById(id),
           rememberTask: async (channel, ts, user, id) => {
             const store = new SlackDmContexts(client);
             await store.save(channel, ts, user, [id], "invitation");
             await store.save(channel, "latest", user, [id]);
           },
           executionId: event.function_execution_id,
-          loadAccess: async (task, userId, workspaceId) => {
-            const directAccess = { userId, teamIds: [] as string[] };
-            const references = taskReferencedTeamIds(task);
-            if (!references.length) return directAccess;
-            try {
-              const workspace = workspaceId ??
-                await resolveWorkspace(client, task.channelId, {});
-              const snapshot = await directory.load(userId, workspace, references);
-              if (snapshot.access.userId !== userId) {
-                throw new Error("Membership does not match notification recipient.");
-              }
-              return snapshot.access;
-            } catch (error) {
-              if (
-                ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
-                canAccessTask(task, directAccess)
-              ) return directAccess;
-              throw error;
-            }
-          },
+          loadAccess: taskAccessLoader(client),
         },
       },
       () => resetTaskDatabase(client),
       new SlackDmContexts(client),
       taskDisplays(client),
-      (channel, userId, botUserId, boundary) =>
-        clearDmHistory(client, channel, userId, botUserId, boundary),
+      (channel, userId, botUserId, boundary, threadTs) => {
+        const configured: unknown = env.SLACK_CLEAR_USER_TOKENS
+          ? JSON.parse(env.SLACK_CLEAR_USER_TOKENS)
+          : {};
+        const token =
+          configured && typeof configured === "object" && !Array.isArray(configured)
+            ? (configured as Record<string, unknown>)[userId]
+            : undefined;
+        if (
+          token !== undefined && (typeof token !== "string" || !token.startsWith("xoxp-"))
+        ) throw new Error("Invalid requester authorization configuration.");
+        return clearDmHistory(
+          client,
+          channel,
+          userId,
+          botUserId,
+          boundary,
+          threadTs,
+          typeof token === "string" ? SlackAPI(token) : undefined,
+        );
+      },
     );
     // Interactive assignment messages remain active until their recipients respond.
     if (result.interactive) return { completed: false };
@@ -772,4 +893,54 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event }) 
     };
   }
 }).addBlockActionsHandler(ASSIGNMENT_ACTION_IDS, assignmentBlockActionHandler)
+  .addBlockActionsHandler(PARTICIPATION_ACTION_IDS, async ({ body, action, client }) => {
+    const repository = new SlackTaskRepository(client);
+    const raw = action as unknown as {
+      action_id?: string;
+      value?: string;
+      action_ts?: string;
+    };
+    const container = body.container as { channel_id?: string; message_ts?: string };
+    const result = await handleParticipationAction({
+      actionId: raw.action_id ?? "",
+      value: raw.value ?? "",
+      userId: body.user.id,
+      channelId: container.channel_id ?? "",
+      messageTs: container.message_ts ?? "",
+      executionId: body.function_data.execution_id,
+      actionTs: raw.action_ts,
+    }, {
+      client,
+      repository,
+      displays: taskDisplays(client),
+      notificationStore: new SlackNotificationStore(client),
+      loadAccess: taskAccessLoader(client),
+      rememberTask: async (channel, ts, userId, taskId) => {
+        await new SlackDmContexts(client).save(
+          channel,
+          ts,
+          userId,
+          [taskId],
+          "invitation",
+        );
+      },
+    });
+    if (!result.ok && result.error && container.channel_id) {
+      await client.chat.postEphemeral({
+        channel: container.channel_id,
+        user: body.user.id,
+        text: result.error,
+      });
+    }
+  })
   .addViewSubmissionHandler(ASSIGNMENT_DELEGATE_VIEW, assignmentViewSubmissionHandler);
+
+function uniqueRequest(task: Task, kind: "complete" | "delete"): string {
+  const ids = Object.entries(task.participation?.requests ?? {}).filter(([, request]) =>
+    request.kind === kind && request.status === "pending"
+  ).map(([id]) => id);
+  if (ids.length !== 1) {
+    throw new TaskCommandError("Choose a specific pending request using its request ID.");
+  }
+  return ids[0];
+}

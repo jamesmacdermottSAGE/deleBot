@@ -7,6 +7,39 @@ import {
   isTaskTeams,
 } from "./access.ts";
 import type { Task, TaskAccess } from "./models.ts";
+import { validateAssignmentTree } from "./assignment_tree.ts";
+import { parseParticipation } from "./participation.ts";
+
+function workflowState(
+  value: unknown,
+): Pick<Task, "assignmentTree" | "assignmentEventNodes" | "participation"> {
+  if (value === undefined) return {};
+  if (typeof value !== "string") throw new Error("Invalid task workflow state.");
+  const state = JSON.parse(value);
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    throw new Error("Invalid task workflow state.");
+  }
+  if (
+    state.assignmentEventNodes !== undefined &&
+    (!state.assignmentEventNodes || typeof state.assignmentEventNodes !== "object" ||
+      Array.isArray(state.assignmentEventNodes) ||
+      !Object.values(state.assignmentEventNodes).every((keys) =>
+        Array.isArray(keys) &&
+        keys.every((key) => typeof key === "string" && /^n\d+:\d+$/.test(key))
+      ))
+  ) throw new Error("Invalid assignment event bindings.");
+  return {
+    ...(state.assignmentTree
+      ? { assignmentTree: validateAssignmentTree(state.assignmentTree) }
+      : {}),
+    ...(state.assignmentEventNodes
+      ? { assignmentEventNodes: state.assignmentEventNodes }
+      : {}),
+    ...(state.participation
+      ? { participation: parseParticipation(state.participation) }
+      : {}),
+  };
+}
 
 export interface TaskRepository {
   findBySource(channelId: string, messageTs: string): Promise<Task | null>;
@@ -132,6 +165,7 @@ function fromRecord(row: Record<string, unknown>): Task {
   }
   return {
     id: row.id as string,
+    ...workflowState(row.workflow_state),
     number: row.number as number,
     name: row.name as string,
     links: [...row.links],
@@ -241,6 +275,15 @@ function parseAssignmentEvents(value: unknown): Record<string, string[]> {
 function toRecord(task: Task): Record<string, unknown> {
   return {
     id: task.id,
+    ...((task.assignmentTree || task.participation || task.assignmentEventNodes)
+      ? {
+        workflow_state: JSON.stringify({
+          assignmentTree: task.assignmentTree,
+          participation: task.participation,
+          assignmentEventNodes: task.assignmentEventNodes,
+        }),
+      }
+      : {}),
     number: task.number,
     number_text: String(task.number),
     name: task.name,

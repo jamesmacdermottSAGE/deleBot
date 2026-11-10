@@ -2,6 +2,8 @@ import { DefineDatastore, Schema } from "deno-slack-sdk/mod.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
 import { canViewTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
+import { withKeyLock } from "../tasks/mutation.ts";
+import { assignmentInvitationKey } from "../tasks/assignment_tree.ts";
 
 export type NotificationTask =
   & Pick<
@@ -18,6 +20,9 @@ export type NotificationTask =
       | "createdBy"
       | "deleted"
       | "assignmentResponses"
+      | "assignmentTree"
+      | "assignmentEventNodes"
+      | "completed"
     >
   >;
 
@@ -33,6 +38,7 @@ export type MessageBlocks = NonNullable<
   Parameters<SlackAPIClient["chat"]["postMessage"]>[0]["blocks"]
 >;
 export interface NotificationContext {
+  loadTask?: (taskId: string) => Promise<Task | null>;
   rememberTask?: (
     channel: string,
     messageTs: string,
@@ -62,6 +68,8 @@ export interface AssignmentInvitation {
   delegatedTo?: string[];
   returnedBy?: string;
   note?: string;
+  closedBy?: string;
+  completionNotified?: boolean;
   modalNonce?: string;
   modalId?: string;
   decision?: {
@@ -97,6 +105,7 @@ export interface NotificationBatch {
   sourceChannelId?: string;
   sourceMessageTs?: string;
   invitations?: Record<string, AssignmentInvitation>;
+  invitationKeys?: string[];
   completedExecutions?: string[];
 }
 
@@ -113,6 +122,9 @@ interface ApiResult {
 export interface NotificationClient {
   conversations: {
     open(args: { users: string }): Promise<ApiResult & { channel?: { id?: string } }>;
+    history?(
+      args: { channel: string; limit: number; include_all_metadata: boolean },
+    ): Promise<ApiResult & { messages?: unknown[] }>;
   };
   chat: {
     postMessage(args: {
@@ -121,6 +133,7 @@ export interface NotificationClient {
       unfurl_links: boolean;
       unfurl_media: boolean;
       blocks?: MessageBlocks;
+      metadata?: { event_type: string; event_payload: Record<string, string> };
     }): Promise<ApiResult & { ts?: string }>;
     getPermalink?(args: { channel: string; message_ts: string }): Promise<
       ApiResult & { permalink?: string }
@@ -128,6 +141,9 @@ export interface NotificationClient {
     delete?(
       args: { channel: string; ts: string },
     ): Promise<{ ok: boolean; error?: string }>;
+    update?(
+      args: { channel: string; ts: string; text: string; blocks: MessageBlocks },
+    ): Promise<ApiResult>;
   };
   usergroups: {
     users: {
@@ -301,8 +317,26 @@ export function invitationValue(
 }
 
 function isCurrentAssignment(task: NotificationTask, access: TaskAccess): boolean {
+  if (task.assignmentTree) {
+    return Object.values(task.assignmentTree.nodes).some((node) =>
+      node.kind === "user" && node.principalId === access.userId &&
+      ["pending", "accepted"].includes(node.status)
+    );
+  }
   return task.assignees.some((id) =>
     id === access.userId || (/^S/.test(id) && access.teamIds.includes(id))
+  );
+}
+
+function currentBinding(
+  task: NotificationTask,
+  batch: NotificationBatch,
+  userId: string,
+): boolean {
+  if (!task.assignmentTree || !batch.invitationKeys?.length) return true;
+  return Object.values(task.assignmentTree.nodes).some((node) =>
+    node.principalId === userId && ["pending", "accepted"].includes(node.status) &&
+    batch.invitationKeys!.includes(assignmentInvitationKey(node))
   );
 }
 
@@ -319,6 +353,76 @@ async function reconcileInvitations(
       continue;
     }
     try {
+      if (task.completed && !task.deleted && client.chat.update) {
+        const access = context.loadAccess
+          ? await context.loadAccess(
+            task as Task,
+            invitation.recipientId,
+            batch.workspaceId,
+          )
+          : { userId: invitation.recipientId, teamIds: [] };
+        if (canViewTask(task as Task, access)) {
+          if (!invitation.completionNotified) {
+            const result = await client.chat.update({
+              channel: invitation.channelId,
+              ts: invitation.messageTs,
+              text: `*Task #${task.number}: ${
+                escape(task.name)
+              }*\n\n✅ Completed. This invitation is closed.`,
+              blocks: [],
+            });
+            if (!result.ok && result.error !== "message_not_found") {
+              failed.add(invitation.recipientId);
+              continue;
+            }
+            invitation.completionNotified = true;
+            invitation.status = "cancelled";
+            batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
+            await store.save(batch);
+          }
+          continue;
+        }
+      }
+      if (
+        task.assignmentTree?.acceptedBy &&
+        (invitation.recipientId !== task.assignmentTree.acceptedBy ||
+          invitation.status === "pending") &&
+        !task.deleted &&
+        client.chat.update
+      ) {
+        const access = context.loadAccess
+          ? await context.loadAccess(
+            task as Task,
+            invitation.recipientId,
+            batch.workspaceId,
+          )
+          : { userId: invitation.recipientId, teamIds: [] };
+        if (
+          access.userId === invitation.recipientId && canViewTask(task as Task, access)
+        ) {
+          if (invitation.closedBy !== task.assignmentTree.acceptedBy) {
+            const result = await client.chat.update({
+              channel: invitation.channelId,
+              ts: invitation.messageTs,
+              text: `*Task #${task.number}: ${
+                escape(task.name)
+              }*\n\n✅ Accepted by <@${task.assignmentTree.acceptedBy}>. This invitation is closed.`,
+              blocks: [],
+            });
+            if (!result.ok && result.error !== "message_not_found") {
+              failed.add(invitation.recipientId);
+              continue;
+            }
+            invitation.closedBy = task.assignmentTree.acceptedBy;
+            invitation.status = invitation.recipientId === task.assignmentTree.acceptedBy
+              ? "accepted"
+              : "cancelled";
+            batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
+            await store.save(batch);
+          }
+          continue;
+        }
+      }
       let remove = task.deleted || invitation.status === "cancelled" ||
         invitation.status === "rejected";
       if (!remove) {
@@ -334,7 +438,8 @@ async function reconcileInvitations(
           }
           remove = !canViewTask(task as Task, access) ||
             ((invitation.status === "pending" || invitation.status === "accepted") &&
-              !isCurrentAssignment(task, access));
+              (!isCurrentAssignment(task, access) ||
+                !currentBinding(task, batch, invitation.recipientId)));
         } else if (
           task.viewPerms !== undefined &&
           !(task.viewPerms.length === 1 && task.viewPerms[0] === "all")
@@ -432,7 +537,7 @@ export function assignmentNotificationText(
  * succeeds but saving the marker fails (or concurrent duplicate workflows run),
  * a retry can duplicate that notification; no exactly-once guarantee is claimed.
  */
-export async function notifyAssignments(
+async function notifyAssignmentsUnlocked(
   task: NotificationTask,
   assigned: string[],
   eventKey: string,
@@ -441,6 +546,11 @@ export async function notifyAssignments(
   store: NotificationStore,
   context: NotificationContext = {},
 ): Promise<NotificationResult> {
+  if (context.loadTask) {
+    const current = await context.loadTask(task.id);
+    if (!current) return { failed: [], interactive: false };
+    task = current;
+  }
   let interactive = false;
   const id = `${task.id}:${eventKey}`;
   let batch: NotificationBatch;
@@ -466,6 +576,9 @@ export async function notifyAssignments(
         delivered: [],
         cancelled: [],
         resolvedGroups: [],
+        ...(task.assignmentEventNodes?.[eventKey]
+          ? { invitationKeys: task.assignmentEventNodes[eventKey] }
+          : {}),
         ...(workspaceId ? { workspaceId } : {}),
         sourceChannelId: task.channelId,
         sourceMessageTs: task.messageTs,
@@ -477,7 +590,7 @@ export async function notifyAssignments(
   }
 
   const failed = new Set(await reconcileInvitations(task, batch, client, store, context));
-  if (task.deleted) {
+  if (task.deleted || task.completed) {
     batch.cancelled = [
       ...new Set([
         ...batch.cancelled,
@@ -506,7 +619,10 @@ export async function notifyAssignments(
 
   const eligible = new Set<string>();
   const activeTargets = batch.assigned.filter((target) =>
-    task.assignees.includes(target)
+    task.assignmentTree
+      ? isCurrentAssignment(task, { userId: target, teamIds: [] }) &&
+        currentBinding(task, batch, target)
+      : task.assignees.includes(target)
   );
   for (const target of activeTargets) {
     if (/^[UW]/.test(target)) {
@@ -574,7 +690,9 @@ export async function notifyAssignments(
           failed.add(recipient);
           continue;
         }
-        if (!isCurrentAssignment(task, access)) {
+        if (
+          !isCurrentAssignment(task, access) || !currentBinding(task, batch, recipient)
+        ) {
           batch.cancelled = [...new Set([...batch.cancelled, recipient])];
           await store.save(batch);
           continue;
@@ -592,6 +710,7 @@ export async function notifyAssignments(
         continue;
       }
       let invitation: AssignmentInvitation | undefined;
+      let retrying = false;
       const returnedBy = task.assignmentResponses?.[recipient]?.returnedBy;
       const note = batch.assigned.map((id) => task.assignmentResponses?.[id]?.note).find((
         value,
@@ -599,6 +718,7 @@ export async function notifyAssignments(
       if (context.executionId) {
         batch.invitations ??= {};
         invitation = batch.invitations[recipient];
+        retrying = !!invitation;
         if (!invitation) {
           invitation = {
             id: crypto.randomUUID(),
@@ -610,18 +730,75 @@ export async function notifyAssignments(
           };
           batch.invitations[recipient] = invitation;
         } else if (invitation.status !== "pending") continue;
-        // An unsent invitation is owned by the execution that actually posts it.
-        invitation.executionId = context.executionId;
-        await store.save(batch);
       }
       const text = assignmentNotificationText(
         task,
         recipient,
         invitation ?? { returnedBy, note },
       );
+      const deliveryKey = `${batch.id}:${recipient}`;
+      if (retrying && invitation && client.conversations.history) {
+        const history = await client.conversations.history({
+          channel: dm.channel.id,
+          limit: 100,
+          include_all_metadata: true,
+        });
+        if (!history.ok || !Array.isArray(history.messages)) {
+          failed.add(recipient);
+          continue;
+        }
+        const sent = history.messages.find((entry) => {
+          if (!entry || typeof entry !== "object") return false;
+          const message = entry as {
+            metadata?: { event_type?: string; event_payload?: { key?: string } };
+            ts?: string;
+          };
+          return message.metadata?.event_type === "delebot_assignment" &&
+            message.metadata.event_payload?.key === deliveryKey &&
+            typeof message.ts === "string";
+        }) as { ts: string } | undefined;
+        if (sent) {
+          invitation.channelId = dm.channel.id;
+          invitation.messageTs = sent.ts;
+          batch.delivered = [...new Set([...batch.delivered, recipient])];
+          await store.save(batch);
+          interactive ||= invitation.executionId === context.executionId;
+          if (context.rememberTask) {
+            await context.rememberTask(dm.channel.id, sent.ts, recipient, task.id);
+          }
+          continue;
+        }
+      }
+      if (invitation && context.executionId) {
+        // A recovered message keeps its original execution. Only a new post
+        // transfers an unsent invitation to the current workflow execution.
+        invitation.executionId = context.executionId;
+        await store.save(batch);
+      }
+      if (context.loadTask) {
+        const latest = await context.loadTask(task.id);
+        const freshAccess = latest && context.loadAccess
+          ? await context.loadAccess(latest, recipient, batch.workspaceId)
+          : { userId: recipient, teamIds: [] };
+        if (
+          !latest || latest.deleted || latest.completed ||
+          latest.assignmentTree?.acceptedBy ||
+          !isCurrentAssignment(latest, freshAccess) ||
+          !currentBinding(latest, batch, recipient)
+        ) {
+          batch.cancelled = [...new Set([...batch.cancelled, recipient])];
+          if (invitation) invitation.status = "cancelled";
+          await store.save(batch);
+          continue;
+        }
+      }
       const sent = await client.chat.postMessage({
         channel: dm.channel.id,
         text,
+        metadata: {
+          event_type: "delebot_assignment",
+          event_payload: { key: deliveryKey },
+        },
         unfurl_links: false,
         unfurl_media: false,
         ...(invitation
@@ -673,6 +850,31 @@ export async function notifyAssignments(
     }
   }
   return { failed: [...failed], interactive };
+}
+
+export async function notifyAssignments(
+  task: NotificationTask,
+  assigned: string[],
+  eventKey: string,
+  workspaceId: string | undefined,
+  client: NotificationClient,
+  store: NotificationStore,
+  context: NotificationContext = {},
+): Promise<NotificationResult> {
+  return await withKeyLock(task.id, () =>
+    withKeyLock(
+      `delivery:${task.id}:${eventKey}`,
+      () =>
+        notifyAssignmentsUnlocked(
+          task,
+          assigned,
+          eventKey,
+          workspaceId,
+          client,
+          store,
+          context,
+        ),
+    ));
 }
 
 /** Resume durable assignment intents after any authorized task mutation. */

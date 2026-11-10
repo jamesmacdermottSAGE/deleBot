@@ -6,7 +6,8 @@ import type {
   ActionContext,
   ViewSubmissionContext,
 } from "deno-slack-sdk/functions/interactivity/types.ts";
-import { canEditTask, canViewTask, taskReferencedTeamIds } from "../tasks/access.ts";
+import { canDelegateTask, canViewTask } from "../tasks/access.ts";
+import { taskAccessLoader } from "./access_context.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
 import { SlackTaskRepository, type TaskRepository } from "../tasks/repository.ts";
 import {
@@ -14,7 +15,7 @@ import {
   TaskAccessError,
   TaskCommandError,
 } from "../tasks/service.ts";
-import { SlackTeamDirectory, type TeamClient } from "./teams.ts";
+import type { TeamClient } from "./teams.ts";
 import { resolveWorkspace } from "./workspace.ts";
 import {
   ASSIGNMENT_ACCEPT,
@@ -154,6 +155,12 @@ async function boundInvitation(
 }
 
 function currentlyAssigned(task: Task, access: TaskAccess): boolean {
+  if (task.assignmentTree) {
+    return Object.values(task.assignmentTree.nodes).some((node) =>
+      node.kind === "user" && node.principalId === access.userId &&
+      ["pending", "accepted"].includes(node.status)
+    );
+  }
   const targets = task.assignmentBased
     ? task.assignees
     : [...task.assignees, ...task.teams];
@@ -203,6 +210,10 @@ async function renderDecision(
     throw new Error("Some task messages could not be refreshed.");
   }
   const { invitation } = bound;
+  if (invitation.closedBy) {
+    await finishExecution(bound, dependencies);
+    return;
+  }
   if (
     (invitation.status === "accepted" || invitation.status === "delegated") &&
     !await currentAccess(bound, dependencies)
@@ -271,6 +282,7 @@ async function deliverDecision(
     dependencies.store,
     {
       executionId: bound.invitation.executionId,
+      loadTask: (id) => dependencies.repository.findById(id),
       loadAccess: dependencies.loadAccess,
       rememberTask: dependencies.rememberTask,
     },
@@ -314,6 +326,35 @@ function decisionTimestamp(suggested?: string): string {
   }`;
 }
 
+async function assignmentGroupMembers(
+  task: Task,
+  targets: string[],
+  client: AssignmentClient,
+  workspaceId?: string,
+): Promise<Record<string, string[]>> {
+  const ids = [
+    ...new Set(
+      [...(task.assignmentTree ? [] : [...task.assignees, ...task.teams]), ...targets]
+        .filter((id) => /^S/.test(id)),
+    ),
+  ];
+  const entries = await Promise.all(ids.map(async (id) => {
+    const result = await client.usergroups.users.list({
+      usergroup: id,
+      include_disabled: false,
+      ...(workspaceId ? { team_id: workspaceId } : {}),
+    });
+    if (
+      !result.ok || !Array.isArray(result.users) ||
+      !result.users.every((user) =>
+        typeof user === "string" && /^[UW][A-Z0-9]+$/.test(user)
+      )
+    ) throw new TaskCommandError("I couldn't verify all squad members. Please retry.");
+    return [id, [...new Set(result.users as string[])]] as const;
+  }));
+  return Object.fromEntries(entries.map(([id, members]) => [id, [...members]]));
+}
+
 async function applyDecision(
   bound: BoundInvitation,
   kind: "accept" | "reject" | "delegate",
@@ -344,7 +385,7 @@ async function applyDecision(
   if (!alreadyApplied && !currentlyAssigned(bound.task, access)) {
     return await cancelUnavailable(bound, dependencies);
   }
-  if (kind === "delegate" && !canEditTask(bound.task, access)) {
+  if (kind === "delegate" && !canDelegateTask(bound.task, access)) {
     return {
       ok: false,
       error:
@@ -369,11 +410,20 @@ async function applyDecision(
           kind: decision.kind,
           ...(decision.assignees ? { assignees: decision.assignees } : {}),
           ...(decision.note ? { note: decision.note } : {}),
+          ...(bound.batch.invitationKeys
+            ? { invitationKeys: bound.batch.invitationKeys }
+            : {}),
         },
         {
           channelId: bound.invitation.channelId!,
           messageTs: decision.messageTs,
           userId: bound.invitation.recipientId,
+          groupMembers: await assignmentGroupMembers(
+            bound.task,
+            decision.assignees ?? [],
+            dependencies.client,
+            bound.batch.workspaceId,
+          ),
         },
         dependencies.repository,
         access,
@@ -436,7 +486,7 @@ export async function handleAssignmentAction(
     if (!access || !currentlyAssigned(bound.task, access)) {
       return await cancelUnavailable(bound, dependencies);
     }
-    if (!canEditTask(bound.task, access)) {
+    if (!canDelegateTask(bound.task, access)) {
       return { ok: false, error: "You do not have permission to delegate this task." };
     }
     if (bound.invitation.status !== "pending" || bound.invitation.decision) {
@@ -643,7 +693,7 @@ export async function handleAssignmentSubmission(
     if (!access || !currentlyAssigned(bound.task, access)) {
       return await cancelUnavailable(bound, dependencies);
     }
-    if (!canEditTask(bound.task, access)) {
+    if (!canDelegateTask(bound.task, access)) {
       return { ok: false, error: "You do not have permission to delegate this task." };
     }
     const targets = await delegationTargets(submission, bound, dependencies);
@@ -670,7 +720,6 @@ export async function handleAssignmentSubmission(
 }
 
 function productionDependencies(client: SlackAPIClient): AssignmentDependencies {
-  const directory = new SlackTeamDirectory(client);
   return {
     displays: taskDisplays(client),
     rememberTask: async (channel, ts, user, id) => {
@@ -682,22 +731,7 @@ function productionDependencies(client: SlackAPIClient): AssignmentDependencies 
     repository: new SlackTaskRepository(client),
     store: new SlackNotificationStore(client),
     resolveWorkspace: (task) => resolveWorkspace(client, task.channelId, {}),
-    loadAccess: async (task, recipientId, workspaceId) => {
-      const direct = { userId: recipientId, teamIds: [] };
-      const references = taskReferencedTeamIds(task);
-      if (!references.length) return direct;
-      try {
-        const workspace = workspaceId ??
-          await resolveWorkspace(client, task.channelId, {});
-        return (await directory.load(recipientId, workspace, references)).access;
-      } catch (error) {
-        if (
-          ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
-          canViewTask(task, direct)
-        ) return direct;
-        throw error;
-      }
-    },
+    loadAccess: taskAccessLoader(client),
   };
 }
 

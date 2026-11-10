@@ -263,7 +263,10 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
   );
   const task = [...repo.rows.values()][0];
   assert(created.interactive && task.assignees.join() === "SJSQUAD");
-  assert(f.posts[0].text.includes("@jsquad ⏳ Pending"));
+  assert(
+    f.posts[0].text.includes("@jsquad") &&
+      f.posts[0].text.includes("<@UALICE> ⏳ Pending"),
+  );
   assert(!f.posts[0].text.includes("Team SJSQUAD"));
   assert(
     f.notificationPosts.map((post) => post.channel).sort().join() === "DUALICE,DUBOB",
@@ -289,7 +292,7 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
         directory,
       );
       assert(f.posts.at(-1)!.text.includes("jsquadTask"));
-      assert(f.posts.at(-1)!.text.includes("@jsquad ⏳ Pending"));
+      assert(f.posts.at(-1)!.text.includes("@jsquad"));
     }
   }
   for (const [index, member] of members.entries()) {
@@ -305,23 +308,21 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
       directory,
     );
     if (index === 0) {
-      assert(repo.rows.get(task.id)!.assignees.join() === "SJSQUAD,UHUMAN");
+      assert(repo.rows.get(task.id)!.assignees.join() === "SJSQUAD");
       assert(f.posts.at(-1)!.text.includes("<@UALICE> ❌ Rejected"));
-      assert(f.posts.at(-1)!.text.includes("@jsquad ⏳ Pending"));
+      assert(f.posts.at(-1)!.text.includes("@jsquad"));
     }
   }
   const updated = repo.rows.get(task.id)!;
   assert(updated.assignmentResponses?.UALICE.status === "rejected");
   assert(updated.assignmentResponses?.UBOB.status === "accepted");
-  assert(updated.assignees.join() === "UHUMAN,UBOB" && updated.teams.length === 0);
+  assert(updated.assignees.join() === "UBOB" && updated.teams.length === 0);
   assert(f.posts.at(-1)!.text.includes("<@UBOB> ✅"));
-  assert(!f.posts.at(-1)!.text.includes("@jsquad"));
+  assert(f.posts.at(-1)!.text.includes("Accepted by:* <@UBOB>"));
   assert(
-    f.notificationPosts.length === 3,
-    "Rejection adds only the creator's return invitation",
+    f.notificationPosts.length === 2,
+    "One rejection does not return an unresolved squad assignment",
   );
-  assert(f.notificationPosts[2].channel === "DUHUMAN");
-  assert(f.notificationPosts[2].text.includes("returned to you"));
   members = [];
   await handleMessage(
     { ...f.event, user_id: "UALICE", text: "<@UBOT> ls me" },

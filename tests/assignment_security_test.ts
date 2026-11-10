@@ -272,15 +272,15 @@ Deno.test("a recipient with viewing permission and no editing permission can acc
   }
 });
 
-Deno.test("read-only invitation recipients cannot open a delegation modal", async () => {
+Deno.test("assigned viewers can delegate without completion or deletion access", async () => {
   const f = await securityFixture();
   const writes = f.repository.writes;
   const result = await handleAssignmentAction(
     f.action(ASSIGNMENT_DELEGATE),
     f.dependencies,
   );
-  assert(!result.ok && /permission/i.test(result.error ?? ""));
-  assert(f.modals.length === 0 && f.repository.writes === writes);
+  assert(result.ok);
+  assert(f.modals.length === 1 && f.repository.writes === writes);
   assert(!f.invitation().decision && f.invitation().status === "pending");
 });
 
@@ -354,7 +354,7 @@ Deno.test("invalid self delegation clears its intent so the same modal can be co
     f.submission(["UALICE"]),
     f.dependencies,
   );
-  assert(!invalid.ok && /another/i.test(invalid.error ?? ""));
+  assert(!invalid.ok && /other/i.test(invalid.error ?? ""));
   assert(
     f.repository.writes === writes && !f.invitation().decision &&
       f.invitation().status === "pending",

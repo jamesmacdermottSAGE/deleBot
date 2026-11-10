@@ -5,6 +5,7 @@ export interface TeamSnapshot {
   /** Active Slack user groups that can be selected when creating a task. */
   knownTeamIds: string[];
   teamNames: Record<string, string>;
+  teamMembers?: Record<string, string[]>;
   disabledTeamIds?: string[];
 }
 
@@ -117,6 +118,7 @@ export class SlackTeamDirectory implements TeamDirectory {
     const knownTeamIds: string[] = [];
     const teamIds: string[] = [];
     const teamNames: Record<string, string> = {};
+    const teamMembers: Record<string, string[]> = {};
     const seen = new Set<string>();
     const excluded = new Set<string>();
     const candidateNames = new Map<string, string>();
@@ -176,6 +178,7 @@ export class SlackTeamDirectory implements TeamDirectory {
       for (const id of ids) {
         knownTeamIds.push(id);
         teamNames[id] = name;
+        teamMembers[id] = [...users];
         if (users.has(requesterId)) teamIds.push(id);
       }
     }
@@ -209,6 +212,7 @@ export class SlackTeamDirectory implements TeamDirectory {
         return incomplete();
       }
       knownTeamIds.push(id);
+      teamMembers[id] = [...new Set(membership.users)];
       if (candidateNames.has(id)) teamNames[id] = candidateNames.get(id)!;
       if (membership.users.includes(requesterId)) teamIds.push(id);
     }
@@ -234,6 +238,7 @@ export class SlackTeamDirectory implements TeamDirectory {
       access: { userId: requesterId, teamIds },
       knownTeamIds,
       teamNames,
+      teamMembers,
       disabledTeamIds: [...excluded],
     };
   }

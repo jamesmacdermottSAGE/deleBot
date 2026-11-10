@@ -433,7 +433,7 @@ Deno.test("assignment intents survive replay and unchanged assignees do not noti
     repo,
     access,
   );
-  const firstContext = reply("9.1");
+  const firstContext = { ...reply("9.1"), groupMembers: { SFRONTEND: ["UMEMBER"] } };
   const first = await updateTask(
     created.task,
     { assignees: ["UALICE", "SFRONTEND"] },
@@ -441,7 +441,7 @@ Deno.test("assignment intents survive replay and unchanged assignees do not noti
     repo,
     access,
   );
-  assert(first.task.assignmentEvents?.[mutationKey(firstContext)].join() === "SFRONTEND");
+  assert(first.task.assignmentEvents?.[mutationKey(firstContext)].join() === "UMEMBER");
   const latest = await resolveTaskForUpdate(undefined, reply("9.2"), repo, access);
   const replay = await updateTask(
     latest,
@@ -452,7 +452,7 @@ Deno.test("assignment intents survive replay and unchanged assignees do not noti
   );
   assert(
     !replay.updated &&
-      replay.task.assignmentEvents?.[mutationKey(firstContext)].join() === "SFRONTEND",
+      replay.task.assignmentEvents?.[mutationKey(firstContext)].join() === "UMEMBER",
   );
   const nextContext = reply("9.3");
   const next = await updateTask(
@@ -1001,6 +1001,7 @@ Deno.test("configuring legacy editors preserves legacy viewers and match uses ef
   assert(effectiveTaskViewPerms(matched.task).join() === "UCREATOR,UALICE");
 
   const separateTeams = { ...legacy, assignmentBased: false, teams: ["SBACKEND"] };
+  await repo.save(separateTeams);
   const member = { userId: "UMEMBER", teamIds: ["SBACKEND"] };
   const converted = await updateTask(
     separateTeams,
@@ -1139,7 +1140,7 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
       viewPerms: ["UALICE"],
       editPerms: ["UCREATOR"],
     },
-    context,
+    { ...context, groupMembers: { SFRONTEND: ["UTEAMMATE"] } },
     repo,
     access,
   );
@@ -1152,7 +1153,7 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
     repo,
     alice,
   );
-  assert(accepted.task.assignees.join() === task.assignees.join());
+  assert(accepted.task.assignees.join() === "UALICE");
   const rejectContext = reply("9.2", alice.userId);
   const rejected = await respondToAssignment(
     accepted.task,
@@ -1162,8 +1163,8 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
     alice,
   );
   assert(
-    rejected.task.assignees.join() === "UBOB,SFRONTEND,UCREATOR" &&
-      rejected.task.teams.join() === "SFRONTEND",
+    rejected.task.assignees.join() === "UCREATOR" &&
+      rejected.task.teams.length === 0,
   );
   const writes = repo.writes;
   const replay = await respondToAssignment(
@@ -1179,7 +1180,7 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
   );
 });
 
-Deno.test("group-only rejection retains the team and delegation requires current edit permission", async () => {
+Deno.test("group rejection waits for siblings and another pending member can delegate without management access", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
     {
@@ -1188,7 +1189,7 @@ Deno.test("group-only rejection retains the team and delegation requires current
       viewPerms: ["UCREATOR", "SFRONTEND"],
       editPerms: ["UCREATOR"],
     },
-    context,
+    { ...context, groupMembers: { SFRONTEND: ["UMEMBER", "UOTHER"] } },
     repo,
     access,
   );
@@ -1200,7 +1201,7 @@ Deno.test("group-only rejection retains the team and delegation requires current
     repo,
     member,
   );
-  assert(rejected.task.assignees.join() === "SFRONTEND,UBOB,UCREATOR");
+  assert(rejected.task.assignees.join() === "SFRONTEND,UBOB");
   const writes = repo.writes;
   assert(
     await rejection(() =>
@@ -1211,28 +1212,21 @@ Deno.test("group-only rejection retains the team and delegation requires current
         repo,
         member,
       )
-    ) instanceof TaskAccessError,
+    ) instanceof TaskCommandError,
   );
   assert(repo.writes === writes);
-  const permitted = await updateTask(
-    rejected.task,
-    { editPerms: ["SFRONTEND"] },
-    reply("9.3"),
-    repo,
-    access,
-  );
   const delegated = await respondToAssignment(
-    permitted.task,
+    rejected.task,
     { kind: "delegate", assignees: ["UNEW"] },
-    reply("9.4", member.userId),
+    reply("9.4", "UOTHER"),
     repo,
-    member,
+    { userId: "UOTHER", teamIds: ["SFRONTEND"] },
   );
-  assert(delegated.task.assignees.join() === "UBOB,UCREATOR,UNEW");
-  assert(delegated.task.teams.length === 0);
+  assert(delegated.task.assignees.join() === "SFRONTEND,UBOB,UNEW");
+  assert(delegated.task.teams.join() === "SFRONTEND");
 });
 
-Deno.test("accepting a team assignment replaces that team with the member and preserves unrelated assignees", async () => {
+Deno.test("accepting a team assignment selects one owner and cancels every competing branch", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
     {
@@ -1241,7 +1235,10 @@ Deno.test("accepting a team assignment replaces that team with the member and pr
       viewPerms: ["SFRONTEND"],
       editPerms: [],
     },
-    context,
+    {
+      ...context,
+      groupMembers: { SFRONTEND: ["UMEMBER", "UOTHER"], SBACKEND: ["UBACK"] },
+    },
     repo,
     access,
   );
@@ -1254,8 +1251,8 @@ Deno.test("accepting a team assignment replaces that team with the member and pr
     repo,
     member,
   );
-  assert(accepted.task.assignees.join() === "UALICE,SBACKEND,UMEMBER");
-  assert(accepted.task.teams.join() === "SBACKEND");
+  assert(accepted.task.assignees.join() === "UMEMBER");
+  assert(accepted.task.teams.length === 0);
   assert(accepted.task.assignmentResponses?.UMEMBER.status === "accepted");
   assert(accepted.task.assignmentEvents?.[mutationKey(claim)].length === 0);
   assert(
@@ -1277,7 +1274,7 @@ Deno.test("accepting a team assignment replaces that team with the member and pr
         repo,
         otherMember,
       )
-    ) instanceof TaskAccessError,
+    ) instanceof TaskCommandError,
   );
   assert(repo.writes === writes);
 });
@@ -1288,11 +1285,12 @@ Deno.test("legacy team acceptance preserves access policies when converting to a
   const legacy = { ...task, assignees: [], teams: ["SFRONTEND"], assignmentBased: false };
   delete legacy.viewPerms;
   delete legacy.editPerms;
+  await repo.save(legacy);
   const member = { userId: "UMEMBER", teamIds: ["SFRONTEND"] };
   const accepted = await respondToAssignment(
     legacy,
     { kind: "accept" },
-    reply("9.1", member.userId),
+    { ...reply("9.1", member.userId), groupMembers: { SFRONTEND: [member.userId] } },
     repo,
     member,
   );
@@ -1368,17 +1366,16 @@ Deno.test("assignment responses require current assignment and view access witho
       teamIds: [],
     }]
   ) {
-    assert(
-      await rejection(() =>
-        respondToAssignment(
-          task,
-          { kind: "accept" },
-          reply("9.1", actor.userId),
-          repo,
-          actor,
-        )
-      ) instanceof TaskAccessError,
+    const error = await rejection(() =>
+      respondToAssignment(
+        task,
+        { kind: "accept" },
+        reply("9.1", actor.userId),
+        repo,
+        actor,
+      )
     );
+    assert(error instanceof TaskAccessError || error instanceof TaskCommandError);
   }
   assert(repo.writes === writes);
 });
@@ -1436,6 +1433,8 @@ Deno.test("legacy delegation history returns a rejection to the previous delegat
     UALICE: { status: "delegated", delegatedTo: ["UBOB"] },
     UBOB: { status: "pending" },
   };
+  delete task.assignmentTree;
+  await repo.save(task);
   const returned = await respondToAssignment(
     task,
     { kind: "reject" },
@@ -1466,4 +1465,260 @@ Deno.test("adding an assignee in a message records that assigner for rejection h
   );
   assert(returned.task.assignees.join() === "UALICE");
   assert(returned.task.assignmentResponses?.UALICE.returnTo?.join() === "UCREATOR");
+});
+
+Deno.test("concurrent acceptance of stale fanout snapshots produces exactly one current owner", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Concurrent claim", assignees: ["UALICE", "UBOB"] },
+    context,
+    repo,
+    access,
+  );
+  const results = await Promise.allSettled([
+    respondToAssignment(task, { kind: "accept" }, reply("9.1", "UALICE"), repo, {
+      userId: "UALICE",
+      teamIds: [],
+    }),
+    respondToAssignment(task, { kind: "accept" }, reply("9.2", "UBOB"), repo, {
+      userId: "UBOB",
+      teamIds: [],
+    }),
+  ]);
+  assert(results.filter((result) => result.status === "fulfilled").length === 1);
+  const saved = repo.rows.get(task.id)!;
+  assert(
+    saved.assignees.join() === "UALICE" && saved.assignmentTree?.acceptedBy === "UALICE",
+  );
+  assert(!saved.appliedEvents?.includes(mutationKey(reply("9.2", "UBOB"))));
+});
+
+Deno.test("fresh mutation reads preserve concurrent metadata edits and enforce a new access policy", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask({ name: "Fresh edits" }, context, repo, access);
+  await Promise.all([
+    updateTask(task, { description: "Added description" }, reply("9.1"), repo, access),
+    updateTask(task, { links: ["https://example.com"] }, reply("9.2"), repo, access),
+  ]);
+  const saved = repo.rows.get(task.id)!;
+  assert(
+    saved.description === "Added description" &&
+      saved.links.join() === "https://example.com",
+  );
+  await updateTask(saved, { editPerms: ["UALICE"] }, reply("9.3"), repo, access);
+  assert(
+    await rejection(() => deleteTask(task, reply("9.4"), repo, access)) instanceof
+      TaskAccessError,
+  );
+  assert(!repo.rows.get(task.id)!.deleted);
+});
+
+Deno.test("assignment replacement renews bindings while an ordinary edit preserves the delegation tree", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Renew invitation", assignees: ["UALICE"] },
+    context,
+    repo,
+    access,
+  );
+  const oldKeys = task.assignmentEventNodes?.[mutationKey(context)];
+  assert(oldKeys?.length === 1);
+  const metadata = await updateTask(
+    task,
+    { description: "Keep invitation" },
+    reply("9.1"),
+    repo,
+    access,
+  );
+  assert(
+    JSON.stringify(metadata.task.assignmentTree) === JSON.stringify(task.assignmentTree),
+  );
+  const bob = await updateTask(
+    metadata.task,
+    { set: { assignees: ["UBOB"] } },
+    reply("9.2"),
+    repo,
+    access,
+  );
+  const alice = await updateTask(
+    bob.task,
+    { set: { assignees: ["UALICE"] } },
+    reply("9.3"),
+    repo,
+    access,
+  );
+  const writes = repo.writes;
+  assert(
+    await rejection(() =>
+      respondToAssignment(
+        alice.task,
+        { kind: "accept", invitationKeys: oldKeys },
+        reply("9.4", "UALICE"),
+        repo,
+        { userId: "UALICE", teamIds: [] },
+      )
+    ) instanceof TaskCommandError,
+  );
+  assert(repo.writes === writes);
+  const newKeys = alice.task.assignmentEventNodes?.[mutationKey(reply("9.3"))];
+  assert(newKeys?.length === 1 && newKeys[0] !== oldKeys[0]);
+  const accepted = await respondToAssignment(
+    alice.task,
+    { kind: "accept", invitationKeys: newKeys },
+    reply("9.5", "UALICE"),
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
+  assert(accepted.task.assignmentTree?.acceptedBy === "UALICE");
+});
+
+Deno.test("completed tasks reject new assignment responses and deleted tasks never revive from stale snapshots", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Finished", assignees: ["UALICE"] },
+    context,
+    repo,
+    access,
+  );
+  await updateTask(task, { completed: true }, reply("9.1"), repo, access);
+  assert(
+    await rejection(() =>
+      respondToAssignment(task, { kind: "accept" }, reply("9.2", "UALICE"), repo, {
+        userId: "UALICE",
+        teamIds: [],
+      })
+    ) instanceof TaskCommandError,
+  );
+  await deleteTask(task, reply("9.3"), repo, access);
+  const writes = repo.writes;
+  assert(
+    await rejection(() =>
+      respondToAssignment(task, { kind: "accept" }, reply("9.4", "UALICE"), repo, {
+        userId: "UALICE",
+        teamIds: [],
+      })
+    ) instanceof TaskAccessError,
+  );
+  assert(repo.writes === writes && repo.rows.get(task.id)!.deleted);
+});
+
+Deno.test("creators administer access while completion and deletion always require that access", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    {
+      name: "Approval access",
+      assignees: ["UALICE"],
+      viewPerms: ["all"],
+      editPerms: ["UMANAGER"],
+    },
+    context,
+    repo,
+    access,
+  );
+  const alice = { userId: "UALICE", teamIds: [] };
+  const priority = await updateTask(
+    task,
+    { priority: 1 },
+    reply("9.1", "UALICE"),
+    repo,
+    alice,
+  );
+  assert(priority.task.priority === 1);
+  const writes = repo.writes;
+  assert(
+    await rejection(() =>
+      updateTask(
+        priority.task,
+        { editPerms: ["UALICE"] },
+        reply("9.2", "UALICE"),
+        repo,
+        alice,
+      )
+    ) instanceof TaskAccessError,
+  );
+  assert(
+    await rejection(() =>
+      updateTask(priority.task, { completed: true }, reply("9.3"), repo, access)
+    ) instanceof TaskAccessError,
+  );
+  assert(
+    await rejection(() =>
+      deleteTask(priority.task, reply("9.4"), repo, access)
+    ) instanceof TaskAccessError,
+  );
+  assert(repo.writes === writes);
+  const allowed = await updateTask(
+    priority.task,
+    { editPerms: ["UALICE"] },
+    reply("9.5"),
+    repo,
+    access,
+  );
+  assert(allowed.task.editPerms?.join() === "UMANAGER,UALICE");
+  const completed = await updateTask(
+    allowed.task,
+    { completed: true },
+    reply("9.6", "UALICE"),
+    repo,
+    alice,
+  );
+  assert(completed.task.completed);
+});
+
+Deno.test("a non-owner cannot reopen accepted ownership through assignment edits even with management access", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Protected owner", assignees: ["UALICE", "UBOB"] },
+    context,
+    repo,
+    access,
+  );
+  const owner = { userId: "UALICE", teamIds: [] };
+  const other = { userId: "UBOB", teamIds: [] };
+  const accepted = await respondToAssignment(
+    task,
+    { kind: "accept" },
+    reply("9.1", owner.userId),
+    repo,
+    owner,
+  );
+  assert(
+    canEditTask(accepted.task, other),
+    "Management Access does not confer assignment ownership",
+  );
+  const writes = repo.writes;
+  for (
+    const [index, patch] of [
+      { assignees: [] },
+      { assignees: ["UBOB"] },
+      { set: { assignees: ["UBOB"] } },
+      { clear: ["assignees"] },
+    ].entries()
+  ) {
+    const error = await rejection(() =>
+      updateTask(
+        task,
+        patch as TaskPatch,
+        reply(`10.${index + 1}`, other.userId),
+        repo,
+        other,
+      )
+    );
+    assert(error instanceof TaskAccessError || error instanceof TaskCommandError);
+    assert(
+      repo.writes === writes &&
+        repo.rows.get(task.id)!.assignmentTree?.acceptedBy === owner.userId,
+    );
+  }
+  const delegated = await updateTask(
+    accepted.task,
+    { set: { assignees: ["UCAROL"] } },
+    reply("11.1", owner.userId),
+    repo,
+    owner,
+  );
+  assert(
+    delegated.task.assignees.join() === "UCAROL" &&
+      !delegated.task.assignmentTree?.acceptedBy,
+  );
 });

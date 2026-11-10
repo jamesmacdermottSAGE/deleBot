@@ -181,11 +181,20 @@ those fields.
 
 ## Access
 
-`access @person @team` replaces editing access; `access all` grants editing access to all
-viewers. `edit access @person` works too; `delete access` resets editing access to all.
-Teams and people can be combined. Old `editPerms` commands remain compatible. The
-view-permissions field is omitted from task cards and current help. Existing stored
-visibility restrictions are retained so older private tasks are not silently published.
+`access @person @team` adds people and teams allowed to complete or delete a task.
+`edit access @person` replaces that policy; `access all` and `delete access` allow all
+viewers. The creator and current Access holders can administer the policy in the task
+thread. Old `editPerms` commands remain compatible. Ordinary metadata updates are also
+available to the creator and active assignees, but do not grant management permission.
+
+A viewer without Access using `done` or `delete` creates a pending request. The task is
+not completed/deleted until a current Access holder approves. Access holders receive
+Approve/Decline buttons and can also use `approve complete`, `approve delete`,
+`deny complete`, or `deny delete` in the task thread. If several matching requests are
+pending, include the request ID. Approval rechecks current permissions and squad
+membership; revoked Access cannot be exercised through an old button. Viewing
+permission remains a separate policy and is never widened implicitly by assignment,
+collaboration, or an approval request.
 
 ## Parsing names and descriptions
 
@@ -278,29 +287,28 @@ later authorized task update also retries saved, undelivered assignment notifica
 
 Assignment invitations include **Accept**, **Reject**, and **Delegate** buttons:
 
-- **Accept** marks your invitation as accepted in that DM. For a team invitation, it
-  replaces your assigned team with you as the accepted assignee.
-- **Reject** deletes your invitation DM and removes your direct user assignment. If you
-  received it through a team assignment, the team remains assigned to the task. The task
-  returns to your previous delegator, or its creator if there is no previous delegator,
-  with a fresh **Accept / Reject / Delegate** invitation. Its message identifies who
-  rejected it. Return invitations require viewing permission, like other invitations.
+- **Accept** selects one accepted owner for the task. All competing invitations are
+  updated to identify that owner and lose their action buttons. Other people cannot
+  accept, delegate, or change assignees on an owned task. The owner can delegate again.
+- **Reject** exhausts only your branch. A squad snapshots its members when assigned;
+  the squad does not return until every member's branch is exhausted. A sibling who is
+  still pending, or has delegated to a live descendant, keeps the branch open.
 - **Delegate** opens a modal with one required **People and teams** field. Use `@` to
   mention people and Slack user groups together, up to 20 combined. Add an optional
   **Note** below; it is included in each recipient's invitation and omitted when blank.
-  Notes are limited to 2,000 characters. Delegation requires both view and edit permission.
+  Notes are limited to 2,000 characters. Delegation requires an active assignment and viewing permission.
   Direct recipients must already have view permission; delegation does not grant it.
   Your invitation is updated to show its delegation, and eligible new assignees receive
-  their own invitations. For a team invitation, delegation removes your assigned team
-  and replaces it with the selected person or team.
+  their own invitations. Delegating your squad invitation changes only your own branch;
+  the other squad members keep their pending invitations.
 
-After a team invitation is accepted or delegated, the other members' invitations for
-that team are cancelled. Unrelated people and teams remain assigned. A rejection stays
-visible on the task while the team remains assigned.
-
-Each assignment remembers its return path. If a delegator rejects a returned task, it
-goes back another step, eventually reaching the creator. If the creator rejects their
-own returned task, no further invitation is sent. Other assignees remain assigned.
+Assignments form a persisted tree. For example, if A delegates to B and C, and C delegates
+to D, B stays pending while D decides. If D rejects, C receives a fresh invitation, while
+B remains pending. A gets the task back only after both branches have rejected. Nested
+squads follow the same rule: squad X → squad Y → person A → squad Z unwinds one level at
+a time after each complete branch rejects. Rejections and delegation history remain on
+the task card. The creator rejecting the finally returned task deletes it with a durable
+tombstone so retries cannot recreate it. New return generations invalidate older buttons.
 
 Invitation refresh reuses the workspace saved during delivery, including in enterprise
 DMs without workspace metadata. A membership lookup failure preserves the invitation
@@ -309,12 +317,34 @@ Returned-task invitations retain their short return explanation and action butto
 during refresh. They are not replaced with a full task card. Delegation notes remain
 visible on pending invitations when cards refresh.
 
-Type `clear` in your DM with DeleBot to remove its messages, including threaded replies.
-Slack only allows the bot to delete its own messages, so your messages remain. Saved
-tasks and other people's DMs are unchanged. Clearing also removes stale task selection
-and display records and closes the cleared invitations; use `ls` or task-number commands
-to continue working. If some messages fail to clear, the reply says so and `clear` can
-be retried. `clear` does not run in channels.
+The accepted owner can invite separate collaborators with `collab @person` in the task
+thread. Recipients receive collaboration Accept/Reject buttons, or can reply
+`collab accept` / `collab reject`. Accepted collaborators appear under Collaborators and
+can list those tasks with `ls collab`. Collaboration does not accept ownership or grant
+completion/deletion rights. Only the current accepted owner can issue new invitations;
+pending invitations from an owner who changed are closed.
+
+Type `clear` in the main DeleBot DM to clear that chat, or in a DM thread to clear only
+that thread. Channels are refused. The old global datastore scans are replaced with
+scoped queries and bounded work: at most two history pages and eight deletions per
+invocation. Large histories resume from saved progress when you repeat `clear`; the
+response explicitly reports remaining work. Saved tasks, other DMs, and other recipients'
+controls are preserved. Clearing removes stale selection/display records and cleared
+invitation controls. The acknowledgement is posted in the main DM because a cleared
+thread root may no longer exist.
+
+Slack bot credentials can delete only bot-written messages. To also delete the requesting
+person's own messages, configure their separately authorized Slack user token locally:
+
+```dotenv
+SLACK_CLEAR_USER_TOKENS={"U_REQUESTER_ID":"xoxp-user-authorized-token"}
+```
+
+Set this in the private `.env` loaded by `slack run` (or hosted secret configuration),
+using a real user ID and a user token with `chat:write`. Do not put tokens in task text or
+source control. The bot checks `auth.test` and refuses a token belonging to a different
+user before reading or deleting anything. Without this configuration it reports that
+user messages remain. This does not authorize deleting other people's messages.
 
 Each invitation belongs to its recipient. DeleBot checks current task permissions and
 assignment membership again when a button is used. Button availability depends on the
@@ -330,8 +360,9 @@ channel; use a DM when entering private details. Task access does not grant acce
 linked Slack messages or documents.
 
 Every list, lookup, update, deletion, and assignment notification enforces view
-permissions before showing fields. Updates and deletion additionally require edit
-permission. Group membership is freshly verified, including direct group membership lookup
+permissions before showing fields. Completion and deletion additionally require Access.
+Group membership is freshly verified per incoming interaction (with an interaction-local
+cache), including direct group membership lookup
 when Slack's group discovery omits a selected or saved group. Failed verification grants
 no group-based access. On a membership lookup failure, explicitly named viewers and tasks
 with view permission `all` can still be shown with a notice that team results are hidden.

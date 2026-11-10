@@ -23,6 +23,7 @@ export const TasksDatastore = DefineDatastore({
     applied_events: { type: Schema.types.array, items: { type: Schema.types.string } },
     assignment_events: { type: Schema.types.string },
     assignment_responses: { type: Schema.types.string },
+    workflow_state: { type: Schema.types.string },
     jira_links: { type: Schema.types.array, items: { type: Schema.types.string } },
     github_links: { type: Schema.types.array, items: { type: Schema.types.string } },
     view_perms: { type: Schema.types.array, items: { type: Schema.types.string } },

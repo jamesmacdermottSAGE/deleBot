@@ -3,9 +3,7 @@ import { canAccessTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
 import { formatTask, splitTaskReply } from "./messages.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
-import { SlackTeamDirectory } from "./teams.ts";
-import { resolveWorkspace } from "./workspace.ts";
-import { taskReferencedTeamIds } from "../tasks/access.ts";
+import { taskAccessLoader } from "./access_context.ts";
 import {
   assignmentBlocks,
   type AssignmentInvitation,
@@ -17,26 +15,7 @@ import {
 } from "./notifications.ts";
 
 export function taskDisplays(client: SlackAPIClient): TaskDisplays {
-  const directory = new SlackTeamDirectory(client);
-  return new SlackTaskDisplays(client, async (task, userId, workspaceId) => {
-    const direct = { userId, teamIds: [] as string[] };
-    const references = taskReferencedTeamIds(task);
-    if (!references.length) return direct;
-    try {
-      const workspace = workspaceId ?? await resolveWorkspace(client, task.channelId, {});
-      const snapshot = await directory.load(userId, workspace, references);
-      if (snapshot.access.userId !== userId) throw new Error("Incorrect task viewer.");
-      return { ...snapshot.access, teamNames: snapshot.teamNames };
-    } catch (error) {
-      // An unavailable lookup does not mean a team member left. In particular,
-      // public viewing access alone must never trigger invitation deletion.
-      if (
-        ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
-        canAccessTask(task, direct)
-      ) return direct;
-      throw error;
-    }
-  });
+  return new SlackTaskDisplays(client, taskAccessLoader(client));
 }
 
 export const TaskDisplaysDatastore = DefineDatastore({
@@ -301,11 +280,51 @@ export class SlackTaskDisplays implements TaskDisplays {
     for (const { batch, invitation } of invitations.values()) {
       if (invitation.status !== "pending" || invitation.messageRemoved) continue;
       try {
+        if (task.deleted) {
+          const removed = await this.client.chat.delete({
+            channel: invitation.channelId!,
+            ts: invitation.messageTs!,
+          });
+          if (!removed.ok && removed.error !== "message_not_found") failed++;
+          continue;
+        }
         const access = await this.loadAccess(
           task,
           invitation.recipientId,
           batch.workspaceId,
         );
+        if (!canAccessTask(task, access)) {
+          const removed = await this.client.chat.delete({
+            channel: invitation.channelId!,
+            ts: invitation.messageTs!,
+          });
+          if (!removed.ok && removed.error !== "message_not_found") failed++;
+          continue;
+        }
+        if (task.assignmentTree?.acceptedBy || task.completed) {
+          const text = task.completed
+            ? `*Task #${task.number}*\n\n✅ Completed.`
+            : `*Task #${task.number}*\n\n✅ Accepted by <@${
+              task.assignmentTree!.acceptedBy
+            }>. ${
+              invitation.recipientId === task.assignmentTree!.acceptedBy
+                ? "You own this task."
+                : "This invitation is closed."
+            }`;
+          const result = await this.client.chat.update({
+            channel: invitation.channelId!,
+            ts: invitation.messageTs!,
+            text,
+            blocks: [],
+            unfurl_links: false,
+            unfurl_media: false,
+          });
+          if (
+            !result.ok && result.error !== "message_not_modified" &&
+            result.error !== "message_not_found"
+          ) failed++;
+          continue;
+        }
         const assigned = task.assignees.includes(invitation.recipientId) ||
           task.assignees.some((id) => /^S/.test(id) && access.teamIds.includes(id));
         if (task.deleted || !canAccessTask(task, access) || !assigned) {

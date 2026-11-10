@@ -78,6 +78,18 @@ export function canEditTask(task: AccessTask, access: TaskAccess): boolean {
   return matches(effectiveTaskViewPerms({ ...task, viewPerms: undefined }), access);
 }
 
+/** The displayed Access policy authorizes task completion and deletion. */
+export const canManageTask = canEditTask;
+
+export function canDelegateTask(task: Task, access: TaskAccess): boolean {
+  if (!canAccessTask(task, access)) return false;
+  if (task.assignmentTree?.acceptedBy) {
+    return task.assignmentTree.acceptedBy === access.userId;
+  }
+  return task.assignees.includes(access.userId) || task.assignees.includes("all") ||
+    task.teams.some((id) => access.teamIds.includes(id));
+}
+
 /** Group discovery must include permission principals as well as assignees. */
 export function taskReferencedTeamIds(
   task: Partial<Pick<Task, "teams" | "assignees" | "viewPerms" | "editPerms">>,

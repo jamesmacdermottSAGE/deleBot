@@ -1,6 +1,7 @@
 import {
   canAccessTask,
-  canEditTask,
+  canDelegateTask,
+  canManageTask,
   effectiveTaskViewPerms,
   isTaskAssignees,
   isTaskPermissions,
@@ -8,12 +9,21 @@ import {
 import type { ClearField, TaskPatch, TaskSet } from "./commands.ts";
 import type { Task, TaskAccess, TaskInput, TaskQuery } from "./models.ts";
 import type { TaskRepository } from "./repository.ts";
+import {
+  addAssignmentTreeTargets,
+  initializeAssignmentTree,
+  resetAssignmentTree,
+  transitionAssignmentTree,
+} from "./assignment_state.ts";
+import { AssignmentTreeError } from "./assignment_tree.ts";
+import { withKeyLock } from "./mutation.ts";
 
 export interface TaskContext {
   channelId: string;
   messageTs: string;
   userId: string;
   threadTs?: string;
+  groupMembers?: Record<string, string[]>;
 }
 function messageTime(ts: string): number {
   const match = /^(\d+)\.(\d{1,6})$/.exec(ts);
@@ -181,8 +191,9 @@ export async function createTask(
       }]),
     ),
   };
-  await repository.save(task);
-  return { task, created: true };
+  const initialized = initializeAssignmentTree(task, context);
+  await repository.save(initialized);
+  return { task: initialized, created: true };
 }
 export async function resolveTaskForUpdate(
   number: number | undefined,
@@ -211,14 +222,39 @@ export async function resolveTaskForUpdate(
   }
   return visible[0];
 }
-export async function updateTask(
+async function updateTaskUnlocked(
   task: Task,
   patch: TaskPatch,
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
 ): Promise<{ task: Task; updated: boolean }> {
-  if (context.userId !== access.userId || !canEditTask(task, access)) {
+  const clearsPolicy = patch.clear?.some((field) =>
+    field === "viewPerms" || field === "editPerms"
+  );
+  const changesPolicy = patch.viewPerms !== undefined || patch.editPerms !== undefined ||
+    patch.set?.viewPerms !== undefined || patch.set?.editPerms !== undefined ||
+    patch.matchPerms || clearsPolicy;
+  const changesCompletion = patch.completed !== undefined ||
+    patch.set?.completed !== undefined || patch.clear?.includes("completed");
+  const changesOwnership = patch.assignees !== undefined ||
+    patch.set?.assignees !== undefined || patch.clear?.includes("assignees");
+  if (
+    changesOwnership && task.assignmentTree?.acceptedBy &&
+    task.assignmentTree.acceptedBy !== access.userId
+  ) {
+    throw new TaskAccessError(
+      "Only the accepted owner can change this task's assignees.",
+    );
+  }
+  const creator = task.createdBy === access.userId;
+  const manager = canManageTask(task, access);
+  if (
+    context.userId !== access.userId || !canAccessTask(task, access) ||
+    (changesPolicy && !creator && !manager) ||
+    (changesCompletion && !manager) ||
+    (!creator && !manager && !canDelegateTask(task, access))
+  ) {
     throw new TaskAccessError("You need view and edit permission to update this task.");
   }
   const key = mutationKey(context);
@@ -290,9 +326,14 @@ export async function updateTask(
     ...(patch.viewPerms === undefined
       ? {}
       : { viewPerms: [...new Set(patch.viewPerms)] }),
-    ...(patch.editPerms === undefined
-      ? {}
-      : { editPerms: [...new Set(patch.editPerms)] }),
+    ...(patch.editPerms === undefined ? {} : {
+      editPerms: patch.editPerms.includes("all") ? ["all"] : [
+        ...new Set([
+          ...(task.editPerms ?? []).filter((id) => id !== "all"),
+          ...patch.editPerms,
+        ]),
+      ],
+    }),
     appliedEvents: [...task.appliedEvents ?? [], key],
   };
   Object.assign(next, replacements);
@@ -334,17 +375,35 @@ export async function updateTask(
     }
   }
   next.assignmentEvents = { ...task.assignmentEvents, [key]: newlyAssigned };
-  await repository.save(next);
-  return { task: next, updated: true };
+  const changedPrincipals =
+    [...new Set([...task.assignees, ...task.teams])].sort().join() !==
+      [...next.assignees].sort().join();
+  let finalTask = next;
+  if (assignmentChanged && changedPrincipals) {
+    try {
+      finalTask = patch.assignees !== undefined && replacements.assignees === undefined &&
+          !clears.has("assignees") && task.assignmentTree &&
+          !task.assignmentTree.acceptedBy &&
+          task.assignmentTree.nodes[task.assignmentTree.rootId].status === "delegated" &&
+          !next.assignees.includes("all")
+        ? addAssignmentTreeTargets(next, newlyAssigned, context)
+        : resetAssignmentTree(next, context);
+    } catch (error) {
+      if (error instanceof AssignmentTreeError) throw new TaskCommandError(error.message);
+      throw error;
+    }
+  }
+  await repository.save(finalTask);
+  return { task: finalTask, updated: true };
 }
 
-export async function deleteTask(
+async function deleteTaskUnlocked(
   task: Task,
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
 ): Promise<void> {
-  if (context.userId !== access.userId || !canEditTask(task, access)) {
+  if (context.userId !== access.userId || !canManageTask(task, access)) {
     throw new TaskAccessError("You need view and edit permission to delete this task.");
   }
   await repository.delete(task);
@@ -354,10 +413,11 @@ export type AssignmentDecision = {
   kind: "accept" | "reject" | "delegate";
   assignees?: string[];
   note?: string;
+  invitationKeys?: string[];
 };
 
 /** An invitation recipient can respond without being an editor; delegation still edits the task. */
-export async function respondToAssignment(
+async function respondToAssignmentUnlocked(
   task: Task,
   decision: AssignmentDecision,
   context: TaskContext,
@@ -369,6 +429,28 @@ export async function respondToAssignment(
   }
   const key = mutationKey(context);
   if (task.appliedEvents?.includes(key)) return { task, updated: false };
+  if (task.completed) {
+    throw new TaskCommandError(
+      "This task is completed. Reopen it before responding to assignments.",
+    );
+  }
+  if (decision.kind === "delegate" && !canDelegateTask(task, access)) {
+    throw new TaskAccessError("You must be a current assignee to delegate this task.");
+  }
+  try {
+    const transitioned = transitionAssignmentTree(task, decision, context);
+    if (transitioned) {
+      validate(transitioned);
+      await repository.save(transitioned);
+      return { task: transitioned, updated: true };
+    }
+  } catch (error) {
+    if (error instanceof AssignmentTreeError) throw new TaskCommandError(error.message);
+    throw error;
+  }
+  if (decision.invitationKeys?.length) {
+    throw new TaskCommandError("This invitation has been replaced. List the task again.");
+  }
   const previous = task.assignmentBased
     ? task.assignees
     : task.teams.includes("all")
@@ -411,7 +493,7 @@ export async function respondToAssignment(
     ];
   }
   if (decision.kind === "delegate") {
-    if (!canEditTask(task, access)) {
+    if (!canDelegateTask(task, access)) {
       throw new TaskAccessError(
         "You need view and edit permission to delegate this task.",
       );
@@ -489,6 +571,60 @@ export async function respondToAssignment(
   return { task: next, updated: true };
 }
 
+async function freshTaskMutation<T>(
+  task: Task,
+  repository: TaskRepository,
+  mutate: (current: Task) => Promise<T>,
+): Promise<T> {
+  return await withKeyLock(task.id, async () => {
+    const current = await repository.findById(task.id);
+    if (!current) throw new TaskCommandError("This task is no longer available.");
+    return await mutate(current);
+  });
+}
+
+export async function updateTask(
+  task: Task,
+  patch: TaskPatch,
+  context: TaskContext,
+  repository: TaskRepository,
+  access: TaskAccess,
+): Promise<{ task: Task; updated: boolean }> {
+  return await freshTaskMutation(
+    task,
+    repository,
+    (current) => updateTaskUnlocked(current, patch, context, repository, access),
+  );
+}
+
+export async function deleteTask(
+  task: Task,
+  context: TaskContext,
+  repository: TaskRepository,
+  access: TaskAccess,
+): Promise<void> {
+  return await freshTaskMutation(
+    task,
+    repository,
+    (current) => deleteTaskUnlocked(current, context, repository, access),
+  );
+}
+
+export async function respondToAssignment(
+  task: Task,
+  decision: AssignmentDecision,
+  context: TaskContext,
+  repository: TaskRepository,
+  access: TaskAccess,
+): Promise<{ task: Task; updated: boolean }> {
+  return await freshTaskMutation(
+    task,
+    repository,
+    (current) =>
+      respondToAssignmentUnlocked(current, decision, context, repository, access),
+  );
+}
+
 function soonWindow(now: Date): { start: string; end: string } {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/London",
@@ -515,6 +651,8 @@ export async function listTasks(
     switch (query.kind) {
       case "all":
         return true;
+      case "collaborator":
+        return task.participation?.collaborators[access.userId]?.status === "accepted";
       case "number":
         return task.number === query.number;
       case "name":

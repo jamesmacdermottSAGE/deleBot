@@ -44,6 +44,7 @@ Deno.test("manifest targets Slack hosting and allows people to send DMs", () => 
       "deleted",
       "view_perms",
       "edit_perms",
+      "workflow_state",
     ]
   ) {
     if (!(field in attributes)) throw new Error(`Missing task field: ${field}`);

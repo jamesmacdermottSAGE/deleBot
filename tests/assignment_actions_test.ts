@@ -285,8 +285,8 @@ Deno.test("rejecting a team invitation keeps the team assignment and other invit
   const f = await fixture({ assignees: ["SFRONTEND"] });
   assert(f.posts.length === 2);
   assert((await handleAssignmentAction(f.action(ASSIGNMENT_REJECT), f.dependencies)).ok);
-  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "SFRONTEND,UCREATOR");
-  assert(f.invitation("UCREATOR").invitation.status === "pending");
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "SFRONTEND");
+  assert(![...f.rows.values()].some((batch) => batch.invitations?.UCREATOR));
   assert(
     f.invitation("UBOB").invitation.status === "pending" && f.completed.length === 0,
   );
@@ -294,16 +294,9 @@ Deno.test("rejecting a team invitation keeps the team assignment and other invit
     (await handleAssignmentAction(f.action(ASSIGNMENT_ACCEPT, "UBOB"), f.dependencies))
       .ok,
   );
-  assert(f.completed.length === 0);
-  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UCREATOR,UBOB");
-  assert(f.repository.rows.get(f.task.id)!.teams.length === 0);
-  assert(
-    (await handleAssignmentAction(
-      f.action(ASSIGNMENT_ACCEPT, "UCREATOR"),
-      f.dependencies,
-    )).ok,
-  );
   assert(f.completed.join() === "FXORIGIN");
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UBOB");
+  assert(f.repository.rows.get(f.task.id)!.teams.length === 0);
 });
 
 Deno.test("accepting a team invitation claims the task and cancels the other members' controls", async () => {
@@ -316,8 +309,13 @@ Deno.test("accepting a team invitation claims the task and cancels the other mem
   assert(saved.assignmentResponses?.UALICE.status === "accepted");
   assert(f.invitation().invitation.status === "accepted");
   assert(f.invitation("UBOB").invitation.status === "cancelled");
-  assert(f.invitation("UBOB").invitation.messageRemoved);
-  assert(f.deleted.some((item) => item.channel === "DUBOB"));
+  assert(f.invitation("UBOB").invitation.closedBy === "UALICE");
+  assert(
+    f.updates.some((item) =>
+      item.channel === "DUBOB" && item.text.includes("Accepted by <@UALICE>") &&
+      item.blocks.length === 0
+    ),
+  );
   assert(f.completed.join() === "FXORIGIN");
   const writes = f.repository.writes;
   assert((await handleAssignmentAction(action, f.dependencies)).ok);
@@ -327,15 +325,16 @@ Deno.test("accepting a team invitation claims the task and cancels the other mem
   assert(Number(f.completed.length) === 1);
 });
 
-Deno.test("delegating a team invitation removes the squad and invites only the new assignee", async () => {
+Deno.test("delegating a squad member's branch preserves the other squad members", async () => {
   const f = await fixture({ assignees: ["SFRONTEND"] });
   assert((await f.delegate(["UCAROL"])).ok);
   const saved = f.repository.rows.get(f.task.id)!;
-  assert(saved.assignees.join() === "UCAROL" && saved.teams.length === 0);
+  assert(
+    saved.assignees.join() === "SFRONTEND,UCAROL" && saved.teams.join() === "SFRONTEND",
+  );
   assert(saved.assignmentResponses?.UALICE.status === "delegated");
   assert(f.invitation().invitation.status === "delegated");
-  assert(f.invitation("UBOB").invitation.status === "cancelled");
-  assert(f.invitation("UBOB").invitation.messageRemoved);
+  assert(f.invitation("UBOB").invitation.status === "pending");
   assert(f.posts.length === 3 && f.posts[2].channel === "DUCAROL");
   assert(JSON.stringify(f.posts[2].blocks).includes(ASSIGNMENT_ACCEPT));
   assert(f.completed.length === 0);
@@ -402,7 +401,10 @@ for (const assignees of [["UALICE"], ["SFRONTEND"]]) {
       )).ok,
     );
     const returned = f.repository.rows.get(f.task.id)!;
-    assert(returned.assignees.join() === "UALICE" && returned.teams.length === 0);
+    assert(
+      returned.assignees.join() ===
+        (assignees[0] === "SFRONTEND" ? "SFRONTEND,UALICE" : "UALICE"),
+    );
     assert(returned.assignmentResponses?.UCAROL.status === "rejected");
     assert(returned.assignmentResponses?.UALICE.status === "pending");
     assert(returned.assignmentResponses?.UALICE.returnTo?.join() === "UCREATOR");
@@ -412,7 +414,10 @@ for (const assignees of [["UALICE"], ["SFRONTEND"]]) {
     assert(JSON.stringify(f.posts.at(-1)!.blocks).includes("Delegate"));
     assert(f.completed.length === 0);
     assert((await f.delegate(["UBOB"])).ok);
-    assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UBOB");
+    assert(
+      f.repository.rows.get(f.task.id)!.assignees.join() ===
+        (assignees[0] === "SFRONTEND" ? "SFRONTEND,UBOB" : "UBOB"),
+    );
     assert(
       (await handleAssignmentAction(f.action(ASSIGNMENT_ACCEPT, "UBOB"), f.dependencies))
         .ok,
@@ -439,7 +444,7 @@ Deno.test("creator rejection stops the return cycle without notifying the creato
   );
   assert(f.posts.length === 2 && f.completed.join() === "FXORIGIN");
   const writes = f.repository.writes;
-  assert((await handleAssignmentAction(creatorReject, f.dependencies)).ok);
+  assert(!(await handleAssignmentAction(creatorReject, f.dependencies)).ok);
   assert(
     f.repository.writes === writes && f.posts.length === 2 && f.completed.length === 1,
   );
@@ -469,7 +474,7 @@ Deno.test("failed return delivery retries without repeating the rejection or a s
   assert(f.invitation("UCREATOR").invitation.status === "pending");
 });
 
-Deno.test("returning to an already assigned creator sends a fresh pending invitation", async () => {
+Deno.test("once the creator accepts a competing assignee cannot reject and create a return", async () => {
   const f = await fixture({ assignees: ["UALICE", "UCREATOR"] });
   assert(
     (await handleAssignmentAction(
@@ -479,13 +484,13 @@ Deno.test("returning to an already assigned creator sends a fresh pending invita
   );
   const acceptedInvitation = f.invitation("UCREATOR").invitation.id;
   assert((await handleAssignmentAction(f.action(ASSIGNMENT_REJECT), f.dependencies)).ok);
-  assert(f.posts.length === 3 && f.posts[2].channel === "DUCREATOR");
-  assert(f.invitation("UCREATOR").invitation.id !== acceptedInvitation);
-  assert(f.invitation("UCREATOR").invitation.status === "pending");
+  assert(f.posts.length === 2);
+  assert(f.invitation("UCREATOR").invitation.id === acceptedInvitation);
+  assert(f.invitation("UCREATOR").invitation.status === "accepted");
   assert(
-    f.repository.rows.get(f.task.id)!.assignmentResponses?.UCREATOR.status === "pending",
+    f.repository.rows.get(f.task.id)!.assignmentResponses?.UCREATOR.status === "accepted",
   );
-  assert(f.completed.length === 0);
+  assert(f.completed.join() === "FXORIGIN");
 });
 
 Deno.test("combined delegation mentions support people and teams and forward a note once", async () => {
