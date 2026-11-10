@@ -3,13 +3,14 @@ import {
   type MessageClient,
   type MessageEvent,
 } from "../delebot/slack/events.ts";
-import { GREETING } from "../delebot/slack/messages.ts";
+import { GREETING, UNKNOWN_COMMAND } from "../delebot/slack/messages.ts";
 import { TASK_CREATE_USAGE, TASK_LIST_USAGE } from "../delebot/tasks/commands.ts";
 import { input, MemoryTaskRepository, teamDirectory } from "./task_fixtures.ts";
 import { SlackTeamDirectory, type TeamDirectory } from "../delebot/slack/teams.ts";
 import { createTask } from "../delebot/tasks/service.ts";
 import { TaskReferenceError } from "../delebot/tasks/repository.ts";
 import type {
+  MessageBlocks,
   NotificationBatch,
   NotificationClient,
   NotificationContext,
@@ -49,7 +50,9 @@ function fixture() {
     { channel: string; text: string; thread_ts?: string; user?: string }
   > = [];
   const publicPosts: Array<{ channel: string; text: string; thread_ts?: string }> = [];
-  const notificationPosts: Array<{ channel: string; text: string }> = [];
+  const notificationPosts: Array<
+    { channel: string; text: string; blocks?: MessageBlocks }
+  > = [];
   const notificationDeletes: Array<{ channel: string; ts: string }> = [];
   const openedDms: string[] = [];
   const openedListDms: string[] = [];
@@ -176,14 +179,33 @@ Deno.test("usage commands need no team or datastore access and list help goes to
   assert(posts.at(-1)!.thread_ts === event.message_ts);
 });
 
-Deno.test("unrecognised channel mention receives command help in a thread", async () => {
+Deno.test("unrecognised channel mention explains the command was not recognised and suggests help", async () => {
   const { event, client, posts } = fixture();
   const result = await handleMessage(event, client);
   assert("outputs" in result && !result.outputs.ignored);
   assert(posts.length === 1);
   assert(posts[0].channel === event.channel_id);
   assert(posts[0].thread_ts === event.message_ts);
-  assert(posts[0].text === GREETING);
+  assert(posts[0].text === UNKNOWN_COMMAND);
+  assert(posts[0].text.includes("task ?") && posts[0].text.includes("`?`"));
+});
+
+Deno.test("unrecognised DM replies in its thread without loading tasks or memberships", async () => {
+  const { event, client, posts } = fixture();
+  await handleMessage(
+    {
+      ...event,
+      channel_type: "dm",
+      channel_id: "DTEST",
+      text: "nonsense",
+      thread_ts: "1.1",
+    },
+    client,
+    undefined,
+    { load: () => Promise.reject(new Error("Must not load memberships")) },
+  );
+  assert(posts.length === 1 && posts[0].text === UNKNOWN_COMMAND);
+  assert(posts[0].channel === "DTEST" && posts[0].thread_ts === "1.1");
 });
 
 Deno.test("reply stays in an existing thread", async () => {
@@ -205,6 +227,109 @@ Deno.test("human DM does not require a bot mention", async () => {
   const { event, client, posts } = fixture();
   await handleMessage({ ...event, channel_type: "dm", text: "hello" }, client);
   assert(posts.length === 1);
+});
+
+Deno.test("team creation invites each member, rejection retains the team, and acceptance claims it", async () => {
+  const f = fixture();
+  const repo = new MemoryTaskRepository();
+  let members = ["UALICE", "UBOB"];
+  const directory = new SlackTeamDirectory({
+    usergroups: {
+      list: () =>
+        Promise.resolve({
+          ok: true,
+          usergroups: [{
+            id: "SJSQUAD",
+            handle: "jsquad",
+            is_section: true,
+            is_usergroup: false,
+            date_delete: 0,
+          }],
+        }),
+      users: {
+        list: () => Promise.resolve({ ok: true, users: members }),
+      },
+    },
+  });
+  f.notifications.context!.loadAccess = async (task, userId, workspaceId) =>
+    (await directory.load(userId, workspaceId, task.teams)).access;
+  f.notificationClient.usergroups.users.list = () =>
+    Promise.resolve({ ok: true, users: members });
+  const created = await handleMessage(
+    { ...f.event, text: "<@UBOT> task jsquadTask assign <!subteam^SJSQUAD>" },
+    f.client,
+    repo,
+    directory,
+  );
+  const task = [...repo.rows.values()][0];
+  assert(created.interactive && task.assignees.join() === "SJSQUAD");
+  assert(f.posts[0].text.includes("@jsquad ⏳ Pending"));
+  assert(!f.posts[0].text.includes("Team SJSQUAD"));
+  assert(
+    f.notificationPosts.map((post) => post.channel).sort().join() === "DUALICE,DUBOB",
+  );
+  for (const post of f.notificationPosts) {
+    const blocks = JSON.stringify(post.blocks);
+    for (
+      const action of [
+        "delebot_assignment_accept",
+        "delebot_assignment_reject",
+        "delebot_assignment_delegate",
+      ]
+    ) {
+      assert(blocks.includes(action));
+    }
+  }
+  for (const member of members) {
+    for (const command of ["ls me", "ls @jsquad"]) {
+      await handleMessage(
+        { ...f.event, user_id: member, text: `<@UBOT> ${command}` },
+        f.client,
+        repo,
+        directory,
+      );
+      assert(f.posts.at(-1)!.text.includes("jsquadTask"));
+      assert(f.posts.at(-1)!.text.includes("@jsquad ⏳ Pending"));
+    }
+  }
+  for (const [index, member] of members.entries()) {
+    await handleMessage(
+      {
+        ...f.event,
+        message_ts: `11.${index + 1}`,
+        user_id: member,
+        text: `<@UBOT> ${task.number} ${index === 0 ? "reject" : "accept"}`,
+      },
+      f.client,
+      repo,
+      directory,
+    );
+    if (index === 0) {
+      assert(repo.rows.get(task.id)!.assignees.join() === "SJSQUAD,UHUMAN");
+      assert(f.posts.at(-1)!.text.includes("<@UALICE> ❌ Rejected"));
+      assert(f.posts.at(-1)!.text.includes("@jsquad ⏳ Pending"));
+    }
+  }
+  const updated = repo.rows.get(task.id)!;
+  assert(updated.assignmentResponses?.UALICE.status === "rejected");
+  assert(updated.assignmentResponses?.UBOB.status === "accepted");
+  assert(updated.assignees.join() === "UHUMAN,UBOB" && updated.teams.length === 0);
+  assert(f.posts.at(-1)!.text.includes("<@UBOB> ✅"));
+  assert(!f.posts.at(-1)!.text.includes("@jsquad"));
+  assert(
+    f.notificationPosts.length === 3,
+    "Rejection adds only the creator's return invitation",
+  );
+  assert(f.notificationPosts[2].channel === "DUHUMAN");
+  assert(f.notificationPosts[2].text.includes("returned to you"));
+  members = [];
+  await handleMessage(
+    { ...f.event, user_id: "UALICE", text: "<@UBOT> ls me" },
+    f.client,
+    repo,
+    directory,
+  );
+  assert(f.posts.at(-1)!.text === "No tasks found.");
 });
 
 Deno.test("private-channel mention receives a reply", async () => {
@@ -1288,15 +1413,15 @@ Deno.test("composable ls targets and filters return full task details only in th
   }
   const cases: Array<[string, string[]]> = [
     ["ls", ["Personal", "Friend", "Frontend", "Later", "Backend"]],
-    ["ls me", ["Personal"]],
+    ["ls me", ["Personal", "Frontend"]],
     ["ls <@UFRIEND>", ["Friend", "Later"]],
     ["ls team", ["Frontend"]],
     ["ls <!subteam^SBACKEND>", ["Backend"]],
-    ["ls 1 soon", ["Personal"]],
+    ["ls 1 soon", ["Personal", "Frontend"]],
     ["ls <@UFRIEND> soon", ["Friend"]],
     ["ls team priority 1", ["Frontend"]],
     [`ls (${due(2)}) <@UFRIEND> p1`, ["Friend"]],
-    ["ls me <@UFRIEND> soon", ["Personal", "Friend"]],
+    ["ls me <@UFRIEND> soon", ["Personal", "Friend", "Frontend"]],
   ];
   for (const [command, expected] of cases) {
     const before = posts.length;

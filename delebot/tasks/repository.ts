@@ -192,11 +192,28 @@ function parseResponses(value: unknown): NonNullable<Task["assignmentResponses"]
   if (
     !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
     !Object.entries(parsed).every(([id, raw]) => {
-      const entry = raw as { status?: unknown; delegatedTo?: unknown };
+      const entry = raw as {
+        status?: unknown;
+        delegatedTo?: unknown;
+        returnTo?: unknown;
+        returnedBy?: unknown;
+        note?: unknown;
+      };
       return /^[UWS][A-Z0-9]+$/.test(id) && entry && typeof entry === "object" &&
         ["pending", "accepted", "rejected", "delegated"].includes(
           entry.status as string,
-        ) && (entry.delegatedTo === undefined || isTaskAssignees(entry.delegatedTo));
+        ) && (entry.delegatedTo === undefined || isTaskAssignees(entry.delegatedTo)) &&
+        (entry.returnTo === undefined ||
+          (Array.isArray(entry.returnTo) &&
+            entry.returnTo.every((parent) =>
+              typeof parent === "string" && /^[UW][A-Z0-9]+$/.test(parent)
+            ) &&
+            new Set(entry.returnTo).size === entry.returnTo.length)) &&
+        (entry.note === undefined ||
+          (typeof entry.note === "string" && entry.note.length <= 2000)) &&
+        (entry.returnedBy === undefined ||
+          (typeof entry.returnedBy === "string" &&
+            /^[UW][A-Z0-9]+$/.test(entry.returnedBy)));
     })
   ) throw new Error("Invalid assignment responses.");
   return parsed;

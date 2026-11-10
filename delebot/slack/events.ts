@@ -1,5 +1,6 @@
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 import { resetTaskDatabase } from "../tasks/reset.ts";
+import { clearDmHistory } from "./clear.ts";
 import { type TaskDisplays, taskDisplays } from "./task_displays.ts";
 import { type DmContexts, expandTeamHandles, SlackDmContexts } from "./dm_context.ts";
 import type { TaskAccess } from "../tasks/models.ts";
@@ -61,7 +62,13 @@ import {
   notifyTaskAssignments,
   SlackNotificationStore,
 } from "./notifications.ts";
-import { formatTask, GREETING, splitPrivateReply, splitTaskReply } from "./messages.ts";
+import {
+  formatTask,
+  GREETING,
+  splitPrivateReply,
+  splitTaskReply,
+  UNKNOWN_COMMAND,
+} from "./messages.ts";
 import {
   membershipHelp,
   SlackTeamDirectory,
@@ -147,6 +154,12 @@ export async function handleMessage(
   resetDatabase?: () => Promise<{ tasks: number; notifications: number }>,
   dmContexts?: DmContexts,
   displays?: TaskDisplays,
+  clearConversation?: (
+    channel: string,
+    userId: string,
+    botUserId: string,
+    boundary: string,
+  ) => Promise<{ deleted: number; failed: number }>,
 ): Promise<MessageResult> {
   const ignored = { outputs: { ignored: true } };
   if (event.bot_id || event.subtype || !event.user_id || !event.message_ts) {
@@ -217,10 +230,38 @@ export async function handleMessage(
   let replyTaskIds: string[][] | undefined;
   let changedTask: Task | undefined;
   let listedTasks: Task[] = [];
-  let replies = [GREETING];
+  let replies = [text ? UNKNOWN_COMMAND : GREETING];
   let hasTaskCards = false;
   if (teamMenu) {
     replies = [teamMenu];
+  } else if (command.kind === "clear-chat") {
+    if (!isDm) {
+      replies = [
+        "Use `clear` in your direct message with DeleBot to remove its messages from that chat.",
+      ];
+    } else if (!clearConversation) replies = ["Chat clearing is not configured."];
+    else {
+      try {
+        const result = await clearConversation(
+          event.channel_id,
+          event.user_id,
+          identity.user_id,
+          event.message_ts,
+        );
+        shownTaskIds = [];
+        replies = [
+          `Cleared ${result.deleted} DeleBot messages from this DM. Slack only lets me delete my own messages, so your messages remain. Saved tasks are unchanged.${
+            result.failed
+              ? " Some messages or cleanup records could not be cleared; run clear again to retry."
+              : ""
+          }`,
+        ];
+      } catch {
+        replies = [
+          "I couldn't finish clearing this DM. Run `clear` again to retry. Slack only lets me delete DeleBot's own messages; your messages and saved tasks remain.",
+        ];
+      }
+    }
   } else if (command.kind === "reset") {
     if (!resetDatabase) {
       replies = ["Database reset is not configured."];
@@ -706,7 +747,10 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event }) 
               }
               return snapshot.access;
             } catch (error) {
-              if (canAccessTask(task, directAccess)) return directAccess;
+              if (
+                ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
+                canAccessTask(task, directAccess)
+              ) return directAccess;
               throw error;
             }
           },
@@ -715,6 +759,8 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event }) 
       () => resetTaskDatabase(client),
       new SlackDmContexts(client),
       taskDisplays(client),
+      (channel, userId, botUserId, boundary) =>
+        clearDmHistory(client, channel, userId, botUserId, boundary),
     );
     // Interactive assignment messages remain active until their recipients respond.
     if (result.interactive) return { completed: false };

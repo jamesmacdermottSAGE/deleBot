@@ -1,4 +1,5 @@
 import type { Task } from "../delebot/tasks/models.ts";
+import { TASK_CREATE_USAGE } from "../delebot/tasks/commands.ts";
 import {
   formatTask,
   formatTaskList,
@@ -249,7 +250,7 @@ Deno.test("new tasks display all optional fields as unset", () => {
   assert(!text.includes("null") && !text.includes("undefined"));
 });
 
-Deno.test("help explains named fields, thread updates, completion and repeated links", () => {
+Deno.test("task help explains fields, thread updates, completion and delegation", () => {
   for (
     const command of [
       "task Name",
@@ -272,9 +273,17 @@ Deno.test("help explains named fields, thread updates, completion and repeated l
     ]
   ) {
     assert(
-      GREETING.includes(command.replaceAll("@DeleBot ", "")),
+      TASK_CREATE_USAGE.includes(command.replaceAll("@DeleBot ", "")),
       `Missing help: ${command}`,
     );
   }
   assert(!GREETING.includes("urgency"));
+});
+
+Deno.test("general help is brief and introduces task creation and listing", () => {
+  assert(GREETING.length < 1000);
+  for (const command of ["task Name", "ls me", "task ?", "ls ?", "delegate @person"]) {
+    assert(GREETING.includes(command), `Missing brief help: ${command}`);
+  }
+  assert(GREETING.includes("direct and team assignments"));
 });

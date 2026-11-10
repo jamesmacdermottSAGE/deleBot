@@ -38,7 +38,14 @@ export interface Task extends TaskInput {
   assignmentEvents?: Record<string, string[]>;
   assignmentResponses?: Record<
     string,
-    { status: "pending" | "accepted" | "rejected" | "delegated"; delegatedTo?: string[] }
+    {
+      status: "pending" | "accepted" | "rejected" | "delegated";
+      delegatedTo?: string[];
+      /** Previous assignees, nearest first; an empty path stops rejection loops. */
+      returnTo?: string[];
+      returnedBy?: string;
+      note?: string;
+    }
   >;
   /** Retained to prevent delayed creation-event replays from restoring a deleted task. */
   deleted?: boolean;

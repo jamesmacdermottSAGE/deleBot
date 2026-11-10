@@ -264,3 +264,24 @@ Deno.test("DM team discovery resolves flagged handles only after membership veri
   const absent = await directory.load("UJAMES", "TWORKSPACE", [], true);
   assert(!absent.teamNames.SALPHA && !absent.knownTeamIds.includes("SALPHA"));
 });
+
+Deno.test("referenced flagged teams retain their handles without handle discovery, including enterprise aliases", async () => {
+  const { directory, client } = fixture([
+    group("SLOCAL", [], {
+      enterprise_subteam_id: "SENTERPRISE",
+      handle: "jsquad",
+      is_section: true,
+      is_usergroup: false,
+    }),
+  ]);
+  client.usergroups.users.list = () => Promise.resolve({ ok: true, users: ["UJAMES"] });
+  for (const id of ["SLOCAL", "SENTERPRISE"]) {
+    const snapshot = await directory.load("UJAMES", "TWORKSPACE", [id]);
+    assert(snapshot.access.teamIds.includes(id));
+    assert(snapshot.teamNames[id] === "jsquad");
+  }
+  client.usergroups.users.list = () =>
+    Promise.resolve({ ok: false, error: "usergroup_not_found" });
+  const absent = await directory.load("UJAMES", "TWORKSPACE", ["SENTERPRISE"]);
+  assert(!absent.teamNames.SENTERPRISE && !absent.knownTeamIds.includes("SENTERPRISE"));
+});

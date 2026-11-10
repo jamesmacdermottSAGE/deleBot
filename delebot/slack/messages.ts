@@ -1,18 +1,17 @@
 import type { Task } from "../tasks/models.ts";
 
-/** Help is also the response to messages that are not task commands. */
+/** Brief introduction; task ? contains the full creation and delegation guide. */
 export const GREETING = [
-  "Thread updates get a short confirmation while existing task cards refresh. Use print to show the full task again, or 123 print to select a task by number.",
   "💬 Talk directly to DeleBot in a DM; no bot mention needed.",
-  "*Create:* `task Name` — the name is required. Other fields start unset; tasks start unassigned.",
-  "*Fields:* `assign @person @team`, `desc text`, `p 1`, `due 6/11/26`, `link https://…`, `jira https://…`, `github https://…`, `access @person @team` (or `access all`). Priority 1 is highest; 5 lowest. Dates use day/month/year.",
-  '*Edit:* `edit due 10/11/26 p 2 desc "New text"` replaces fields. `edit completed no` reopens a task. `delete due p desc` clears fields; `delete` alone deletes the task.',
-  "*List:* `ls me`, `ls @person`, `ls @team`, `ls team`, `ls soon`, `ls 1 soon`, `ls 6/11/26`, or `ls task Name`. Each task arrives as a separate DM message. Reply to its thread to edit that task. Bare done works after selecting a single task; otherwise specify its number.",
-  "*Respond:* `accept`, `reject`, `delegate @person` or `delegate @team` in the task message's thread. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. New assignees receive their own invitation. Editing and delegation require access.",
-  "*Teams:* type `teams`, then use a handle directly, e.g. `assign @alphateam`. Use Slack's people menu for user mentions.",
-  "Quote names or descriptions containing field words. Repeat link, jira or github to add multiple links; use edit to replace or delete to clear each field.",
-  "*Help:* `task ?` for all fields and `ls ?` for filters. Numbers are automatic and non-consecutive. `delete all` temporarily resets the whole database.",
+  "*Create:* `task Name`, or `task Name assign @person @team p 1 due 6/11/26`. Type `teams` to find team handles.",
+  "*List:* `ls` shows available tasks; `ls me` includes your direct and team assignments. Use `ls @person`, `ls @team`, or `ls soon` to narrow the results. Each task arrives as a separate DM message.",
+  "Reply in a task's thread with `accept`, `reject`, `delegate @person`, edits, or `done`. You can also select a task by number, e.g. `123 done`.",
+  "*Help:* `task ?` for full task creation, editing and delegation instructions; `ls ?` for all list filters.",
+  "*Clear chat:* `clear` removes DeleBot's messages from this DM. Your messages and saved tasks remain.",
 ].join("\n\n");
+
+export const UNKNOWN_COMMAND =
+  "I didn't recognise that command. Run `task ?` for full task creation and delegation instructions, or `?` for a brief guide to `task` and `ls`.";
 
 /** Escape Slack control characters in text supplied by people. */
 function escapeText(text: string): string {

@@ -9,6 +9,8 @@ import { taskReferencedTeamIds } from "../tasks/access.ts";
 import {
   assignmentBlocks,
   type AssignmentInvitation,
+  assignmentNotificationText,
+  escapeNotificationText,
   type MessageBlocks,
   type NotificationBatch,
   SlackNotificationStore,
@@ -16,17 +18,22 @@ import {
 
 export function taskDisplays(client: SlackAPIClient): TaskDisplays {
   const directory = new SlackTeamDirectory(client);
-  return new SlackTaskDisplays(client, async (task, userId) => {
+  return new SlackTaskDisplays(client, async (task, userId, workspaceId) => {
     const direct = { userId, teamIds: [] as string[] };
     const references = taskReferencedTeamIds(task);
     if (!references.length) return direct;
     try {
-      const workspace = await resolveWorkspace(client, task.channelId, {});
+      const workspace = workspaceId ?? await resolveWorkspace(client, task.channelId, {});
       const snapshot = await directory.load(userId, workspace, references);
       if (snapshot.access.userId !== userId) throw new Error("Incorrect task viewer.");
-      return snapshot.access;
+      return { ...snapshot.access, teamNames: snapshot.teamNames };
     } catch (error) {
-      if (canAccessTask(task, direct)) return direct;
+      // An unavailable lookup does not mean a team member left. In particular,
+      // public viewing access alone must never trigger invitation deletion.
+      if (
+        ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
+        canAccessTask(task, direct)
+      ) return direct;
       throw error;
     }
   });
@@ -101,7 +108,11 @@ interface Client {
 export class SlackTaskDisplays implements TaskDisplays {
   constructor(
     private client: Client,
-    private loadAccess: (task: Task, user: string) => Promise<TaskAccess>,
+    private loadAccess: (
+      task: Task,
+      user: string,
+      workspaceId?: string,
+    ) => Promise<TaskAccess & { teamNames?: Record<string, string> }>,
   ) {}
   async track(taskId: string, channel: string, ts: string, user: string, part = 0) {
     const result = await this.client.apps.datastore.put({
@@ -159,6 +170,10 @@ export class SlackTaskDisplays implements TaskDisplays {
       }
       if (notificationCursor) notificationCursors.add(notificationCursor);
     } while (notificationCursor);
+    // Enterprise DM metadata may omit context_team_id. Delivery already saved
+    // the verified source workspace; use it again when refreshing invitations.
+    const workspaceId = [...invitations.values()].find(({ batch }) => batch.workspaceId)
+      ?.batch.workspaceId;
     const rows: Record<string, unknown>[] = [];
     const cursors = new Set<string>();
     let cursor: string | undefined;
@@ -234,9 +249,11 @@ export class SlackTaskDisplays implements TaskDisplays {
         continue;
       }
       try {
-        const visible = !task.deleted &&
-          canAccessTask(task, await this.loadAccess(task, row.user_id));
-        const parts = visible ? splitTaskReply(formatTask(task)) : [];
+        const access = task.deleted
+          ? undefined
+          : await this.loadAccess(task, row.user_id, workspaceId);
+        const visible = !!access && canAccessTask(task, access);
+        const parts = visible ? splitTaskReply(formatTask(task, access?.teamNames)) : [];
         const text = row.combined
           ? "This task list has changed. Send ls again for current task cards."
           : parts[row.part as number];
@@ -284,7 +301,11 @@ export class SlackTaskDisplays implements TaskDisplays {
     for (const { batch, invitation } of invitations.values()) {
       if (invitation.status !== "pending" || invitation.messageRemoved) continue;
       try {
-        const access = await this.loadAccess(task, invitation.recipientId);
+        const access = await this.loadAccess(
+          task,
+          invitation.recipientId,
+          batch.workspaceId,
+        );
         const assigned = task.assignees.includes(invitation.recipientId) ||
           task.assignees.some((id) => /^S/.test(id) && access.teamIds.includes(id));
         if (task.deleted || !canAccessTask(task, access) || !assigned) {
@@ -297,7 +318,14 @@ export class SlackTaskDisplays implements TaskDisplays {
         }
         // Also repairs invitations whose blocks were removed by the previous
         // refresh implementation, retaining their original recipient binding.
-        const text = formatTask(task);
+        const returnedBy = invitation.returnedBy ??
+          task.assignmentResponses?.[invitation.recipientId]?.returnedBy;
+        const note = invitation.note ??
+          task.assignmentResponses?.[invitation.recipientId]?.note;
+        const text = returnedBy
+          ? assignmentNotificationText(task, invitation.recipientId, invitation)
+          : formatTask(task, access.teamNames) +
+            (note?.trim() ? `\n\n*Note:* ${escapeNotificationText(note.trim())}` : "");
         const result = await this.client.chat.update({
           channel: invitation.channelId!,
           ts: invitation.messageTs!,

@@ -246,7 +246,10 @@ Deno.test("a recipient with viewing permission and no editing permission can acc
   for (const actionId of [ASSIGNMENT_ACCEPT, ASSIGNMENT_REJECT]) {
     const f = await securityFixture({ viewPerms: ["UALICE"], editPerms: [] });
     const result = await handleAssignmentAction(f.action(actionId), f.dependencies);
-    assert(result.ok);
+    assert(
+      result.ok ||
+        (actionId === ASSIGNMENT_REJECT && result.error?.includes("response was saved")),
+    );
     const saved = f.repository.rows.get(f.task.id)!;
     assert(saved.editPerms?.length === 0 && saved.viewPerms?.join() === "UALICE");
     if (actionId === ASSIGNMENT_ACCEPT) {
@@ -256,14 +259,20 @@ Deno.test("a recipient with viewing permission and no editing permission can acc
           f.updates[0]?.blocks.length === 0,
       );
     } else {
-      assert(f.invitation().status === "rejected" && saved.assignees.length === 0);
+      assert(
+        f.invitation().status === "rejected" && saved.assignees.join() === "UCREATOR",
+      );
       assert(f.deletions.length === 1);
+      assert(
+        f.sent.length === 1,
+        "Return invitations must not bypass the creator's viewing permission",
+      );
     }
-    assert(f.completions.includes(executionId));
+    assert(f.completions.includes(executionId) === (actionId === ASSIGNMENT_ACCEPT));
   }
 });
 
-Deno.test("read-only invitation recipients cannot open a reassignment modal", async () => {
+Deno.test("read-only invitation recipients cannot open a delegation modal", async () => {
   const f = await securityFixture();
   const writes = f.repository.writes;
   const result = await handleAssignmentAction(
@@ -280,7 +289,7 @@ Deno.test("rejected assignments recover after service commit, notification write
   f.store.failTerminalSave = true;
   const action = f.action(ASSIGNMENT_REJECT);
   const first = await handleAssignmentAction(action, f.dependencies);
-  assert(!first.ok && f.repository.rows.get(f.task.id)?.assignees.length === 0);
+  assert(!first.ok && f.repository.rows.get(f.task.id)?.assignees.join() === "UCREATOR");
   assert(
     f.invitation().status === "pending" && f.invitation().decision?.kind === "reject",
   );
@@ -293,6 +302,7 @@ Deno.test("rejected assignments recover after service commit, notification write
   assert(third.ok && f.repository.writes === writes && f.deletions.length === 2);
   const applied = f.repository.rows.get(f.task.id)?.appliedEvents ?? [];
   assert(applied.filter((key) => key === "DALICE:20.1").length === 1);
+  assert(f.sent.length === 2, "Retries send one return invitation to the creator");
 });
 
 Deno.test("accepted assignment retries only the failed DM update", async () => {

@@ -85,6 +85,35 @@ function validate(input: TaskInput) {
     }
   }
 }
+
+/** Old tasks recover their return path from delegation history until next assigned. */
+function assignmentReturnPath(
+  task: Task,
+  principals: string[],
+  visited = new Set<string>(),
+): string[] {
+  for (const id of principals) {
+    const path = task.assignmentResponses?.[id]?.returnTo;
+    if (path !== undefined) return [...path];
+    visited.add(id);
+  }
+  const delegator = Object.entries(task.assignmentResponses ?? {}).reverse().find(
+    ([id, response]) =>
+      !visited.has(id) && /^[UW]/.test(id) && response.status === "delegated" &&
+      response.delegatedTo?.some((target) => principals.includes(target)),
+  )?.[0];
+  return delegator
+    ? [delegator, ...assignmentReturnPath(task, [delegator], visited)]
+    : visited.has(task.createdBy)
+    ? []
+    : [task.createdBy];
+}
+
+function delegationReturnPath(task: Task, userId: string, target: string): string[] {
+  return [...new Set([userId, ...assignmentReturnPath(task, [userId])])]
+    .filter((id) => id !== target);
+}
+
 export async function createTask(
   draft: Pick<TaskInput, "name"> & Partial<Omit<TaskInput, "name">> & {
     matchPerms?: boolean;
@@ -145,6 +174,12 @@ export async function createTask(
     status: input.completed ? "completed" : "open",
     appliedEvents: [key],
     assignmentEvents: { [key]: input.assignees },
+    assignmentResponses: Object.fromEntries(
+      input.assignees.filter((id) => id !== "all").map((id) => [id, {
+        status: "pending" as const,
+        returnTo: id === context.userId ? [] : [context.userId],
+      }]),
+    ),
   };
   await repository.save(task);
   return { task, created: true };
@@ -291,7 +326,12 @@ export async function updateTask(
     ? {}
     : { ...task.assignmentResponses };
   for (const id of newlyAssigned) {
-    if (/^[UW]/.test(id)) next.assignmentResponses[id] = { status: "pending" };
+    if (id !== "all") {
+      next.assignmentResponses[id] = {
+        status: "pending",
+        returnTo: delegationReturnPath(task, context.userId, id),
+      };
+    }
   }
   next.assignmentEvents = { ...task.assignmentEvents, [key]: newlyAssigned };
   await repository.save(next);
@@ -313,6 +353,7 @@ export async function deleteTask(
 export type AssignmentDecision = {
   kind: "accept" | "reject" | "delegate";
   assignees?: string[];
+  note?: string;
 };
 
 /** An invitation recipient can respond without being an editor; delegation still edits the task. */
@@ -328,18 +369,46 @@ export async function respondToAssignment(
   }
   const key = mutationKey(context);
   if (task.appliedEvents?.includes(key)) return { task, updated: false };
-  const assigned = task.assignees.includes(access.userId) ||
-    task.assignees.includes("all") ||
-    [...task.assignees, ...task.teams].some((id) =>
-      /^S/.test(id) && access.teamIds.includes(id)
-    );
+  const previous = task.assignmentBased
+    ? task.assignees
+    : task.teams.includes("all")
+    ? ["all"]
+    : [...new Set([...task.assignees, ...task.teams])];
+  const respondingTeams = previous.filter((id) =>
+    /^S/.test(id) && access.teamIds.includes(id)
+  );
+  const assigned = previous.includes(access.userId) || previous.includes("all") ||
+    respondingTeams.length > 0;
   if (!assigned) throw new TaskAccessError("You are no longer assigned this task.");
   if (!["accept", "reject", "delegate"].includes(decision.kind)) {
     throw new TaskCommandError("Choose accept, reject, or delegate.");
   }
-  let assignees = [...task.assignees];
+  if (
+    decision.note !== undefined &&
+    (typeof decision.note !== "string" || decision.note.length > 2000)
+  ) {
+    throw new TaskCommandError("Keep the delegation note to 2,000 characters or fewer.");
+  }
+  const note = decision.kind === "delegate" ? decision.note?.trim() : undefined;
+  const replacesTeams = decision.kind !== "reject" && respondingTeams.length > 0;
+  let assignees = replacesTeams
+    ? previous.filter((id) => !respondingTeams.includes(id))
+    : [...previous];
+  const returnPath = assignmentReturnPath(
+    task,
+    previous.includes(access.userId) ? [access.userId] : respondingTeams,
+  ).filter((id) => id !== access.userId);
+  const returnedTo = decision.kind === "reject" ? returnPath[0] : undefined;
+  if (decision.kind === "accept" && replacesTeams) {
+    assignees = [...new Set([...assignees, access.userId])];
+  }
   if (decision.kind === "reject" || decision.kind === "delegate") {
     assignees = assignees.filter((id) => id !== access.userId);
+  }
+  if (returnedTo) {
+    assignees = [
+      ...new Set([...(assignees.includes("all") ? [] : assignees), returnedTo]),
+    ];
   }
   if (decision.kind === "delegate") {
     if (!canEditTask(task, access)) {
@@ -359,7 +428,7 @@ export async function respondToAssignment(
     if (assignees.includes("all")) assignees = [];
     assignees = [...new Set([...assignees, ...decision.assignees])];
   }
-  const changesAssignments = decision.kind !== "accept";
+  const changesAssignments = decision.kind !== "accept" || replacesTeams;
   const next: Task = {
     ...task,
     assignmentResponses: {
@@ -371,19 +440,44 @@ export async function respondToAssignment(
           ? "rejected"
           : "delegated",
         ...(decision.kind === "delegate" ? { delegatedTo: decision.assignees } : {}),
+        returnTo: returnPath,
       },
       ...Object.fromEntries(
-        (decision.assignees ?? []).map((id) => [id, { status: "pending" as const }]),
+        (decision.assignees ?? []).map((id) => [id, {
+          status: "pending" as const,
+          ...(note ? { note } : {}),
+          returnTo: [...new Set([access.userId, ...returnPath])].filter((parent) =>
+            parent !== id
+          ),
+        }]),
       ),
+      ...(returnedTo
+        ? {
+          [returnedTo]: {
+            status: "pending" as const,
+            returnTo: returnPath.slice(1),
+            returnedBy: access.userId,
+          },
+        }
+        : {}),
     },
     assignees,
-    ...(changesAssignments && task.assignmentBased
+    ...(changesAssignments && !task.assignmentBased
+      ? {
+        assignmentBased: true,
+        viewPerms: task.viewPerms ?? effectiveTaskViewPerms(task),
+        editPerms: task.editPerms ?? effectiveTaskViewPerms(task),
+      }
+      : {}),
+    ...(changesAssignments
       ? { teams: assignees.filter((id) => /^S/.test(id) || id === "all") }
       : {}),
     appliedEvents: [...task.appliedEvents ?? [], key],
     assignmentEvents: {
       ...task.assignmentEvents,
-      [key]: decision.kind === "delegate"
+      [key]: returnedTo
+        ? [returnedTo]
+        : decision.kind === "delegate"
         ? assignees.filter((id) =>
           !task.assignees.includes(id) && !task.teams.includes(id)
         )
@@ -440,7 +534,10 @@ export async function listTasks(
         const matchesTarget = !query.targets?.length || query.targets.some((target) => {
           switch (target.kind) {
             case "me":
-              return task.assignees.includes(access.userId);
+              return task.assignees.includes(access.userId) ||
+                [...task.assignees, ...task.teams].some((id) =>
+                  /^S/.test(id) && access.teamIds.includes(id)
+                );
             case "user":
               return task.assignees.includes(target.userId);
             case "team":

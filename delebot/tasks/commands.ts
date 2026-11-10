@@ -33,18 +33,23 @@ export interface TaskPatch {
 
 export const TASK_CREATE_USAGE = [
   "Use print in a task's thread to reprint its latest details, or 123 print elsewhere. Thread edits use short confirmations and update existing cards automatically.",
-  "💬 *Create:* `task Name` in your DM with DeleBot. A name is required; other fields are optional.",
+  "💬 *Create:* `task Name` in your DM with DeleBot; no bot mention needed. In a channel, start with @DeleBot. A name is required; other fields are optional and tasks start unassigned. Example: `task Review PRs assign @person @team p 1 due 6/11/26`.",
   "*Fields:* `assign @person @team`, `desc text`, `p 1` (highest) through `p 5`, `due 6/11/26` (day/month/year), `link https://…`, `jira https://…`, `github https://…`, and `access @person @team` or `access all`.",
-  "Assignments start pending ⏳. Each recipient can accept ✅, reject ❌, or delegate ↪️; the next assignee gets a new pending invitation. Rejected and delegated responses remain visible on the task.",
+  "*Assignments:* `assign @person @team` adds assignees, `assign -` assigns yourself, and `assign all` replaces specific assignees with everyone. Select people from Slack's @ menu; type `teams` to find team handles you can type directly. Assigning a team sends each current member who can view the task an invitation DM; overlapping recipients receive one invitation per assignment event. Assigning all does not send invitations to everyone.",
+  "*Respond and delegate:* reply to an invitation or task thread with `accept`, `reject`, `delegate @person`, or `delegate @team`. Or use a task number, e.g. `123 accept` or `123 delegate @team`. Invitations also have Accept, Reject and Delegate buttons. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. The next assignee gets a new pending invitation. Rejecting returns the task to your previous delegator, or its creator, with a new invitation to accept, reject or delegate again. Rejections walk back through the delegation chain and stop if the creator rejects their own task. Rejected and delegated responses remain visible on the task. Rejecting a team invitation also keeps the team assigned. Accepting replaces your assigned team with you; delegating replaces it with the chosen assignee. Other members' team invitations then close. Unrelated assignees stay assigned.",
   "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
   '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
   "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
-  "*List:* `ls me` or `ls @person` sends each task as its own message. Reply to that message with edits, delete, done, accept, reject, or delegate @person. Type teams to discover usable team handles. You can also use a task number, e.g. `123 done`.",
+  "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
+  "*Clear chat:* `clear` in a DM removes DeleBot's messages and thread replies. Slack does not let the bot delete your messages. Saved tasks are unchanged; use ls to show them again.",
+  "*Complete:* `done` or `work done` completes a task. `edit completed no` reopens it. Reply in the task's thread or specify its number, e.g. `123 done`. Bare done also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
+  "*Permissions:* `access @person @team` (alias: `editPerms`) controls editing and delegation; `viewPerms @person @team` controls viewing. Use `all` for everyone. `perms match` copies view permissions to edit permissions. Assigning someone does not change their permissions. Both permissions default to all on new tasks.",
+  "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
 ].join("\n\n");
 
 export const TASK_LIST_USAGE = [
-  "*List:* `@DeleBot ls` shows all tasks available to you. All list results are sent to you in a DM. Use `ls me`, `ls @person`, `ls @team`, or `ls team` for tasks assigned to your teams. Select people and teams from Slack's @ menu.",
+  "*List:* `@DeleBot ls` shows all tasks available to you. All list results are sent to you in a DM. `ls me` includes direct assignments and assignments to your current teams; `ls @person` shows direct assignments, `ls @team` selects one team, and `ls team` selects all your current teams. Select people and teams from Slack's @ menu, or type a team handle found with `teams`.",
   "*Filters:* `ls 1` (or `ls (1)`), `ls p1`, `ls 6/11/26` (or `ls date (6/11/26)`), and `ls soon` filter your assigned tasks. Priority 1 is highest. Dates use day/month/year. Soon means due from today through the next three calendar days, inclusive, using London dates.",
   "Combine targets and filters: `ls @person soon`, `ls 1 soon`, `ls me p1`, or `ls team priority 1`. Multiple people or teams match any selected target; priority and due filters apply together. Use either soon or one exact date.",
   "*Lookup:* `ls task 5` or `ls task Clean PRs`. Existing forms also work: `ls tasks`, `tasks ls`, `ls tasks @person`, `ls tasks @team`, `ls tasks team all`, `ls tasks priority 1`, `ls tasks due 6/11/26`, and `ls tasks completed no`.",
@@ -59,6 +64,7 @@ export type TaskCommand =
   }
   | { kind: "print"; number?: number }
   | { kind: "reset" }
+  | { kind: "clear-chat" }
   | { kind: "help"; topic: "general" | "create" | "list" }
   | { kind: "create"; name: string; patch: TaskPatch }
   | { kind: "update"; number?: number; patch: TaskPatch }
@@ -688,6 +694,7 @@ export function parseTaskCommand(text: string): TaskCommand {
     .replace(/^#(\d+)(?=\s|$)/, "$1")
     .replace(/^\((\d+)\)(?=\s|$)/, "$1");
   if (command === "?") return { kind: "help", topic: "general" };
+  if (/^clear$/i.test(command)) return { kind: "clear-chat" };
   if (/^delete\s+all$/i.test(command)) return { kind: "reset" };
   if (/^task\s+\?$/i.test(command)) return { kind: "help", topic: "create" };
   if (/^ls(?:\s+tasks?)?\s+\?$/i.test(command)) return { kind: "help", topic: "list" };

@@ -1,5 +1,6 @@
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
 import { SlackDmContexts } from "./dm_context.ts";
+import { recipientMentions } from "./delegation_input.ts";
 import { type TaskDisplays, taskDisplays } from "./task_displays.ts";
 import type {
   ActionContext,
@@ -84,13 +85,17 @@ export interface AssignmentSubmission {
   userId: string;
   viewId: string;
   executionId: string;
-  selectedUsers: string[];
-  teamText: string;
+  recipients?: unknown;
+  note?: string;
+  /** Compatibility with delegation dialogs opened before the combined field. */
+  selectedUsers?: string[];
+  teamText?: string;
 }
 export interface AssignmentActionResult {
   ok: boolean;
   error?: string;
   interactive?: boolean;
+  errorField?: "delegation_recipients" | "delegation_note";
 }
 interface InvitationReference {
   batchId: string;
@@ -255,6 +260,41 @@ async function currentAccess(
     : null;
 }
 
+async function deliverDecision(
+  bound: BoundInvitation,
+  dependencies: AssignmentDependencies,
+): Promise<AssignmentActionResult> {
+  const delivery = await notifyTaskAssignments(
+    bound.task,
+    bound.batch.workspaceId,
+    dependencies.client,
+    dependencies.store,
+    {
+      executionId: bound.invitation.executionId,
+      loadAccess: dependencies.loadAccess,
+      rememberTask: dependencies.rememberTask,
+    },
+  );
+  // Delivery can cancel squad invitations or remove the rejected invitation.
+  // Preserve those saved changes before rendering this recipient's decision.
+  const reconciled = await dependencies.store.get(bound.batch.id);
+  const invitation = reconciled?.invitations?.[bound.invitation.recipientId];
+  if (reconciled && invitation) {
+    bound.batch = reconciled;
+    bound.invitation = invitation;
+  }
+  if (delivery.failed.length) {
+    return {
+      ok: false,
+      interactive: true,
+      error:
+        "Your response was saved, but some assignment messages could not be delivered or updated. Retry this response, or update the task to retry delivery.",
+    };
+  }
+  await renderDecision(bound, dependencies);
+  return { ok: true, interactive: delivery.interactive };
+}
+
 async function cancelUnavailable(
   bound: BoundInvitation,
   dependencies: AssignmentDependencies,
@@ -280,10 +320,14 @@ async function applyDecision(
   dependencies: AssignmentDependencies,
   assignees?: string[],
   actionTs?: string,
+  note?: string,
 ): Promise<AssignmentActionResult> {
   const access = await currentAccess(bound, dependencies);
   if (!access) return await cancelUnavailable(bound, dependencies);
   if (bound.invitation.status !== "pending") {
+    if (bound.invitation.status !== "cancelled") {
+      return await deliverDecision(bound, dependencies);
+    }
     await renderDecision(bound, dependencies);
     return { ok: true };
   }
@@ -304,13 +348,14 @@ async function applyDecision(
     return {
       ok: false,
       error:
-        "You can respond to this assignment, but you do not have permission to reassign it.",
+        "You can respond to this assignment, but you do not have permission to delegate it.",
     };
   }
   if (!savedDecision) {
     bound.invitation.decision = {
       kind,
       ...(assignees ? { assignees } : {}),
+      ...(note ? { note } : {}),
       messageTs: decisionTimestamp(actionTs),
     };
     await dependencies.store.save(bound.batch);
@@ -323,6 +368,7 @@ async function applyDecision(
         {
           kind: decision.kind,
           ...(decision.assignees ? { assignees: decision.assignees } : {}),
+          ...(decision.note ? { note: decision.note } : {}),
         },
         {
           channelId: bound.invitation.channelId!,
@@ -353,24 +399,7 @@ async function applyDecision(
   // Retain the modal binding so a Slack retry can finish updating the same DM
   // after the service mutation or invitation decision has already been saved.
   await dependencies.store.save(bound.batch);
-  let interactive = false;
-  if (kind === "delegate") {
-    const delivery = await notifyTaskAssignments(
-      bound.task,
-      bound.batch.workspaceId,
-      dependencies.client,
-      dependencies.store,
-      {
-        executionId: bound.invitation.executionId,
-        loadAccess: dependencies.loadAccess,
-        rememberTask: dependencies.rememberTask,
-      },
-    );
-    interactive = delivery.interactive;
-    // A failed invitation remains durable and is retried by the next task update.
-  }
-  await renderDecision(bound, dependencies);
-  return { ok: true, interactive };
+  return await deliverDecision(bound, dependencies);
 }
 
 export async function handleAssignmentAction(
@@ -408,13 +437,13 @@ export async function handleAssignmentAction(
       return await cancelUnavailable(bound, dependencies);
     }
     if (!canEditTask(bound.task, access)) {
-      return { ok: false, error: "You do not have permission to reassign this task." };
+      return { ok: false, error: "You do not have permission to delegate this task." };
     }
     if (bound.invitation.status !== "pending" || bound.invitation.decision) {
       return { ok: false, error: "This assignment already has a response." };
     }
     if (!action.interactivityPointer) {
-      return { ok: false, error: "Open Reassign again to choose an assignee." };
+      return { ok: false, error: "Open Delegate again to choose an assignee." };
     }
     const nonce = crypto.randomUUID();
     bound.invitation.modalNonce = nonce;
@@ -426,38 +455,47 @@ export async function handleAssignmentAction(
         type: "modal",
         callback_id: ASSIGNMENT_DELEGATE_VIEW,
         private_metadata: JSON.stringify({ ...ref, nonce }),
-        title: { type: "plain_text", text: "Reassign task" },
-        submit: { type: "plain_text", text: "Reassign" },
+        title: { type: "plain_text", text: "Delegate task" },
+        submit: { type: "plain_text", text: "Delegate" },
         close: { type: "plain_text", text: "Cancel" },
         blocks: [
           {
             type: "input",
-            block_id: "delegation_people",
-            optional: true,
-            label: { type: "plain_text", text: "People" },
+            block_id: "delegation_recipients",
+            label: { type: "plain_text", text: "People and teams" },
+            hint: {
+              type: "plain_text",
+              text: "Use @ to mention one or more people or teams (up to 20).",
+            },
             element: {
-              type: "multi_users_select",
-              action_id: "people",
-              max_selected_items: 20,
+              type: "rich_text_input",
+              action_id: "recipients",
+              placeholder: { type: "plain_text", text: "@person @team" },
+              focus_on_load: true,
             },
           },
           {
             type: "input",
-            block_id: "delegation_teams",
+            block_id: "delegation_note",
             optional: true,
-            label: { type: "plain_text", text: "Teams" },
+            label: { type: "plain_text", text: "Note" },
             hint: {
               type: "plain_text",
               text:
-                "Enter Slack user-group handles, e.g. @frontend, @backend. You can choose people, teams, or both.",
+                "Sent to the recipients with their invitation. Leave blank to send no note.",
             },
-            element: { type: "plain_text_input", action_id: "teams", max_length: 1000 },
+            element: {
+              type: "plain_text_input",
+              action_id: "note",
+              multiline: true,
+              max_length: 2000,
+            },
           },
         ],
       },
     });
     if (!opened.ok || !opened.view?.id) {
-      return { ok: false, error: "I could not open Reassign. Try again." };
+      return { ok: false, error: "I could not open Delegate. Try again." };
     }
     bound.invitation.modalId = opened.view.id;
     await dependencies.store.save(bound.batch);
@@ -473,12 +511,19 @@ async function delegationTargets(
   dependencies: AssignmentDependencies,
 ): Promise<string[] | null> {
   if (
-    !Array.isArray(submission.selectedUsers) ||
-    !submission.selectedUsers.every((id) => /^[UW][A-Z0-9]+$/.test(id))
+    (submission.selectedUsers !== undefined &&
+      (!Array.isArray(submission.selectedUsers) ||
+        !submission.selectedUsers.every((id) => /^[UW][A-Z0-9]+$/.test(id))))
   ) return null;
-  const targets = new Set(submission.selectedUsers);
-  const text = submission.teamText.trim();
-  if (text) {
+  const targets = new Set(submission.selectedUsers ?? []);
+  const text = submission.recipients !== undefined
+    ? recipientMentions(submission.recipients)
+    : (submission.teamText ?? "").trim();
+  if (text === undefined) return null;
+  const mentions = /<@([UW][A-Z0-9]+)(?:\|[^>]+)?>|<!subteam\^(S[A-Z0-9]+)(?:\|[^>]+)?>/g;
+  for (const mention of text.matchAll(mentions)) targets.add(mention[1] ?? mention[2]);
+  const rest = text.replace(mentions, " ").trim();
+  if (rest.replace(/[\s,]/g, "")) {
     const groups = await dependencies.client.usergroups.list({
       include_users: false,
       include_count: false,
@@ -501,29 +546,11 @@ async function delegationTargets(
         handles.set(group.handle.toLowerCase().replace(/^@/, ""), group.id);
       }
     }
-    const mentions = /<!subteam\^(S[A-Z0-9]+)(?:\|[^>]+)?>/g;
-    for (const match of text.matchAll(mentions)) {
-      targets.add(match[1]);
-    }
-    const rest = text.replace(mentions, " ");
     for (const handle of rest.split(/[\s,]+/).filter(Boolean)) {
       const id = handles.get(handle.toLowerCase().replace(/^@/, ""));
       if (!id) return null;
       targets.add(id);
     }
-  }
-  for (const group of [...targets].filter((id) => /^S/.test(id))) {
-    const membership = await dependencies.client.usergroups.users.list({
-      usergroup: group,
-      include_disabled: false,
-      ...(bound.batch.workspaceId ? { team_id: bound.batch.workspaceId } : {}),
-    });
-    if (
-      !membership.ok || !Array.isArray(membership.users) ||
-      !membership.users.every((id) =>
-        typeof id === "string" && /^[UW][A-Z0-9]+$/.test(id)
-      )
-    ) return null;
   }
   return targets.size && targets.size <= 20 ? [...targets] : null;
 }
@@ -535,6 +562,7 @@ async function targetViewError(
 ): Promise<string | undefined> {
   for (const target of targets) {
     if (/^[UW]/.test(target)) {
+      if (canViewTask(bound.task, { userId: target, teamIds: [] })) continue;
       const access = await dependencies.loadAccess(
         bound.task,
         target,
@@ -556,6 +584,11 @@ async function targetViewError(
         )
       ) return "I could not verify that team's viewing permission. Please try again.";
       let visible = false;
+      if (
+        response.users.some((userId: string) =>
+          canViewTask(bound.task, { userId, teamIds: [] })
+        )
+      ) continue;
       for (const member of response.users as string[]) {
         const access = await dependencies.loadAccess(
           bound.task,
@@ -590,18 +623,28 @@ export async function handleAssignmentSubmission(
     ) {
       return {
         ok: false,
-        error: "This reassignment form is no longer available. Open Reassign again.",
+        error: "This delegation form is no longer available. Open Delegate again.",
       };
     }
     if (bound.invitation.status !== "pending" || bound.invitation.decision) {
       return await applyDecision(bound, "delegate", dependencies);
+    }
+    if (
+      submission.note !== undefined &&
+      (typeof submission.note !== "string" || submission.note.length > 2000)
+    ) {
+      return {
+        ok: false,
+        error: "Keep the note to 2,000 characters or fewer.",
+        errorField: "delegation_note",
+      };
     }
     const access = await currentAccess(bound, dependencies);
     if (!access || !currentlyAssigned(bound.task, access)) {
       return await cancelUnavailable(bound, dependencies);
     }
     if (!canEditTask(bound.task, access)) {
-      return { ok: false, error: "You do not have permission to reassign this task." };
+      return { ok: false, error: "You do not have permission to delegate this task." };
     }
     const targets = await delegationTargets(submission, bound, dependencies);
     if (!targets) {
@@ -613,9 +656,16 @@ export async function handleAssignmentSubmission(
     }
     const viewError = await targetViewError(targets, bound, dependencies);
     if (viewError) return { ok: false, error: viewError };
-    return await applyDecision(bound, "delegate", dependencies, targets);
+    return await applyDecision(
+      bound,
+      "delegate",
+      dependencies,
+      targets,
+      undefined,
+      submission.note?.trim(),
+    );
   } catch {
-    return { ok: false, error: "I could not reassign this task. Please try again." };
+    return { ok: false, error: "I could not delegate this task. Please try again." };
   }
 }
 
@@ -641,7 +691,10 @@ function productionDependencies(client: SlackAPIClient): AssignmentDependencies 
           await resolveWorkspace(client, task.channelId, {});
         return (await directory.load(recipientId, workspace, references)).access;
       } catch (error) {
-        if (canViewTask(task, direct)) return direct;
+        if (
+          ![...task.assignees, ...task.teams].some((id) => /^S/.test(id)) &&
+          canViewTask(task, direct)
+        ) return direct;
         throw error;
       }
     },
@@ -676,16 +729,26 @@ export async function assignmentViewSubmissionHandler(
   { body, view, client }: ViewSubmissionContext<Record<string, unknown>>,
 ) {
   const values = view.state.values;
+  const recipientValue = values.delegation_recipients?.recipients as unknown as {
+    rich_text_value?: unknown;
+  } | undefined;
   const result = await handleAssignmentSubmission({
     privateMetadata: view.private_metadata ?? "",
     userId: body.user.id,
     viewId: view.id,
     executionId: body.function_data.execution_id,
+    ...(recipientValue ? { recipients: recipientValue.rich_text_value } : {}),
+    note: values.delegation_note?.note?.value ?? "",
     selectedUsers: values.delegation_people?.people?.selected_users ?? [],
     teamText: values.delegation_teams?.teams?.value ?? "",
   }, productionDependencies(client));
   return result.ok ? { response_action: "clear" as const } : {
     response_action: "errors" as const,
-    errors: { delegation_teams: result.error ?? "Could not reassign task." },
+    errors: {
+      [
+        result.errorField ??
+          (recipientValue ? "delegation_recipients" : "delegation_teams")
+      ]: result.error ?? "Could not delegate task.",
+    },
   };
 }

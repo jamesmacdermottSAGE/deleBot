@@ -11,7 +11,13 @@ export type NotificationTask =
   & Partial<
     Pick<
       Task,
-      "viewPerms" | "editPerms" | "teams" | "assignmentBased" | "createdBy" | "deleted"
+      | "viewPerms"
+      | "editPerms"
+      | "teams"
+      | "assignmentBased"
+      | "createdBy"
+      | "deleted"
+      | "assignmentResponses"
     >
   >;
 
@@ -54,16 +60,19 @@ export interface AssignmentInvitation {
   messageTs?: string;
   messageRemoved?: boolean;
   delegatedTo?: string[];
+  returnedBy?: string;
+  note?: string;
   modalNonce?: string;
   modalId?: string;
   decision?: {
     kind: "accept" | "reject" | "delegate";
     assignees?: string[];
+    note?: string;
     messageTs: string;
   };
 }
 
-/** Delivery bookkeeping contains IDs only; task contents stay in the task datastore. */
+/** Delivery state retains invitation context for reliable retries and refreshes. */
 export const AssignmentNotificationsDatastore = DefineDatastore({
   name: "assignment_notifications",
   primary_key: "id",
@@ -212,6 +221,11 @@ function validateBatch(value: unknown, expectedId: string): NotificationBatch {
           typeof invitation.messageRemoved !== "boolean") ||
         (invitation.delegatedTo !== undefined &&
           !strings(invitation.delegatedTo, /^[UWS][A-Z0-9]+$/)) ||
+        (invitation.returnedBy !== undefined &&
+          (typeof invitation.returnedBy !== "string" ||
+            !/^[UW][A-Z0-9]+$/.test(invitation.returnedBy))) ||
+        (invitation.note !== undefined &&
+          (typeof invitation.note !== "string" || invitation.note.length > 2000)) ||
         (invitation.modalNonce !== undefined &&
           !/^[a-f0-9-]{36}$/.test(invitation.modalNonce)) ||
         (invitation.modalId !== undefined &&
@@ -222,7 +236,10 @@ function validateBatch(value: unknown, expectedId: string): NotificationBatch {
         (!["accept", "reject", "delegate"].includes(invitation.decision.kind) ||
           !/^\d+\.\d+$/.test(invitation.decision.messageTs) ||
           (invitation.decision.assignees !== undefined &&
-            !strings(invitation.decision.assignees, /^[UWS][A-Z0-9]+$/)))
+            !strings(invitation.decision.assignees, /^[UWS][A-Z0-9]+$/)) ||
+          (invitation.decision.note !== undefined &&
+            (typeof invitation.decision.note !== "string" ||
+              invitation.decision.note.length > 2000)))
       ) throw new Error("Invalid invitation decision.");
     }
   }
@@ -327,7 +344,7 @@ async function reconcileInvitations(
         }
       }
       if (!remove) continue;
-      invitation.status = "cancelled";
+      if (invitation.status !== "rejected") invitation.status = "cancelled";
       batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
       await store.save(batch);
       if (!client.chat.delete) {
@@ -379,7 +396,7 @@ export function assignmentBlocks(
         {
           type: "button",
           action_id: ASSIGNMENT_DELEGATE,
-          text: { type: "plain_text", text: "Reassign" },
+          text: { type: "plain_text", text: "Delegate" },
           value,
         },
       ],
@@ -387,14 +404,22 @@ export function assignmentBlocks(
   ];
 }
 
-function notificationText(
+export function assignmentNotificationText(
   task: NotificationTask,
-  client: NotificationClient,
+  recipientId: string,
+  invitation: Pick<AssignmentInvitation, "returnedBy" | "note"> = {},
 ): string {
-  void client;
+  const returnedBy = invitation.returnedBy ??
+    task.assignmentResponses?.[recipientId]?.returnedBy;
+  const note = invitation.note ?? task.assignmentResponses?.[recipientId]?.note;
   return [
-    `You have been assigned task *#${task.number}: ${escape(task.name)}*.`,
+    returnedBy
+      ? `Task *#${task.number}: ${
+        escape(task.name)
+      }* was returned to you after <@${returnedBy}> rejected it.`
+      : `You have been assigned task *#${task.number}: ${escape(task.name)}*.`,
     `Reply here with \`accept\`, \`reject\`, \`delegate @person\`, or \`done\`. You can also send \`${task.number} done\` directly to DeleBot.`,
+    ...(note?.trim() ? [`*Note:* ${escape(note.trim())}`] : []),
   ].join("\n\n");
 }
 
@@ -526,7 +551,6 @@ export async function notifyAssignments(
     return { failed: [...new Set([...failed, "delivery_state"])], interactive };
   }
 
-  const text = notificationText(task, client);
   for (const recipient of batch.recipients) {
     if (batch.delivered.includes(recipient) || batch.cancelled.includes(recipient)) {
       continue;
@@ -568,6 +592,10 @@ export async function notifyAssignments(
         continue;
       }
       let invitation: AssignmentInvitation | undefined;
+      const returnedBy = task.assignmentResponses?.[recipient]?.returnedBy;
+      const note = batch.assigned.map((id) => task.assignmentResponses?.[id]?.note).find((
+        value,
+      ) => value?.trim());
       if (context.executionId) {
         batch.invitations ??= {};
         invitation = batch.invitations[recipient];
@@ -577,6 +605,8 @@ export async function notifyAssignments(
             recipientId: recipient,
             status: "pending",
             executionId: context.executionId,
+            ...(returnedBy ? { returnedBy } : {}),
+            ...(note ? { note } : {}),
           };
           batch.invitations[recipient] = invitation;
         } else if (invitation.status !== "pending") continue;
@@ -584,12 +614,25 @@ export async function notifyAssignments(
         invitation.executionId = context.executionId;
         await store.save(batch);
       }
+      const text = assignmentNotificationText(
+        task,
+        recipient,
+        invitation ?? { returnedBy, note },
+      );
       const sent = await client.chat.postMessage({
         channel: dm.channel.id,
         text,
         unfurl_links: false,
         unfurl_media: false,
-        ...(invitation ? { blocks: assignmentBlocks(text, batch, invitation) } : {}),
+        ...(invitation
+          ? {
+            blocks: assignmentBlocks(
+              text,
+              batch,
+              invitation,
+            ),
+          }
+          : {}),
       });
       if (!sent.ok || !sent.ts) {
         failed.add(recipient);

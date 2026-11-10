@@ -739,11 +739,11 @@ Deno.test("combined task filters OR assignment targets and AND date and priority
       targets: [{ kind: "me" }, { kind: "user", userId: "UALICE" }],
       priority: 1,
       dueDate: "2026-11-04",
-    }) === "Alice,Mine",
+    }) === "Alice,Frontend,Mine",
   );
   assert(
     await names({ kind: "filters", targets: [{ kind: "me" }] }) ===
-      "Later,Lower priority,Mine",
+      "Frontend,Later,Lower priority,Mine",
   );
   assert(
     await names({ kind: "filters", targets: [{ kind: "my-teams" }] }) === "Frontend",
@@ -1162,7 +1162,7 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
     alice,
   );
   assert(
-    rejected.task.assignees.join() === "UBOB,SFRONTEND" &&
+    rejected.task.assignees.join() === "UBOB,SFRONTEND,UCREATOR" &&
       rejected.task.teams.join() === "SFRONTEND",
   );
   const writes = repo.writes;
@@ -1174,7 +1174,9 @@ Deno.test("assignees can accept or reject without edit permission and rejection 
     alice,
   );
   assert(!replay.updated && repo.writes === writes);
-  assert(replay.task.assignmentEvents?.[mutationKey(rejectContext)].length === 0);
+  assert(
+    replay.task.assignmentEvents?.[mutationKey(rejectContext)].join() === "UCREATOR",
+  );
 });
 
 Deno.test("group-only rejection retains the team and delegation requires current edit permission", async () => {
@@ -1198,7 +1200,7 @@ Deno.test("group-only rejection retains the team and delegation requires current
     repo,
     member,
   );
-  assert(rejected.task.assignees.join() === "SFRONTEND,UBOB");
+  assert(rejected.task.assignees.join() === "SFRONTEND,UBOB,UCREATOR");
   const writes = repo.writes;
   assert(
     await rejection(() =>
@@ -1226,7 +1228,78 @@ Deno.test("group-only rejection retains the team and delegation requires current
     repo,
     member,
   );
-  assert(delegated.task.assignees.join() === "SFRONTEND,UBOB,UNEW");
+  assert(delegated.task.assignees.join() === "UBOB,UCREATOR,UNEW");
+  assert(delegated.task.teams.length === 0);
+});
+
+Deno.test("accepting a team assignment replaces that team with the member and preserves unrelated assignees", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    {
+      name: "Claim team task",
+      assignees: ["SFRONTEND", "UALICE", "SBACKEND"],
+      viewPerms: ["SFRONTEND"],
+      editPerms: [],
+    },
+    context,
+    repo,
+    access,
+  );
+  const member = { userId: "UMEMBER", teamIds: ["SFRONTEND"] };
+  const claim = reply("9.1", member.userId);
+  const accepted = await respondToAssignment(
+    task,
+    { kind: "accept" },
+    claim,
+    repo,
+    member,
+  );
+  assert(accepted.task.assignees.join() === "UALICE,SBACKEND,UMEMBER");
+  assert(accepted.task.teams.join() === "SBACKEND");
+  assert(accepted.task.assignmentResponses?.UMEMBER.status === "accepted");
+  assert(accepted.task.assignmentEvents?.[mutationKey(claim)].length === 0);
+  assert(
+    accepted.task.viewPerms?.join() === "SFRONTEND" && !accepted.task.editPerms?.length,
+  );
+  const writes = repo.writes;
+  assert(
+    !(await respondToAssignment(accepted.task, { kind: "accept" }, claim, repo, member))
+      .updated,
+  );
+  assert(repo.writes === writes);
+  const otherMember = { userId: "UOTHER", teamIds: ["SFRONTEND"] };
+  assert(
+    await rejection(() =>
+      respondToAssignment(
+        accepted.task,
+        { kind: "accept" },
+        reply("9.2", otherMember.userId),
+        repo,
+        otherMember,
+      )
+    ) instanceof TaskAccessError,
+  );
+  assert(repo.writes === writes);
+});
+
+Deno.test("legacy team acceptance preserves access policies when converting to a person assignment", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask({ name: "Legacy team" }, context, repo, access);
+  const legacy = { ...task, assignees: [], teams: ["SFRONTEND"], assignmentBased: false };
+  delete legacy.viewPerms;
+  delete legacy.editPerms;
+  const member = { userId: "UMEMBER", teamIds: ["SFRONTEND"] };
+  const accepted = await respondToAssignment(
+    legacy,
+    { kind: "accept" },
+    reply("9.1", member.userId),
+    repo,
+    member,
+  );
+  assert(accepted.task.assignmentBased && accepted.task.assignees.join() === "UMEMBER");
+  assert(accepted.task.teams.length === 0);
+  assert(accepted.task.viewPerms?.join() === "SFRONTEND");
+  assert(accepted.task.editPerms?.join() === "SFRONTEND");
 });
 
 Deno.test("delegation swaps only the actor, records new invitations and rejects self targets", async () => {
@@ -1308,4 +1381,89 @@ Deno.test("assignment responses require current assignment and view access witho
     );
   }
   assert(repo.writes === writes);
+});
+
+Deno.test("rejection follows each step of a delegation chain back to its creator and stops", async () => {
+  const repo = new MemoryTaskRepository();
+  let { task } = await createTask(
+    { name: "Return chain", assignees: ["UALICE"] },
+    context,
+    repo,
+    access,
+  );
+  for (
+    const [index, [userId, target]] of [["UALICE", "UBOB"], ["UBOB", "UCAROL"]].entries()
+  ) {
+    task = (await respondToAssignment(
+      task,
+      { kind: "delegate", assignees: [target] },
+      reply(`9.${index + 1}`, userId),
+      repo,
+      { userId, teamIds: [] },
+    )).task;
+  }
+  assert(task.assignmentResponses?.UCAROL.returnTo?.join() === "UBOB,UALICE,UCREATOR");
+  for (
+    const [index, [userId, expected]] of [["UCAROL", "UBOB"], ["UBOB", "UALICE"], [
+      "UALICE",
+      "UCREATOR",
+    ], ["UCREATOR", ""]].entries()
+  ) {
+    const rejectionContext = reply(`10.${index + 1}`, userId);
+    task = (await respondToAssignment(task, { kind: "reject" }, rejectionContext, repo, {
+      userId,
+      teamIds: [],
+    })).task;
+    assert(task.assignees.join() === expected);
+    assert(task.assignmentResponses?.[userId].status === "rejected");
+    assert(task.assignmentEvents?.[mutationKey(rejectionContext)].join() === expected);
+    if (expected) {
+      assert(task.assignmentResponses?.[expected].status === "pending");
+      assert(task.assignmentResponses?.[expected].returnedBy === userId);
+    }
+  }
+});
+
+Deno.test("legacy delegation history returns a rejection to the previous delegator", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Old delegation", assignees: ["UBOB"] },
+    context,
+    repo,
+    access,
+  );
+  task.assignmentResponses = {
+    UALICE: { status: "delegated", delegatedTo: ["UBOB"] },
+    UBOB: { status: "pending" },
+  };
+  const returned = await respondToAssignment(
+    task,
+    { kind: "reject" },
+    reply("9.1", "UBOB"),
+    repo,
+    { userId: "UBOB", teamIds: [] },
+  );
+  assert(returned.task.assignees.join() === "UALICE");
+  assert(returned.task.assignmentResponses?.UALICE.returnTo?.join() === "UCREATOR");
+});
+
+Deno.test("adding an assignee in a message records that assigner for rejection hand-back", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask({ name: "Assign later" }, context, repo, access);
+  const assigned = await updateTask(
+    task,
+    { assignees: ["UBOB"] },
+    reply("9.1", "UALICE"),
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
+  const returned = await respondToAssignment(
+    assigned.task,
+    { kind: "reject" },
+    reply("9.2", "UBOB"),
+    repo,
+    { userId: "UBOB", teamIds: [] },
+  );
+  assert(returned.task.assignees.join() === "UALICE");
+  assert(returned.task.assignmentResponses?.UALICE.returnTo?.join() === "UCREATOR");
 });

@@ -69,6 +69,34 @@ function fixture() {
   return { rows, gets, puts, client, repository: new SlackTaskRepository(client) };
 }
 
+Deno.test("assignment return paths persist and invalid return metadata is rejected", async () => {
+  const { repository, rows } = fixture();
+  const item = task({
+    assignmentResponses: {
+      UOTHER: { status: "pending", returnTo: ["UALICE", "UJAMES"], returnedBy: "UBOB" },
+    },
+  });
+  await repository.save(item);
+  const restored = await repository.findById(item.id);
+  assert(restored?.assignmentResponses?.UOTHER.returnTo?.join() === "UALICE,UJAMES");
+  assert(restored.assignmentResponses.UOTHER.returnedBy === "UBOB");
+  const valid = structuredClone(rows.get(item.id)!);
+  for (
+    const response of [
+      { status: "pending", returnTo: "UJAMES" },
+      { status: "pending", returnTo: ["SFRONTEND"] },
+      { status: "pending", returnTo: ["UJAMES", "UJAMES"] },
+      { status: "pending", returnedBy: "<!channel>" },
+    ]
+  ) {
+    rows.set(item.id, {
+      ...valid,
+      assignment_responses: JSON.stringify({ UOTHER: response }),
+    });
+    await rejects(() => repository.findById(item.id), "Invalid assignment responses");
+  }
+});
+
 Deno.test("team-reference discovery follows empty pages and returns only distinct group IDs", async () => {
   const { repository, client } = fixture();
   client.apps.datastore.query = ({ cursor, expression_values }) => {

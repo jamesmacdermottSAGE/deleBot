@@ -135,18 +135,6 @@ export class SlackTeamDirectory implements TeamDirectory {
         }
         continue;
       }
-      // Section/type flags alone do not establish whether this ID is usable as
-      // a team. For explicitly referenced IDs, ask the membership API below.
-      if (
-        group.is_section === true ||
-        (group.is_usergroup === false && group.is_subteam !== true)
-      ) {
-        if (discoverHandles && typeof group.handle === "string" && group.handle.trim()) {
-          referencedTeams = [...referencedTeams, group.id];
-          candidateNames.set(group.id, group.handle.trim());
-        }
-        continue;
-      }
       // Enterprise mentions may use enterprise_subteam_id while the workspace
       // API returns a local id. Both identify this same verified membership.
       const ids = [
@@ -158,6 +146,23 @@ export class SlackTeamDirectory implements TeamDirectory {
             : []),
         ]),
       ];
+      const name = typeof group.handle === "string" && group.handle.trim()
+        ? group.handle.trim()
+        : typeof group.name === "string" && group.name.trim()
+        ? group.name.trim()
+        : group.id;
+      // Retain display names even when these flags require direct membership
+      // verification. Publish a candidate name only after its ID is verified.
+      if (
+        group.is_section === true ||
+        (group.is_usergroup === false && group.is_subteam !== true)
+      ) {
+        for (const id of ids) candidateNames.set(id, name);
+        if (discoverHandles && typeof group.handle === "string" && group.handle.trim()) {
+          referencedTeams = [...referencedTeams, group.id];
+        }
+        continue;
+      }
       if (ids.some((id) => seen.has(id))) return incomplete();
       for (const id of ids) seen.add(id);
 
@@ -168,11 +173,6 @@ export class SlackTeamDirectory implements TeamDirectory {
         group.user_count !== undefined && memberCount(group.user_count) !== users.size
       ) return incomplete();
 
-      const name = typeof group.handle === "string" && group.handle.trim()
-        ? group.handle.trim()
-        : typeof group.name === "string" && group.name.trim()
-        ? group.name.trim()
-        : group.id;
       for (const id of ids) {
         knownTeamIds.push(id);
         teamNames[id] = name;

@@ -232,13 +232,13 @@ messages without dropping tasks.
 | Command      | Results                                                                    |
 | ------------ | -------------------------------------------------------------------------- |
 | `ls`         | All tasks you can access                                                   |
-| `ls me`      | Tasks assigned directly to you                                             |
+| `ls me`      | Tasks assigned directly to you or to any of your current teams              |
 | `ls @person` | Tasks assigned directly to that person, within your access                 |
 | `ls @team`   | Tasks assigned to that Slack user group, within your access                |
 | `ls team`    | Tasks assigned to any of your current Slack user groups                    |
-| `ls soon`    | Your direct assignments due today through three days from today, inclusive |
-| `ls 6/11/26` | Your direct assignments due on that date                                   |
-| `ls 1`       | Your direct assignments with priority 1; use any priority from 1 to 5      |
+| `ls soon`    | Your direct and team assignments due today through three days from today   |
+| `ls 6/11/26` | Your direct and team assignments due on that date                          |
+| `ls 1`       | Your direct and team assignments with priority 1; use any priority 1 to 5  |
 
 Combine filters to require every condition: `ls 1 soon` means your priority 1 tasks due
 soon. An explicit person or team replaces the implicit personal target, so
@@ -258,10 +258,12 @@ filtered with `ls tasks completed no` or `ls tasks completed yes`. The older `ls
 and `tasks ls` spellings still work; old priority and due filters use the same personal
 defaults as their short forms.
 
-Use `@DeleBot task ?` for full creation and update instructions, `@DeleBot ?` for general
+Use `@DeleBot task ?` for full creation, update and delegation instructions, `@DeleBot ?` for brief
 usage, or `@DeleBot ls ?` for list commands. `ls tasks ?` and `tasks ls ?` are equivalent.
 General and creation help replies appear in the original thread; list help arrives by DM.
 Help does not query task storage or team membership.
+Unrecognised commands receive a short explanation suggesting `task ?` or `?`.
+In DMs, these commands work without the bot mention.
 
 ## Assignment notifications and access
 
@@ -274,17 +276,45 @@ Notification delivery state is saved separately so a retry can resume failed del
 task can be saved even if Slack cannot deliver one of its assignment notifications. A
 later authorized task update also retries saved, undelivered assignment notifications.
 
-Assignment invitations include **Accept**, **Reject**, and **Reassign** buttons:
+Assignment invitations include **Accept**, **Reject**, and **Delegate** buttons:
 
-- **Accept** marks your invitation as accepted in that DM.
+- **Accept** marks your invitation as accepted in that DM. For a team invitation, it
+  replaces your assigned team with you as the accepted assignee.
 - **Reject** deletes your invitation DM and removes your direct user assignment. If you
-  received it through a team assignment, the team remains assigned to the task.
-- **Reassign** opens a modal with a Slack people picker and an optional teams field. Enter
-  team handles such as `@frontend` or paste Slack user-group mentions. Choose at least one
-  person or team, up to 20 combined. Reassignment requires both view and edit permission.
-  Direct recipients must already have view permission; reassignment does not grant it.
+  received it through a team assignment, the team remains assigned to the task. The task
+  returns to your previous delegator, or its creator if there is no previous delegator,
+  with a fresh **Accept / Reject / Delegate** invitation. Its message identifies who
+  rejected it. Return invitations require viewing permission, like other invitations.
+- **Delegate** opens a modal with one required **People and teams** field. Use `@` to
+  mention people and Slack user groups together, up to 20 combined. Add an optional
+  **Note** below; it is included in each recipient's invitation and omitted when blank.
+  Notes are limited to 2,000 characters. Delegation requires both view and edit permission.
+  Direct recipients must already have view permission; delegation does not grant it.
   Your invitation is updated to show its delegation, and eligible new assignees receive
-  their own invitations.
+  their own invitations. For a team invitation, delegation removes your assigned team
+  and replaces it with the selected person or team.
+
+After a team invitation is accepted or delegated, the other members' invitations for
+that team are cancelled. Unrelated people and teams remain assigned. A rejection stays
+visible on the task while the team remains assigned.
+
+Each assignment remembers its return path. If a delegator rejects a returned task, it
+goes back another step, eventually reaching the creator. If the creator rejects their
+own returned task, no further invitation is sent. Other assignees remain assigned.
+
+Invitation refresh reuses the workspace saved during delivery, including in enterprise
+DMs without workspace metadata. A membership lookup failure preserves the invitation
+for retry instead of treating the recipient as a former member.
+Returned-task invitations retain their short return explanation and action buttons
+during refresh. They are not replaced with a full task card. Delegation notes remain
+visible on pending invitations when cards refresh.
+
+Type `clear` in your DM with DeleBot to remove its messages, including threaded replies.
+Slack only allows the bot to delete its own messages, so your messages remain. Saved
+tasks and other people's DMs are unchanged. Clearing also removes stale task selection
+and display records and closes the cleared invitations; use `ls` or task-number commands
+to continue working. If some messages fail to clear, the reply says so and `clear` can
+be retried. `clear` does not run in channels.
 
 Each invitation belongs to its recipient. DeleBot checks current task permissions and
 assignment membership again when a button is used. Button availability depends on the
