@@ -125,6 +125,21 @@ function delegationReturnPath(task: Task, userId: string, target: string): strin
     .filter((id) => id !== target);
 }
 
+function resolveSelfPermissions<T extends { viewPerms?: string[]; editPerms?: string[] }>(
+  value: T,
+  userId: string,
+): T {
+  return {
+    ...value,
+    ...(value.viewPerms
+      ? { viewPerms: value.viewPerms.map((id) => id === "me" ? userId : id) }
+      : {}),
+    ...(value.editPerms
+      ? { editPerms: value.editPerms.map((id) => id === "me" ? userId : id) }
+      : {}),
+  };
+}
+
 export async function createTask(
   draft: Pick<TaskInput, "name"> & Partial<Omit<TaskInput, "name">> & {
     matchPerms?: boolean;
@@ -148,6 +163,7 @@ export async function createTask(
     }
     return { task: existing, created: false };
   }
+  draft = resolveSelfPermissions(draft, context.userId);
   const input: TaskInput = {
     name: draft.name.trim(),
     links: [...new Set(draft.links ?? [])],
@@ -230,6 +246,10 @@ async function updateTaskUnlocked(
   repository: TaskRepository,
   access: TaskAccess,
 ): Promise<{ task: Task; updated: boolean }> {
+  patch = {
+    ...resolveSelfPermissions(patch, context.userId),
+    ...(patch.set ? { set: resolveSelfPermissions(patch.set, context.userId) } : {}),
+  };
   const clearsPolicy = patch.clear?.some((field) =>
     field === "viewPerms" || field === "editPerms"
   );

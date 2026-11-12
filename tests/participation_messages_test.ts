@@ -1,3 +1,4 @@
+import { SlackTaskRepository } from "../delebot/tasks/repository.ts";
 import {
   COLLAB_ACCEPT,
   COLLAB_REJECT,
@@ -11,7 +12,9 @@ import {
 } from "../delebot/slack/participation_messages.ts";
 import {
   inviteCollaborators,
+  rememberRequestConfirmation,
   requestTaskAction,
+  respondToTaskAction,
   type TaskParticipation,
 } from "../delebot/tasks/participation.ts";
 import { createTask } from "../delebot/tasks/service.ts";
@@ -344,4 +347,101 @@ Deno.test("an unsent invitation retry binds to the workflow that successfully po
   const action = await f.action(COLLAB_ACCEPT, "UBOB");
   assert(action.executionId === "FXRETRY");
   assert((await handleParticipationAction(action, f.dependencies)).ok);
+});
+
+Deno.test("request confirmations survive datastore reload and display rejection with task identity", async () => {
+  const f = await fixture();
+  const request = await f.request("complete");
+  const tracked = await rememberRequestConfirmation(request.task, request.requestId, {
+    channelId: "DBOB",
+    messageTs: "12.1",
+    userId: "UBOB",
+  }, f.repository);
+  let row: Record<string, unknown> = {};
+  const repository = new SlackTaskRepository({
+    apps: {
+      datastore: {
+        put: ({ item }) => {
+          row = structuredClone(item);
+          return Promise.resolve({ ok: true });
+        },
+        get: () => Promise.resolve({ ok: true, item: structuredClone(row) }),
+        query: () => Promise.resolve({ ok: true, items: [structuredClone(row)] }),
+      },
+    },
+  });
+  await repository.save(tracked);
+  const restored = (await repository.findById(tracked.id))!;
+  assert(
+    restored.participation!.requests[request.requestId].confirmations?.[0].messageTs ===
+      "12.1",
+  );
+  const rejected = await respondToTaskAction(
+    restored,
+    request.requestId,
+    "reject",
+    { channelId: "DADMIN", messageTs: "13.1", userId: "UADMIN" },
+    repository,
+    f.accesses.UADMIN,
+  );
+  await notifyParticipation(rejected.task, "TWORKSPACE", f.client, {
+    loadAccess: f.dependencies.loadAccess,
+  }, repository);
+  const update = f.updates.find((message) =>
+    message.channel === "DBOB" && message.ts === "12.1"
+  )!;
+  assert(
+    update.text.includes(`#${restored.number}: Review &lt;script&gt;`) &&
+      update.text.includes("Completion request rejected"),
+  );
+});
+
+Deno.test("resolved request confirmations redact task identity when requester visibility is revoked", async () => {
+  const f = await fixture();
+  const request = await f.request("delete");
+  await rememberRequestConfirmation(request.task, request.requestId, {
+    channelId: "DBOB",
+    messageTs: "12.1",
+    userId: "UBOB",
+  }, f.repository);
+  const rejected = await respondToTaskAction(
+    await f.latest(),
+    request.requestId,
+    "reject",
+    { channelId: "DADMIN", messageTs: "13.1", userId: "UADMIN" },
+    f.repository,
+    f.accesses.UADMIN,
+  );
+  await f.repository.save({ ...rejected.task, viewPerms: ["UADMIN"] });
+  await f.notify(await f.latest());
+  const update = f.updates.find((message) =>
+    message.channel === "DBOB" && message.ts === "12.1"
+  )!;
+  assert(update.text === "This task is no longer available.");
+});
+
+Deno.test("deletion approvals identify the deleted task and preserve the approved decision", async () => {
+  const f = await fixture();
+  const requested = await f.request("delete");
+  await f.notify(requested.task);
+  assert(
+    (await handleParticipationAction(
+      await f.action(REQUEST_APPROVE, "UADMIN"),
+      f.dependencies,
+    )).ok,
+  );
+  const task = await f.latest();
+  assert(
+    task.deleted && Object.values(task.participation!.requests)[0].status === "approved",
+  );
+  const decision = f.updates.at(-1)!;
+  assert(
+    decision.text.includes(`#${task.number}: Review &lt;script&gt;`) &&
+      decision.text.includes("Deletion request approved") &&
+      decision.text.includes("Task deleted"),
+  );
+  assert(
+    Object.values(task.participation!.deliveryEvents)[0].deliveries!.UADMIN.status ===
+      "approved",
+  );
 });

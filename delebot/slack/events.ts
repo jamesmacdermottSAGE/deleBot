@@ -13,6 +13,7 @@ import { SlackAPI } from "deno-slack-api/mod.ts";
 import { canManageTask } from "../tasks/access.ts";
 import {
   inviteCollaborators,
+  rememberRequestConfirmation,
   requestTaskAction,
   respondToCollaboration,
   respondToTaskAction,
@@ -22,6 +23,7 @@ import {
   notifyParticipation,
   PARTICIPATION_ACTION_IDS,
   type ParticipationClient,
+  requestStatusText,
 } from "./participation_messages.ts";
 import { type TaskDisplays, taskDisplays } from "./task_displays.ts";
 import { type DmContexts, expandTeamHandles, SlackDmContexts } from "./dm_context.ts";
@@ -38,7 +40,10 @@ async function resolveDmTarget(
   key = "latest",
 ) {
   if (number === undefined && conversations) {
-    const ids = await conversations.get(context.channelId, key, context.userId);
+    const personal = await conversations.get(context.channelId, key, context.userId);
+    const ids = personal.length || key === "latest"
+      ? personal
+      : await conversations.get(context.channelId, key, "*");
     if (ids.length > 1) {
       throw new TaskCommandError(
         "Several tasks were shown. Use a task number, e.g. 123 done, or use ls task Name to select one.",
@@ -89,6 +94,7 @@ import {
   GREETING,
   splitPrivateReply,
   splitTaskReply,
+  taskTitle,
   UNKNOWN_COMMAND,
 } from "./messages.ts";
 import {
@@ -259,6 +265,9 @@ export async function handleMessage(
   let shownTaskIds: string[] | undefined;
   let replyTaskIds: string[][] | undefined;
   let changedTask: Task | undefined;
+  let identifiedTask: Task | undefined;
+  let includeTaskIdentity = true;
+  let requestConfirmationId: string | undefined;
   let listedTasks: Task[] = [];
   let replies = [text ? UNKNOWN_COMMAND : GREETING];
   let hasTaskCards = false;
@@ -428,10 +437,12 @@ export async function handleMessage(
           context,
           repository,
           access,
-          isDm ? dmContexts : undefined,
+          dmContexts,
           event.thread_ts && event.thread_ts !== event.message_ts
             ? event.thread_ts
-            : "latest",
+            : isDm
+            ? "latest"
+            : event.message_ts,
         );
         shownTaskIds = [task.id];
         listedTasks = [task];
@@ -443,11 +454,15 @@ export async function handleMessage(
           context,
           repository,
           access,
-          isDm ? dmContexts : undefined,
+          dmContexts,
           event.thread_ts && event.thread_ts !== event.message_ts
             ? event.thread_ts
-            : "latest",
+            : isDm
+            ? "latest"
+            : event.message_ts,
         );
+        identifiedTask = target;
+        shownTaskIds = [target.id];
         if (!canManageTask(target, access)) {
           const request = await requestTaskAction(
             target,
@@ -457,15 +472,19 @@ export async function handleMessage(
             access,
           );
           changedTask = request.task;
+          requestConfirmationId = request.requestId;
           replies = [
-            "Deletion requested. The task stays available until someone in its Access field approves.",
+            requestStatusText(
+              request.task,
+              request.task.participation!.requests[request.requestId],
+            ),
           ];
         } else {
           await deleteTask(target, context, repository, access);
           changedTask = { ...target, deleted: true };
           privateReply = !isDm && !isPublicTask(target);
-          replies = [`Deleted task #${target.number}.`];
-          shownTaskIds = [];
+          replies = [`${taskTitle(target)} — Deleted.`];
+          shownTaskIds = [target.id];
           if (notifications) {
             try {
               const cleanup = await notifyTaskAssignments(
@@ -511,11 +530,18 @@ export async function handleMessage(
             context,
             repository,
             access,
-            isDm ? dmContexts : undefined,
+            dmContexts,
             event.thread_ts && event.thread_ts !== event.message_ts
               ? event.thread_ts
-              : "latest",
+              : isDm
+              ? "latest"
+              : event.message_ts,
           );
+          identifiedTask = target;
+          shownTaskIds = [target.id];
+          const approvalRequestId = command.kind === "approval-response"
+            ? command.requestId ?? uniqueRequest(target, command.kindOfAction)
+            : undefined;
           const result = command.kind === "collaborate"
             ? await inviteCollaborators(
               target,
@@ -535,7 +561,7 @@ export async function handleMessage(
             : command.kind === "approval-response"
             ? await respondToTaskAction(
               target,
-              command.requestId ?? uniqueRequest(target, command.kindOfAction),
+              approvalRequestId!,
               command.approve ? "approve" : "reject",
               context,
               repository,
@@ -564,23 +590,61 @@ export async function handleMessage(
             );
           task = result.task;
           acknowledgement = result.updated ? "Updated" : "Already applied to";
+          if ("requestId" in result && typeof result.requestId === "string") {
+            requestConfirmationId = result.requestId;
+          }
+          if (command.kind === "approval-response") {
+            const request = task.participation!.requests[approvalRequestId!];
+            acknowledgement = `${
+              request.kind === "complete" ? "Completion" : "Deletion"
+            } request ${request.status}`;
+          } else if (command.kind === "collaboration-response") {
+            acknowledgement = `Collaboration ${command.accept ? "accepted" : "rejected"}`;
+          } else if (command.kind === "collaborate") {
+            acknowledgement = "Collaboration requested";
+          } else if (
+            command.kind === "update" &&
+            ["editPerms", "viewPerms", "set", "matchPerms"].some((key) =>
+              key in command.patch
+            ) && Object.keys(command.patch).every((key) =>
+              ["editPerms", "viewPerms", "set", "matchPerms"].includes(key)
+            ) && Object.keys(command.patch.set ?? {}).every((key) =>
+              ["editPerms", "viewPerms"].includes(key)
+            )
+          ) {
+            acknowledgement = "Access updated";
+          }
           if (
             command.kind === "update" &&
             (command.patch.completed || command.patch.set?.completed) &&
             !canManageTask(target, access)
-          ) acknowledgement = "Requested completion of";
+          ) {
+            acknowledgement = "Requested completion of";
+          }
         }
         const stillVisible = canAccessTask(task, access);
         const quiet = command.kind !== "create" && !!event.thread_ts &&
           event.thread_ts !== event.message_ts;
-        hasTaskCards = stillVisible && !quiet;
+        const shortReply = quiet || !!requestConfirmationId ||
+          command.kind === "approval-response" ||
+          command.kind === "collaboration-response" || command.kind === "collaborate" ||
+          acknowledgement === "Access updated";
+        includeTaskIdentity = stillVisible || !!task.deleted;
+        hasTaskCards = stillVisible && !shortReply;
         changedTask = task;
         shownTaskIds = stillVisible ? [task.id] : [];
         privateReply = !isDm && (!stillVisible || !isPublicTask(task));
         replies = stillVisible
           ? [
-            quiet
-              ? `✅ ${acknowledgement} task #${task.number}.`
+            shortReply
+              ? requestConfirmationId
+                ? requestStatusText(
+                  task,
+                  task.participation!.requests[requestConfirmationId],
+                )
+                : `${
+                  command.kind === "approval-response" && !command.approve ? "❌" : "✅"
+                } ${taskTitle(task)} — ${acknowledgement}.`
               : `${acknowledgement} task #${task.number}.\n\n${
                 formatTask(task, teamNames)
               }`,
@@ -588,8 +652,10 @@ export async function handleMessage(
           : [
             task.deleted
               ? (command.kind === "response" && command.decision.kind === "reject"
-                ? `Task #${task.number} was deleted after its creator rejected the returned assignment.`
-                : `Deleted task #${task.number}.`)
+                ? `${
+                  taskTitle(task)
+                } — Deleted after its creator rejected the returned assignment.`
+                : `${taskTitle(task)} — Deleted.`)
               : "Changes saved. Your viewing permissions no longer include this task.",
           ];
         const key = mutationKey(context);
@@ -686,6 +752,46 @@ export async function handleMessage(
       );
     }
   }
+  // Even a validation/error response inside a known task conversation retains
+  // its task identity and can itself be used as the next thread root.
+  if (!identifiedTask && !changedTask && event.thread_ts && dmContexts && repository) {
+    try {
+      const personal = await dmContexts.get(
+        event.channel_id,
+        event.thread_ts,
+        event.user_id,
+      );
+      const ids = personal.length
+        ? personal
+        : await dmContexts.get(event.channel_id, event.thread_ts, "*");
+      const candidates = ids.length === 1
+        ? [await repository.findById(ids[0])]
+        : ids.length
+        ? []
+        : await repository.findInThread(event.channel_id, event.thread_ts);
+      if (candidates.length === 1 && candidates[0]) {
+        const candidate = candidates[0];
+        const access = notifications?.context?.loadAccess
+          ? await notifications.context.loadAccess(
+            candidate,
+            event.user_id,
+            replyWorkspaceId,
+          )
+          : { userId: event.user_id, teamIds: [] };
+        if (canAccessTask(candidate, access)) {
+          identifiedTask = candidate;
+          shownTaskIds = [candidate.id];
+          privateReply = !isDm && !isPublicTask(candidate);
+        }
+      }
+    } catch { /* Never expose a private task based only on a stale thread binding. */ }
+  }
+  const namedTask = changedTask ?? identifiedTask;
+  if (namedTask && includeTaskIdentity) {
+    replies = replies.map((reply) =>
+      reply.includes(taskTitle(namedTask)) ? reply : `${taskTitle(namedTask)}\n\n${reply}`
+    );
+  }
   let replyChannel = event.channel_id;
   const sourceThread = event.thread_ts || event.message_ts;
   let replyThread: string | undefined = sourceThread;
@@ -724,6 +830,15 @@ export async function handleMessage(
         error: `Cannot start reply thread: ${acknowledgement.error ?? "unknown_error"}`,
         ...(interactive ? { interactive: true } : {}),
       };
+    }
+    if (acknowledgement.ts && shownTaskIds?.length && dmContexts) {
+      await dmContexts.save(
+        replyChannel,
+        acknowledgement.ts,
+        "*",
+        shownTaskIds,
+        "context",
+      );
     }
   }
   let replyTs: string | undefined;
@@ -781,12 +896,12 @@ export async function handleMessage(
         };
       }
     }
-    if (dmContexts && shownTaskIds !== undefined && (isDm || directReply)) {
+    if (dmContexts && shownTaskIds !== undefined) {
       try {
         for (
           const key of new Set([
-            "latest",
-            ...(isDm ? [sourceThread] : []),
+            ...(isDm || directReply ? ["latest"] : []),
+            sourceThread,
             ...(replyTs ? [replyTs] : []),
           ])
         ) {
@@ -798,12 +913,32 @@ export async function handleMessage(
             key === replyTs && hasTaskCards ? "card" : "context",
           );
         }
+        if (replyTs && ids?.length) {
+          await dmContexts.save(replyChannel, replyTs, "*", ids, "context");
+        }
       } catch {
         return {
           error:
             "Reply sent, but I couldn't remember its task context. Use the task number for your next update.",
           ...(interactive ? { interactive: true } : {}),
         };
+      }
+    }
+    if (requestConfirmationId && changedTask && replyTs && !privateReply && repository) {
+      const current = await rememberRequestConfirmation(
+        changedTask,
+        requestConfirmationId,
+        { channelId: replyChannel, messageTs: replyTs, userId: event.user_id },
+        repository,
+      );
+      const request = current.participation!.requests[requestConfirmationId];
+      if (request.status !== "pending" && notifications?.client.chat.update) {
+        await notifications.client.chat.update({
+          channel: replyChannel,
+          ts: replyTs,
+          text: requestStatusText(current, request),
+          blocks: [],
+        });
       }
     }
   }
@@ -889,6 +1024,7 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event, en
           rememberTask: async (channel, ts, user, id) => {
             const store = new SlackDmContexts(client);
             await store.save(channel, ts, user, [id], "invitation");
+            await store.save(channel, ts, "*", [id], "context");
             await store.save(channel, "latest", user, [id]);
           },
           executionId: event.function_execution_id,

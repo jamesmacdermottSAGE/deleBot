@@ -1,4 +1,8 @@
 import {
+  handleParticipationAction,
+  REQUEST_REJECT,
+} from "../delebot/slack/participation_messages.ts";
+import {
   handleMessage,
   type MessageClient,
   type MessageEvent,
@@ -84,10 +88,15 @@ function fixture() {
       }),
   };
   let counter = 0;
-  async function command(userId: string, text: string, thread?: string) {
+  async function command(
+    userId: string,
+    text: string,
+    thread?: string,
+    channelId = `D${userId}`,
+  ) {
     const event: MessageEvent = {
-      channel_id: `D${userId}`,
-      channel_type: "dm",
+      channel_id: channelId,
+      channel_type: channelId.startsWith("D") ? "dm" : "public",
       user_id: userId,
       message_ts: `10.${++counter}`,
       text,
@@ -121,7 +130,17 @@ function fixture() {
       post.channel === `D${userId}` && JSON.stringify(post.blocks).includes(action)
     ).at(-1)!;
   const task = () => [...repository.rows.values()][0];
-  return { repository, command, posts, updates, invitation, task };
+  return {
+    repository,
+    command,
+    posts,
+    updates,
+    invitation,
+    task,
+    client,
+    dmContexts,
+    store,
+  };
 }
 
 Deno.test("DM task messages support accepted-owner collaboration and ls collab without changing assignment", async () => {
@@ -185,4 +204,160 @@ Deno.test("access people added in a task thread can subsequently complete that t
   assert(
     f.task().completed && !Object.values(f.task().participation?.requests ?? {}).length,
   );
+});
+
+Deno.test("access me adds the requester, edit access me replaces Access, and both return short named confirmations", async () => {
+  const f = fixture();
+  const created = await f.command("UCREATOR", "task SelfAccess");
+  await f.command("UCREATOR", "access me", created.message_ts);
+  assert(f.task().editPerms?.join() === "UCREATOR");
+  const reply = f.posts.at(-1)!;
+  assert(
+    reply.text.includes(`#${f.task().number}: SelfAccess`) &&
+      reply.text.includes("Access updated") && reply.text.length < 250,
+  );
+  await f.command("UCREATOR", "access <@UMANAGER>", reply.ts);
+  assert(f.task().editPerms?.includes("UMANAGER"));
+  await f.command("UCREATOR", "edit access me", reply.ts);
+  assert(f.task().editPerms?.join() === "UCREATOR");
+  await f.command("UCREATOR", "access", reply.ts);
+  assert(
+    f.posts.at(-1)!.text.length < 500 &&
+      f.posts.at(-1)!.text.includes(`#${f.task().number}: SelfAccess`),
+  );
+  const errorReply = f.posts.at(-1)!;
+  await f.command("UCREATOR", "assign <@UBOB>", errorReply.ts);
+  assert(f.task().assignees.join() === "UBOB");
+});
+
+Deno.test("access me cannot grant a pending assignee editing privileges", async () => {
+  const f = fixture();
+  await f.command("UCREATOR", "task Restricted assign <@UALICE> access <@UMANAGER>");
+  const invite = f.invitation("UALICE", "delebot_assignment_accept");
+  await f.command("UALICE", "access me", invite.ts);
+  assert(f.task().editPerms?.join() === "UMANAGER");
+  assert(
+    f.posts.at(-1)!.text.includes("Only the creator") &&
+      f.posts.at(-1)!.text.includes(`#${f.task().number}: Restricted`),
+  );
+});
+
+Deno.test("request rejections update requester confirmations and remain usable as task threads", async () => {
+  for (const kind of ["complete", "delete"] as const) {
+    const f = fixture();
+    const created = await f.command("UCREATOR", "task Approval access <@UMANAGER>");
+    await f.command(
+      "UCREATOR",
+      kind === "complete" ? "done" : "delete",
+      created.message_ts,
+    );
+    const confirmation = f.posts.at(-1)!;
+    const request = Object.values(f.task().participation!.requests)[0];
+    assert(
+      request.confirmations?.some((message) => message.messageTs === confirmation.ts),
+    );
+    assert(
+      confirmation.text.includes(`#${f.task().number}: Approval`) &&
+        !confirmation.text.includes("*Assignees:*"),
+    );
+    const managerInvite = f.invitation("UMANAGER", "delebot_request_approve");
+    await f.command("UMANAGER", `deny ${kind}`, managerInvite.ts);
+    const rejection = f.updates.filter((update) => update.ts === confirmation.ts).at(-1)!;
+    assert(
+      rejection.text.includes(
+        `${kind === "complete" ? "Completion" : "Deletion"} request rejected`,
+      ) && rejection.text.includes(`#${f.task().number}: Approval`),
+    );
+    assert(
+      f.posts.at(-1)!.text.includes("request rejected") &&
+        f.posts.at(-1)!.text.includes(`#${f.task().number}: Approval`),
+    );
+    assert(!f.task().deleted && !f.task().completed);
+    const originalId = f.task().id;
+    await f.command("UCREATOR", "task Other");
+    await f.command("UCREATOR", "assign <@UBOB>", rejection.ts);
+    assert(f.repository.rows.get(originalId)!.assignees.join() === "UBOB");
+    assert(
+      [...f.repository.rows.values()].find((task) => task.name === "Other")!.assignees
+        .length === 0,
+    );
+  }
+});
+
+Deno.test("reject-request buttons update both named messages and preserve the requester's reply context", async () => {
+  for (const kind of ["complete", "delete"] as const) {
+    const f = fixture();
+    await f.command("UCREATOR", "task ButtonDecision access <@UMANAGER>");
+    await f.command(
+      "UCREATOR",
+      `${f.task().number} ${kind === "complete" ? "done" : "delete"}`,
+    );
+    const confirmation = f.posts.at(-1)!;
+    const invite = f.invitation("UMANAGER", "delebot_request_approve");
+    const delivery = Object.values(f.task().participation!.deliveryEvents).find((event) =>
+      event.kind === "approval"
+    )!;
+    const result = await handleParticipationAction({
+      actionId: REQUEST_REJECT,
+      value: invite.blocks![1].elements[1].value,
+      userId: "UMANAGER",
+      channelId: invite.channel,
+      messageTs: invite.ts,
+      executionId: delivery.deliveries!.UMANAGER.executionId,
+      actionTs: "25.1",
+    }, {
+      client: f.client,
+      repository: f.repository,
+      notificationStore: f.store,
+      loadAccess: (_task, userId) => Promise.resolve({ userId, teamIds: [] }),
+      rememberTask: (channel, ts, user, id) =>
+        f.dmContexts.save(channel, ts, user, [id], "context"),
+    });
+    assert(result.ok, JSON.stringify(result));
+    for (const ts of [confirmation.ts, invite.ts]) {
+      const update = f.updates.filter((message) => message.ts === ts).at(-1)!;
+      assert(
+        update.text.includes(`#${f.task().number}: ButtonDecision`) &&
+          update.text.includes("request rejected"),
+      );
+    }
+    await f.command("UCREATOR", "task Other");
+    await f.command("UCREATOR", "assign <@UBOB>", confirmation.ts);
+    assert(f.task().assignees.join() === "UBOB");
+  }
+});
+
+Deno.test("task-related channel messages support replies from another authorized participant", async () => {
+  const f = fixture();
+  await f.command(
+    "UCREATOR",
+    "<@UBOT> task ChannelTask assign <@UALICE>",
+    undefined,
+    "CTEST",
+  );
+  const card = f.posts.filter((message) => message.channel === "CTEST").at(-1)!;
+  await f.command("UALICE", "<@UBOT> accept", card.ts, "CTEST");
+  assert(f.task().assignmentTree?.acceptedBy === "UALICE");
+  const accepted = f.posts.filter((message) => message.channel === "CTEST").at(-1)!;
+  assert(accepted.text.includes(`#${f.task().number}: ChannelTask`));
+  await f.command("UALICE", "<@UBOT> p 2", accepted.ts, "CTEST");
+  assert(f.task().priority === 2);
+  await f.command("UOTHER", "<@UBOT> p 3", accepted.ts, "CTEST");
+  assert(f.task().priority === 2 && f.posts.at(-1)!.text.includes("Only the creator"));
+});
+
+Deno.test("private-channel task acknowledgements retain context without granting other viewers access", async () => {
+  const f = fixture();
+  await f.command(
+    "UCREATOR",
+    "<@UBOT> task Secret viewPerms <@UCREATOR>",
+    undefined,
+    "CPRIVATE",
+  );
+  const acknowledgement = f.posts.at(-1)!;
+  assert(!acknowledgement.text.includes("Secret"));
+  await f.command("UCREATOR", "<@UBOT> p 1", acknowledgement.ts, "CPRIVATE");
+  assert(f.task().priority === 1);
+  await f.command("UOTHER", "<@UBOT> p 3", acknowledgement.ts, "CPRIVATE");
+  assert(f.task().priority === 1 && !f.posts.at(-1)!.text.includes("Secret"));
 });

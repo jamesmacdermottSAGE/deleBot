@@ -19,6 +19,11 @@ function escapeText(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+/** A consistent identity for task notices, confirmations, and decisions. */
+export function taskTitle(task: Pick<Task, "number" | "name">): string {
+  return `*Task #${task.number}: ${escapeText(task.name)}*`;
+}
+
 function mention(userId: string): string {
   return /^[UW][A-Z0-9]+$/.test(userId) ? `<@${userId}>` : escapeText(userId);
 }

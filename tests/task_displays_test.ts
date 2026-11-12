@@ -98,7 +98,10 @@ Deno.test("display refresh removes revoked private copies and marks deleted task
   await f.displays.refresh({ ...f.task, deleted: true });
   assert(
     f.updates.length === 3 &&
-      f.updates.every((entry) => entry.text === "🗑️ Task deleted"),
+      f.updates.every((entry) =>
+        entry.text.includes(`#${f.task.number}: ${f.task.name}`) &&
+        entry.text.includes("Deleted.")
+      ),
   );
 });
 
@@ -457,4 +460,17 @@ Deno.test("revoked and deleted invitation copies never receive the accepted owne
       `No ownership or completion details should leak for ${variant}`,
     );
   }
+});
+
+Deno.test("deleted cards still show deletion without revealing identity when viewing access cannot be verified", async () => {
+  const f = await fixture();
+  const displays = new SlackTaskDisplays(
+    f.client,
+    () => Promise.reject(new Error("membership unavailable")),
+  );
+  assert(await displays.refresh({ ...f.task, deleted: true }) === 0);
+  assert(
+    f.updates.length > 0 &&
+      f.updates.every((message) => message.text === "🗑️ Task deleted"),
+  );
 });

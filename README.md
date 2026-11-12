@@ -203,6 +203,17 @@ current permissions are still checked before any task changes.
 
 ## Access
 
+`access me` adds yourself to Access; `edit access me` replaces Access with just yourself.
+Both work in task threads and with a task number, and return a short confirmation.
+`me` also works in `viewPerms` and alongside Slack mentions in permission fields.
+
+Task confirmations and request decisions identify the task by number and name. Completion
+and deletion decisions update both the approver's request message and the requester's
+confirmation. Reply to a task-related status message with `assign @person`, `access me`,
+or another task command to act on that same task, even after viewing another task.
+Thread context selects the task; it does not grant permission to view or edit it.
+
+
 `access @person @team` adds people and teams allowed to complete or delete a task.
 `edit access @person` replaces that policy; `access all` and `delete access` allow all
 viewers. Access changes require an editing role (creator, accepted assignee, or accepted

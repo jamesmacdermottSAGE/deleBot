@@ -43,7 +43,7 @@ export const TASK_CREATE_USAGE = [
   "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
   "*Clear chat:* `clear` in a DM clears that chat; in a DM thread it clears only that thread. Large histories run in resumable batches: repeat clear when prompted. Your messages require your Slack user authorization to delete; without it only bot messages are removed. Saved tasks are unchanged.",
   "*Complete:* `done` or `work done` completes a task. `edit completed no` reopens it. Reply in the task's thread or specify its number, e.g. `123 done`. Bare done also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
-  "*Access:* `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Only the creator, accepted assignee, or accepted collaborators can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
+  "*Access:* `access me` adds yourself; `edit access me` replaces Access with yourself. `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Only the creator, accepted assignee, or accepted collaborators can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
   "*Collaborate:* the accepted owner can use `collab @person` to send a separate collaboration invitation. Recipients use its buttons or `collab accept` / `collab reject` in the task thread. `ls collab` lists accepted collaborations; collaborators are not assignees.",
   "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
@@ -84,16 +84,26 @@ export type TaskCommand =
   | { kind: "unknown" };
 
 function invalid(message: string): TaskCommand {
-  return { kind: "error", message: `${message}\n\n${TASK_USAGE}` };
+  return { kind: "error", message: `${message} Run task ? for help.` };
 }
 
-function parseAssignees(value: string): string[] | undefined {
+function parseAssignees(value: string, allowMe = false): string[] | undefined {
   if (value === "-") return [];
   if (/^all$/i.test(value)) return ["all"];
   const pattern = /<@([UW][A-Z0-9]+)(?:\|[^>]+)?>|<!subteam\^(S[A-Z0-9]+)(?:\|[^>]+)?>/g;
   const matches = [...value.matchAll(pattern)];
-  if (!matches.length || !/^[\s,]*$/.test(value.replace(pattern, ""))) return undefined;
-  return [...new Set(matches.map((match) => match[1] ?? match[2]))];
+  const rest = value.replace(pattern, "");
+  const self = allowMe && /\bme\b/i.test(rest);
+  if (
+    (!matches.length && !self) ||
+    !/^[\s,]*$/.test(self ? rest.replace(/\bme\b/gi, "") : rest)
+  ) return undefined;
+  return [
+    ...new Set([
+      ...matches.map((match) => match[1] ?? match[2]),
+      ...(self ? ["me"] : []),
+    ]),
+  ];
 }
 
 function parseCompleted(value: string): boolean | undefined {
@@ -475,9 +485,9 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         if (operation.field === "editPerms" && patch.matchPerms) {
           return "Use either perms match or editPerms in one command, not both.";
         }
-        const permissions = value === "-" ? undefined : parseAssignees(value);
+        const permissions = value === "-" ? undefined : parseAssignees(value, true);
         if (!permissions?.length) {
-          return "After viewPerms or editPerms, select people or teams from Slack's @ menu, or use all.";
+          return "After access or viewPerms, use me, Slack mentions, or all.";
         }
         const combined = [
           ...new Set([...(target[operation.field] ?? []), ...permissions]),

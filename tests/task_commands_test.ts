@@ -13,7 +13,7 @@ function equal(actual: unknown, expected: unknown) {
 function invalid(text: string, contains?: string) {
   const command = parseTaskCommand(text);
   assert(command.kind === "error", `Expected error for ${text}`);
-  assert(command.message.includes("*Create:*"));
+  assert(command.message.includes("task ?") && command.message.length < 500);
   if (contains) assert(command.message.includes(contains), command.message);
 }
 
@@ -690,4 +690,22 @@ Deno.test("usage commands stay distinct from task creation and thread updates", 
   equal(parseTaskCommand("task ?"), { kind: "help", topic: "create" });
   equal(parseTaskCommand("tasks ls ?"), { kind: "help", topic: "list" });
   equal(parseTaskCommand("hello"), { kind: "unknown" });
+});
+
+Deno.test("permission fields recognize me alone or alongside native mentions", () => {
+  equal(parseTaskCommand("access me"), { kind: "update", patch: { editPerms: ["me"] } });
+  equal(parseTaskCommand("edit access ME"), {
+    kind: "update",
+    patch: { set: { editPerms: ["me"] } },
+  });
+  equal(parseTaskCommand("viewPerms me <@UALICE>"), {
+    kind: "update",
+    patch: { viewPerms: ["UALICE", "me"] },
+  });
+  equal(parseTaskCommand("task Personal access me"), {
+    kind: "create",
+    name: "Personal",
+    patch: { editPerms: ["me"] },
+  });
+  invalid("access me all");
 });

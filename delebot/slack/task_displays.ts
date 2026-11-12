@@ -1,7 +1,7 @@
 import { DefineDatastore, Schema } from "deno-slack-sdk/mod.ts";
 import { canAccessTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
-import { formatTask, splitTaskReply } from "./messages.ts";
+import { formatTask, splitTaskReply, taskTitle } from "./messages.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
 import { taskAccessLoader } from "./access_context.ts";
 import {
@@ -229,8 +229,10 @@ export class SlackTaskDisplays implements TaskDisplays {
       }
       try {
         const access = task.deleted
-          ? undefined
+          ? await this.loadAccess(task, row.user_id, workspaceId).catch(() => undefined)
           : await this.loadAccess(task, row.user_id, workspaceId);
+        const maySeeIdentity = !!access &&
+          canAccessTask({ ...task, deleted: false }, access);
         const visible = !!access && canAccessTask(task, access);
         const parts = visible ? splitTaskReply(formatTask(task, access?.teamNames)) : [];
         const text = row.combined
@@ -249,7 +251,9 @@ export class SlackTaskDisplays implements TaskDisplays {
           ? await this.client.chat.update({
             channel: row.channel_id,
             ts: row.message_ts,
-            text: "🗑️ Task deleted",
+            text: maySeeIdentity
+              ? `${taskTitle(task)}\n\n🗑️ Deleted.`
+              : "🗑️ Task deleted",
             blocks: [],
             unfurl_links: false,
             unfurl_media: false,
@@ -303,8 +307,8 @@ export class SlackTaskDisplays implements TaskDisplays {
         }
         if (task.assignmentTree?.acceptedBy || task.completed) {
           const text = task.completed
-            ? `*Task #${task.number}*\n\n✅ Completed.`
-            : `*Task #${task.number}*\n\n✅ Accepted by <@${
+            ? `${taskTitle(task)}\n\n✅ Completed.`
+            : `${taskTitle(task)}\n\n✅ Accepted by <@${
               task.assignmentTree!.acceptedBy
             }>. ${
               invitation.recipientId === task.assignmentTree!.acceptedBy

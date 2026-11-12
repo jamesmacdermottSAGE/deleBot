@@ -965,8 +965,10 @@ Deno.test("name-only creation and combined thread updates show current fields an
   assert(current.dueDate === "2026-11-06" && current.links.length === 2);
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   assert(
-    posts.at(-1)!.text.includes(`Updated task #${initial.number}`) &&
-      !posts.at(-1)!.text.includes("*Task #") &&
+    posts.at(-1)!.text.includes(`#${initial.number}`) &&
+      posts.at(-1)!.text.includes("Updated.") &&
+      posts.at(-1)!.text.includes("Review PRs") &&
+      !posts.at(-1)!.text.includes("*Assignees:*") &&
       !posts.at(-1)!.text.includes("https://b.example"),
   );
   assert(openedDms.join() === "UJAMES");
@@ -1071,7 +1073,7 @@ Deno.test("work done completes the unique task in the current thread", async () 
   );
   assert([...repo.rows.values()][0].completed && repo.writes === 2);
   assert(
-    posts.at(-1)!.text.includes("Updated task #") &&
+    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Updated.") &&
       !posts.at(-1)!.text.includes("*Completed:*"),
   );
 });
@@ -1091,7 +1093,8 @@ Deno.test("print reprints current task details without editing or assigning it",
     repo,
   );
   assert(
-    posts.at(-1)!.text.startsWith("✅ Updated") &&
+    posts.at(-1)!.text.startsWith("✅ *Task #") &&
+      posts.at(-1)!.text.includes("Updated.") &&
       !posts.at(-1)!.text.includes("Current description"),
   );
   const writes = repo.writes;
@@ -1268,7 +1271,7 @@ Deno.test("a later task update resumes pending assignment notifications without 
   );
   assert(Number(repo.writes) === 2 && Number(notificationPosts.length) === 2);
   assert(notificationPosts[1].channel === "DUALICE");
-  assert(posts.at(-1)!.text.includes("Updated task"));
+  assert(posts.at(-1)!.text.includes("Updated."));
   await handleMessage(
     { ...event, thread_ts: event.message_ts, message_ts: "9.3", text: "<@UBOT> done" },
     client,
@@ -1291,7 +1294,10 @@ Deno.test("thread deletion hides the task and delayed command replays cannot res
   };
   await handleMessage(deletion, client, repo);
   assert(repo.writes === 2 && [...repo.rows.values()][0].deleted);
-  assert(posts.at(-1)!.text === `Deleted task #${task.number}.`);
+  assert(
+    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
+      posts.at(-1)!.text.includes("Deleted."),
+  );
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   await handleMessage(deletion, client, repo);
   assert(repo.writes === 2 && posts.at(-1)!.text.includes("No task available"));
@@ -1343,7 +1349,10 @@ Deno.test("numbered deletion denies an unassigned user and permits a current ass
     repo,
   );
   assert(Number(repo.writes) === 2 && [...repo.rows.values()][0].deleted);
-  assert(posts.at(-1)!.text === `Deleted task #${task.number}.`);
+  assert(
+    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
+      posts.at(-1)!.text.includes("Deleted."),
+  );
   assert(posts.at(-1)!.channel === "COTHER" && posts.at(-1)!.thread_ts === "9.3");
 });
 
@@ -1534,7 +1543,7 @@ Deno.test("edit replaces complete fields and delete clears only the named fields
       replaced.dueDate === "2026-11-07",
   );
   assert(
-    posts.at(-1)!.text.includes("Updated task #") &&
+    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Updated.") &&
       !posts.at(-1)!.text.includes("Old description"),
   );
   await handleMessage(
@@ -1752,7 +1761,7 @@ Deno.test("unknown permission groups and invalid mixed edits are rejected withou
       repo,
     );
     assert(repo.writes === 1 && [...repo.rows.values()][0].description === "");
-    assert(!posts.at(-1)!.text.includes("Updated task"));
+    assert(!posts.at(-1)!.text.includes("Updated."));
   }
 });
 
@@ -1825,7 +1834,10 @@ Deno.test("deleting a task removes its assignment controls without creating anot
   );
   assert(repo.rows.get(task.id)?.deleted === true);
   assert(notificationPosts.length === 1 && notificationDeletes.length === 1);
-  assert(posts.at(-1)!.text === `Deleted task #${task.number}.`);
+  assert(
+    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
+      posts.at(-1)!.text.includes("Deleted."),
+  );
 });
 
 Deno.test("a failed channel confirmation preserves the active assignment interaction", async () => {

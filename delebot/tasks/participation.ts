@@ -26,6 +26,7 @@ export interface TaskActionRequest {
   status: "pending" | "approved" | "rejected" | "cancelled";
   eventKey: string;
   resolvedBy?: string;
+  confirmations?: Array<{ channelId: string; messageTs: string; userId: string }>;
 }
 
 export interface ParticipationDelivery {
@@ -98,6 +99,19 @@ export function parseParticipation(value: unknown): TaskParticipation {
     ) {
       throw new Error("Invalid task action request.");
     }
+  }
+  for (const entry of Object.values(value.requests)) {
+    const request = entry as Record<string, unknown>;
+    if (
+      request.confirmations !== undefined &&
+      (!Array.isArray(request.confirmations) ||
+        !request.confirmations.every((message) =>
+          record(message) && typeof message.channelId === "string" &&
+          /^[CDG][A-Z0-9]+$/.test(message.channelId) &&
+          typeof message.messageTs === "string" && /^\d+\.\d+$/.test(message.messageTs) &&
+          isUser(message.userId) && message.userId === request.requestedBy
+        ))
+    ) throw new Error("Invalid task request confirmation.");
   }
   for (const [id, entry] of Object.entries(value.deliveryEvents)) {
     if (
@@ -449,4 +463,29 @@ export async function respondToTaskAction(
         access,
       ),
   );
+}
+
+/** Record the requester's acknowledgement so a later decision updates that same message. */
+export async function rememberRequestConfirmation(
+  task: Task,
+  requestId: string,
+  message: { channelId: string; messageTs: string; userId: string },
+  repository: TaskRepository,
+): Promise<Task> {
+  return await freshMutation(task, repository, async (current) => {
+    const participation = metadata(current);
+    const request = participation.requests[requestId];
+    if (!request || request.requestedBy !== message.userId) {
+      throw new TaskCommandError("This request confirmation is not available.");
+    }
+    request.confirmations ??= [];
+    if (
+      !request.confirmations.some((entry) =>
+        entry.channelId === message.channelId && entry.messageTs === message.messageTs
+      )
+    ) request.confirmations.push(message);
+    const next = { ...current, participation };
+    await repository.save(next);
+    return next;
+  });
 }

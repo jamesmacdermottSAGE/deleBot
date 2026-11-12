@@ -1,3 +1,4 @@
+import { taskTitle } from "./messages.ts";
 import {
   delegationEndpoint,
   dispatchDelegation,
@@ -859,6 +860,7 @@ export function productionDependencies(client: SlackAPIClient): AssignmentDepend
     rememberTask: async (channel, ts, user, id) => {
       const store = new SlackDmContexts(client);
       await store.save(channel, ts, user, [id], "invitation");
+      await store.save(channel, ts, "*", [id], "context");
       await store.save(channel, "latest", user, [id]);
     },
     client,
@@ -1008,8 +1010,9 @@ export async function runQueuedDelegation(
     if (access) {
       const message = {
         channel: bound.invitation.channelId!,
-        text: result.error ??
-          "Delegation could not be completed. Open Delegate to retry.",
+        text: `${taskTitle(bound.task)}\n\n${
+          result.error ?? "Delegation could not be completed. Open Delegate to retry."
+        }`,
         unfurl_links: false,
         unfurl_media: false,
       };
@@ -1022,6 +1025,21 @@ export async function runQueuedDelegation(
       if (!sent.ok) {
         const fallback = await dependencies.client.chat.postMessage(message);
         if (!fallback.ok) throw new Error("Cannot report delegation failure.");
+        if (fallback.ts) {
+          await dependencies.rememberTask?.(
+            message.channel,
+            fallback.ts,
+            submission.userId,
+            bound.task.id,
+          );
+        }
+      } else if (sent.ts) {
+        await dependencies.rememberTask?.(
+          message.channel,
+          sent.ts,
+          submission.userId,
+          bound.task.id,
+        );
       }
     }
   }
@@ -1050,13 +1068,22 @@ export async function runQueuedAssignmentAction(
   ) return { ok: false, error: "This assignment control is no longer available." };
   const result = await handleAssignmentAction(action, dependencies);
   if (!result.ok && await currentAccess(bound, dependencies)) {
-    await dependencies.client.chat.postMessage({
+    const sent = await dependencies.client.chat.postMessage({
       channel: action.channelId,
-      text: result.error ??
-        "Response could not be completed. Retry in the task's thread.",
+      text: `${taskTitle(bound.task)}\n\n${
+        result.error ?? "Response could not be completed. Retry in the task's thread."
+      }`,
       unfurl_links: false,
       unfurl_media: false,
     });
+    if (sent.ok && sent.ts) {
+      await dependencies.rememberTask?.(
+        action.channelId,
+        sent.ts,
+        action.userId,
+        bound.task.id,
+      );
+    }
   }
   return result;
 }

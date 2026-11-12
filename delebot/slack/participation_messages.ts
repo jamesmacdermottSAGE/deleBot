@@ -1,3 +1,4 @@
+import { taskTitle } from "./messages.ts";
 import { canAccessTask, canManageTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
 import { withKeyLock } from "../tasks/mutation.ts";
@@ -8,6 +9,7 @@ import {
   respondToCollaboration,
   respondToTaskAction,
   taskActionApprovers,
+  type TaskActionRequest,
   taskCanCollaborate,
   type TaskParticipation,
 } from "../tasks/participation.ts";
@@ -130,8 +132,8 @@ function state(
   delivery: ParticipationDelivery,
   userId: string,
 ): ParticipationBinding["status"] {
-  if (task.deleted) return "cancelled";
   if (delivery.kind === "collaboration") {
+    if (task.deleted) return "cancelled";
     const invitation = task.participation?.collaborators[userId];
     if (
       !invitation || invitation.eventKey !== eventKey ||
@@ -142,6 +144,14 @@ function state(
   const request = task.participation?.requests[delivery.reference];
   if (!request) return "cancelled";
   return request.status;
+}
+
+export function requestStatusText(task: Task, request: TaskActionRequest): string {
+  const kind = request.kind === "complete" ? "Completion" : "Deletion";
+  const status = request.status === "pending" ? "requested" : `request ${request.status}`;
+  return `${taskTitle(task)}\n\n${kind} ${status}.${
+    request.status === "approved" && request.kind === "delete" ? " Task deleted." : ""
+  }`;
 }
 
 function textFor(
@@ -197,6 +207,36 @@ export async function notifyParticipation(
     }
     if (closedRequests) await repository.save(current);
     const failed = new Set<string>();
+    for (const request of Object.values(current.participation.requests)) {
+      for (const message of request.confirmations ?? []) {
+        try {
+          const access = await accessFor(current, message.userId, workspaceId, context);
+          const visible = canAccessTask({ ...current, deleted: false }, access);
+          const updated = await client.chat.update({
+            channel: message.channelId,
+            ts: message.messageTs,
+            text: visible
+              ? requestStatusText(current, request)
+              : "This task is no longer available.",
+            blocks: [],
+          });
+          if (
+            !updated.ok &&
+            !["message_not_found", "message_not_modified"].includes(updated.error ?? "")
+          ) failed.add(message.userId);
+          if (visible && context.rememberTask) {
+            await context.rememberTask(
+              message.channelId,
+              message.messageTs,
+              message.userId,
+              current.id,
+            );
+          }
+        } catch {
+          failed.add(message.userId);
+        }
+      }
+    }
     let interactive = false;
     for (
       const [eventKey, delivery] of Object.entries(current.participation.deliveryEvents)
@@ -247,17 +287,27 @@ export async function notifyParticipation(
           const access = await accessFor(current, userId, workspace, context);
           let nextStatus = state(current, eventKey, delivery, userId);
           if (
-            !canAccessTask(current, access) ||
+            !canAccessTask({ ...current, deleted: false }, access) ||
             (delivery.kind === "approval" && nextStatus === "pending" &&
               !canManageTask(current, access))
           ) nextStatus = "cancelled";
           if (nextStatus === "pending") continue;
           binding.status = nextStatus;
-          const text = nextStatus === "cancelled"
-            ? "This invitation or request is no longer available."
-            : `${
-              delivery.kind === "collaboration" ? "Collaboration" : "Task action request"
-            } ${nextStatus}.`;
+          const visible = canAccessTask({ ...current, deleted: false }, access);
+          const text = !visible
+            ? "This task is no longer available."
+            : delivery.kind === "approval" && request
+            ? requestStatusText(current, request)
+            : `${taskTitle(current)}\n\nCollaboration ${nextStatus}.`;
+          if (visible && context.rememberTask && !binding.contextSaved) {
+            await context.rememberTask(
+              binding.channelId,
+              binding.messageTs,
+              userId,
+              current.id,
+            );
+            binding.contextSaved = true;
+          }
           const updated = await client.chat.update({
             channel: binding.channelId,
             ts: binding.messageTs,
