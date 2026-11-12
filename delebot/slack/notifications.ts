@@ -1,3 +1,4 @@
+import { formatTask } from "./messages.ts";
 import { DefineDatastore, Schema } from "deno-slack-sdk/mod.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
 import { canViewTask } from "../tasks/access.ts";
@@ -23,21 +24,32 @@ export type NotificationTask =
       | "assignmentTree"
       | "assignmentEventNodes"
       | "completed"
+      | "description"
+      | "dueDate"
+      | "priority"
+      | "links"
+      | "jiraLinks"
+      | "githubLinks"
+      | "participation"
     >
   >;
 
 export const ASSIGNMENT_ACCEPT = "delebot_assignment_accept";
 export const ASSIGNMENT_REJECT = "delebot_assignment_reject";
+export const ASSIGNMENT_RETURN_DELETE = "delebot_assignment_return_delete";
 export const ASSIGNMENT_DELEGATE = "delebot_assignment_delegate";
 export const ASSIGNMENT_ACTION_IDS = [
   ASSIGNMENT_ACCEPT,
   ASSIGNMENT_REJECT,
+  ASSIGNMENT_RETURN_DELETE,
   ASSIGNMENT_DELEGATE,
 ];
 export type MessageBlocks = NonNullable<
   Parameters<SlackAPIClient["chat"]["postMessage"]>[0]["blocks"]
 >;
 export interface NotificationContext {
+  /** Prepare the durable action handler before exposing the first buttons. */
+  prepareInteractivity?: () => Promise<void>;
   loadTask?: (taskId: string) => Promise<Task | null>;
   rememberTask?: (
     channel: string,
@@ -50,7 +62,7 @@ export interface NotificationContext {
     task: Task,
     recipientId: string,
     workspaceId?: string,
-  ) => Promise<TaskAccess>;
+  ) => Promise<TaskAccess & { teamNames?: Record<string, string> }>;
 }
 export interface NotificationResult {
   failed: string[];
@@ -67,6 +79,7 @@ export interface AssignmentInvitation {
   messageRemoved?: boolean;
   delegatedTo?: string[];
   returnedBy?: string;
+  creatorReturn?: boolean;
   note?: string;
   closedBy?: string;
   completionNotified?: boolean;
@@ -129,6 +142,7 @@ export interface NotificationClient {
   chat: {
     postMessage(args: {
       channel: string;
+      thread_ts?: string;
       text: string;
       unfurl_links: boolean;
       unfurl_media: boolean;
@@ -240,6 +254,8 @@ function validateBatch(value: unknown, expectedId: string): NotificationBatch {
         (invitation.returnedBy !== undefined &&
           (typeof invitation.returnedBy !== "string" ||
             !/^[UW][A-Z0-9]+$/.test(invitation.returnedBy))) ||
+        (invitation.creatorReturn !== undefined &&
+          typeof invitation.creatorReturn !== "boolean") ||
         (invitation.note !== undefined &&
           (typeof invitation.note !== "string" || invitation.note.length > 2000)) ||
         (invitation.modalNonce !== undefined &&
@@ -493,8 +509,13 @@ export function assignmentBlocks(
         },
         {
           type: "button",
-          action_id: ASSIGNMENT_REJECT,
-          text: { type: "plain_text", text: "Reject" },
+          action_id: invitation.creatorReturn
+            ? ASSIGNMENT_RETURN_DELETE
+            : ASSIGNMENT_REJECT,
+          text: {
+            type: "plain_text",
+            text: invitation.creatorReturn ? "Delete" : "Reject",
+          },
           style: "danger",
           value,
         },
@@ -509,22 +530,74 @@ export function assignmentBlocks(
   ];
 }
 
+export function assignmentInvitationDetails(
+  task: NotificationTask,
+  recipientId: string,
+  keys?: string[],
+): Pick<AssignmentInvitation, "returnedBy" | "note" | "creatorReturn"> {
+  const tree = task.assignmentTree;
+  const node = tree &&
+    Object.values(tree.nodes).find((n) =>
+      n.kind === "user" && n.principalId === recipientId && n.status === "pending" &&
+      (!keys?.length || keys.includes(assignmentInvitationKey(n)))
+    );
+  if (!node) {
+    return {
+      returnedBy: task.assignmentResponses?.[recipientId]?.returnedBy,
+      note: task.assignmentResponses?.[recipientId]?.note,
+    };
+  }
+  return {
+    returnedBy: node.returnedBy,
+    note: node.note,
+    creatorReturn: node.id === tree!.rootId && node.returned === true &&
+      recipientId === task.createdBy,
+  };
+}
+
 export function assignmentNotificationText(
   task: NotificationTask,
   recipientId: string,
-  invitation: Pick<AssignmentInvitation, "returnedBy" | "note"> = {},
+  invitation: Pick<AssignmentInvitation, "returnedBy" | "note" | "creatorReturn"> = {},
+  teamNames: Record<string, string> = {},
 ): string {
+  const creatorReturn = invitation.creatorReturn ??
+    assignmentInvitationDetails(task, recipientId).creatorReturn;
   const returnedBy = invitation.returnedBy ??
     task.assignmentResponses?.[recipientId]?.returnedBy;
   const note = invitation.note ?? task.assignmentResponses?.[recipientId]?.note;
+  if (!creatorReturn && !returnedBy) {
+    const card: Task = {
+      teams: [],
+      assignmentBased: true,
+      links: [],
+      description: "",
+      dueDate: null,
+      priority: null,
+      createdBy: "",
+      createdAt: "",
+      threadTs: task.messageTs,
+      status: task.completed ? "completed" : "open",
+      completed: false,
+      ...task,
+    };
+    return formatTask(card, teamNames) +
+      (note?.trim() ? `\n\n*Note:* ${escape(note.trim())}` : "");
+  }
   return [
-    returnedBy
+    creatorReturn
+      ? `Your task *#${task.number}: ${
+        escape(task.name)
+      }* has come back to you because its delegation branches were rejected.`
+      : returnedBy
       ? `Task *#${task.number}: ${
         escape(task.name)
       }* was returned to you after <@${returnedBy}> rejected it.`
       : `You have been assigned task *#${task.number}: ${escape(task.name)}*.`,
-    `Reply here with \`accept\`, \`reject\`, \`delegate @person\`, or \`done\`. You can also send \`${task.number} done\` directly to DeleBot.`,
-    ...(note?.trim() ? [`*Note:* ${escape(note.trim())}`] : []),
+    creatorReturn
+      ? "Choose *Accept*, *Delete*, or *Delegate*. You can also reply here with `accept`, `delete`, or `delegate @person @team`."
+      : `Reply here with \`accept\`, \`reject\`, \`delegate @person\`, or \`done\`. You can also send \`${task.number} done\` directly to DeleBot.`,
+    ...(!creatorReturn && note?.trim() ? [`*Note:* ${escape(note.trim())}`] : []),
   ].join("\n\n");
 }
 
@@ -680,12 +753,14 @@ async function notifyAssignmentsUnlocked(
         failed.add(recipient);
         continue;
       }
+      let teamNames: Record<string, string> = {};
       if (context.loadAccess) {
         const access = await context.loadAccess(
           task as Task,
           recipient,
           batch.workspaceId ?? workspaceId,
         );
+        teamNames = access.teamNames ?? {};
         if (access.userId !== recipient || !canViewTask(task as Task, access)) {
           failed.add(recipient);
           continue;
@@ -704,6 +779,7 @@ async function notifyAssignmentsUnlocked(
         failed.add(recipient);
         continue;
       }
+      if (context.executionId) await context.prepareInteractivity?.();
       const dm = await client.conversations.open({ users: recipient });
       if (!dm.ok || !dm.channel?.id || !/^D[A-Z0-9]+$/.test(dm.channel.id)) {
         failed.add(recipient);
@@ -711,10 +787,12 @@ async function notifyAssignmentsUnlocked(
       }
       let invitation: AssignmentInvitation | undefined;
       let retrying = false;
-      const returnedBy = task.assignmentResponses?.[recipient]?.returnedBy;
-      const note = batch.assigned.map((id) => task.assignmentResponses?.[id]?.note).find((
-        value,
-      ) => value?.trim());
+      const details = assignmentInvitationDetails(task, recipient, batch.invitationKeys);
+      const returnedBy = details.returnedBy;
+      const note = details.creatorReturn ? undefined : details.note ??
+        batch.assigned.map((id) => task.assignmentResponses?.[id]?.note).find((
+          value,
+        ) => value?.trim());
       if (context.executionId) {
         batch.invitations ??= {};
         invitation = batch.invitations[recipient];
@@ -726,6 +804,7 @@ async function notifyAssignmentsUnlocked(
             status: "pending",
             executionId: context.executionId,
             ...(returnedBy ? { returnedBy } : {}),
+            ...(details.creatorReturn ? { creatorReturn: true } : {}),
             ...(note ? { note } : {}),
           };
           batch.invitations[recipient] = invitation;
@@ -734,7 +813,8 @@ async function notifyAssignmentsUnlocked(
       const text = assignmentNotificationText(
         task,
         recipient,
-        invitation ?? { returnedBy, note },
+        invitation ?? { returnedBy, note, creatorReturn: details.creatorReturn },
+        teamNames,
       );
       const deliveryKey = `${batch.id}:${recipient}`;
       if (retrying && invitation && client.conversations.history) {

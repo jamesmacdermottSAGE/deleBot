@@ -1,4 +1,8 @@
 import {
+  inviteCollaborators,
+  respondToCollaboration,
+} from "../delebot/tasks/participation.ts";
+import {
   createTask,
   deleteTask,
   listTasks,
@@ -500,7 +504,7 @@ Deno.test("assigning all replaces specifics and assigning specific people or tea
   assert(selfAssigned.task.assignees.join() === "SBACKEND,UCREATOR");
 });
 
-Deno.test("permitted team members can update while strangers cannot resolve or mutate", async () => {
+Deno.test("accepted team members can update while strangers cannot resolve or mutate", async () => {
   const repo = new MemoryTaskRepository();
   const created = await createTask(
     {
@@ -514,8 +518,15 @@ Deno.test("permitted team members can update while strangers cannot resolve or m
     access,
   );
   const member = { userId: "UMEMBER", teamIds: ["SBACKEND"] };
-  const updated = await updateTask(
+  const accepted = await respondToAssignment(
     created.task,
+    { kind: "accept" },
+    reply("9.0", member.userId),
+    repo,
+    member,
+  );
+  const updated = await updateTask(
+    accepted.task,
     { priority: 2 },
     reply("9.1", member.userId),
     repo,
@@ -611,7 +622,8 @@ Deno.test("unassigned tasks default to everyone and assignment does not change p
       assigned.task.editPerms?.join() === "all",
   );
   assert(
-    assigned.task.assignmentEvents?.[mutationKey(reply("9.1"))].join() === "UCREATOR",
+    assigned.task.assignmentTree?.acceptedBy === "UCREATOR" &&
+      assigned.task.assignmentEvents?.[mutationKey(reply("9.1"))].length === 0,
   );
 });
 
@@ -842,21 +854,25 @@ Deno.test("soon filters use London calendar days with inclusive bounds across cl
   }
 });
 
-Deno.test("default public permissions let an unassigned viewer edit independently of assignments", async () => {
+Deno.test("public Access permits management but does not let an unrelated viewer edit details", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask({ name: "Shared" }, context, repo, access);
   const stranger = { userId: "USTRANGER", teamIds: [] };
+  const writes = repo.writes;
   assert(
-    isPublicTask(task) && canAccessTask(task, stranger) && canEditTask(task, stranger),
+    await rejection(() =>
+      updateTask(task, { priority: 1 }, reply("9.1", stranger.userId), repo, stranger)
+    ) instanceof TaskAccessError,
   );
-  const result = await updateTask(
+  assert(repo.writes === writes);
+  const completed = await updateTask(
     task,
-    { priority: 1 },
-    reply("9.1", stranger.userId),
+    { completed: true },
+    reply("9.2", stranger.userId),
     repo,
     stranger,
   );
-  assert(result.task.priority === 1 && result.task.assignees.length === 0);
+  assert(completed.task.completed);
 });
 
 Deno.test("explicit view and edit permissions grant no creator or assignee bypass", async () => {
@@ -895,14 +911,17 @@ Deno.test("explicit view and edit permissions grant no creator or assignee bypas
       (await listTasks({ kind: "all" }, access, repo)).length === 0,
   );
   const alice = { userId: "UALICE", teamIds: [] };
-  const edited = await updateTask(
-    task,
-    { description: "Visible editor, not an assignee." },
-    reply("9.3", alice.userId),
-    repo,
-    alice,
+  assert(
+    await rejection(() =>
+      updateTask(
+        task,
+        { description: "Visible editor, not an assignee." },
+        reply("9.3", alice.userId),
+        repo,
+        alice,
+      )
+    ) instanceof TaskAccessError,
   );
-  assert(edited.updated && !edited.task.assignees.includes(alice.userId));
 });
 
 Deno.test("viewer and editor groups are independent and revocation fails closed", async () => {
@@ -934,7 +953,16 @@ Deno.test("viewer and editor groups are independent and revocation fails closed"
 
 Deno.test("permission edits may lock out the requester and perms match snapshots viewers", async () => {
   const repo = new MemoryTaskRepository();
-  const { task } = await createTask({ name: "Private" }, context, repo, access);
+  const { task } = await createTask(
+    { name: "Private", assignees: ["UALICE"] },
+    context,
+    repo,
+    access,
+  );
+  await respondToAssignment(task, { kind: "accept" }, reply("9.0", "UALICE"), repo, {
+    userId: "UALICE",
+    teamIds: [],
+  });
   const result = await updateTask(
     task,
     { viewPerms: ["UALICE"], matchPerms: true },
@@ -975,7 +1003,14 @@ Deno.test("configuring legacy editors preserves legacy viewers and match uses ef
     repo,
     access,
   );
-  const legacy = { ...task, viewPerms: undefined, editPerms: undefined };
+  const accepted = await respondToAssignment(
+    task,
+    { kind: "accept" },
+    reply("9.0", "UALICE"),
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
+  const legacy = { ...accepted.task, viewPerms: undefined, editPerms: undefined };
   repo.rows.set(legacy.id, legacy);
   assert(canAccessTask(legacy, access) && canEditTask(legacy, access));
   assert(!canAccessTask(legacy, { userId: "USTRANGER", teamIds: [] }));
@@ -1000,9 +1035,14 @@ Deno.test("configuring legacy editors preserves legacy viewers and match uses ef
   assert(matched.task.editPerms?.join() === "UCREATOR,UALICE");
   assert(effectiveTaskViewPerms(matched.task).join() === "UCREATOR,UALICE");
 
-  const separateTeams = { ...legacy, assignmentBased: false, teams: ["SBACKEND"] };
+  const separateTeams = {
+    ...legacy,
+    assignmentTree: undefined,
+    assignmentBased: false,
+    teams: ["SBACKEND"],
+  };
   await repo.save(separateTeams);
-  const member = { userId: "UMEMBER", teamIds: ["SBACKEND"] };
+  const member = { userId: "UCREATOR", teamIds: ["SBACKEND"] };
   const converted = await updateTask(
     separateTeams,
     { assignees: ["UNEW"] },
@@ -1448,7 +1488,12 @@ Deno.test("legacy delegation history returns a rejection to the previous delegat
 
 Deno.test("adding an assignee in a message records that assigner for rejection hand-back", async () => {
   const repo = new MemoryTaskRepository();
-  const { task } = await createTask({ name: "Assign later" }, context, repo, access);
+  const { task } = await createTask(
+    { name: "Assign later" },
+    { ...context, userId: "UALICE" },
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
   const assigned = await updateTask(
     task,
     { assignees: ["UBOB"] },
@@ -1464,7 +1509,10 @@ Deno.test("adding an assignee in a message records that assigner for rejection h
     { userId: "UBOB", teamIds: [] },
   );
   assert(returned.task.assignees.join() === "UALICE");
-  assert(returned.task.assignmentResponses?.UALICE.returnTo?.join() === "UCREATOR");
+  assert(
+    returned.task.assignmentTree?.nodes[returned.task.assignmentTree.rootId].returned ===
+      true,
+  );
 });
 
 Deno.test("concurrent acceptance of stale fanout snapshots produces exactly one current owner", async () => {
@@ -1616,6 +1664,13 @@ Deno.test("creators administer access while completion and deletion always requi
     access,
   );
   const alice = { userId: "UALICE", teamIds: [] };
+  await respondToAssignment(
+    task,
+    { kind: "accept" },
+    reply("9.0", "UALICE"),
+    repo,
+    alice,
+  );
   const priority = await updateTask(
     task,
     { priority: 1 },
@@ -1721,4 +1776,107 @@ Deno.test("a non-owner cannot reopen accepted ownership through assignment edits
     delegated.task.assignees.join() === "UCAROL" &&
       !delegated.task.assignmentTree?.acceptedBy,
   );
+});
+
+Deno.test("direct self-assignment accepts on creation and updates, while your own squad stays pending", async () => {
+  for (const replace of [false, true]) {
+    const repo = new MemoryTaskRepository();
+    const { task } = await createTask(
+      { name: "Mine", assignees: ["UCREATOR"] },
+      context,
+      repo,
+      access,
+    );
+    assert(task.assignmentTree?.acceptedBy === "UCREATOR");
+    assert(task.assignmentResponses?.UCREATOR.status === "accepted");
+    assert(task.assignmentEvents?.[mutationKey(context)].length === 0);
+    const unassigned = await createTask(
+      { name: "Later" },
+      { ...context, messageTs: "8.1" },
+      repo,
+      access,
+    );
+    const mine = await updateTask(
+      unassigned.task,
+      replace ? { set: { assignees: [] } } : { assignees: [] },
+      reply("9.1"),
+      repo,
+      access,
+    );
+    assert(mine.task.assignmentTree?.acceptedBy === "UCREATOR");
+    assert(mine.task.assignees.join() === "UCREATOR");
+  }
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Squad", assignees: ["SFRONTEND"] },
+    {
+      ...context,
+      groupMembers: { SFRONTEND: ["UCREATOR", "UALICE"] },
+    },
+    repo,
+    access,
+  );
+  assert(!task.assignmentTree?.acceptedBy);
+  assert(task.assignees.join() === "SFRONTEND");
+  assert(task.assignmentEvents?.[mutationKey(context)].join() === "UCREATOR,UALICE");
+  assert(
+    Object.values(task.assignmentTree!.nodes).filter((node) =>
+      node.kind === "user" && node.parentId
+    ).every((node) => node.status === "pending"),
+  );
+});
+
+Deno.test("editing requires creator, accepted ownership, or accepted collaboration, with fresh role checks", async () => {
+  const repo = new MemoryTaskRepository();
+  const { task } = await createTask(
+    { name: "Roles", assignees: ["UALICE"] },
+    context,
+    repo,
+    access,
+  );
+  let seq = 0;
+  const edit = (userId: string, snapshot = task) =>
+    updateTask(snapshot, { priority: 2 }, reply(`10.${++seq}`, userId), repo, {
+      userId,
+      teamIds: [],
+    });
+  const writes = repo.writes;
+  assert(await rejection(() => edit("UALICE")) instanceof TaskAccessError);
+  assert(await rejection(() => edit("UOTHER")) instanceof TaskAccessError);
+  assert(repo.writes === writes);
+  await edit("UCREATOR");
+  await respondToAssignment(task, { kind: "accept" }, reply("11.1", "UALICE"), repo, {
+    userId: "UALICE",
+    teamIds: [],
+  });
+  await edit("UALICE");
+  const invited = await inviteCollaborators(
+    task,
+    ["UBOB", "UCAROL"],
+    reply("11.2", "UALICE"),
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
+  assert(await rejection(() => edit("UBOB", invited.task)) instanceof TaskAccessError);
+  await respondToCollaboration(invited.task, "accept", reply("11.3", "UBOB"), repo, {
+    userId: "UBOB",
+    teamIds: [],
+  });
+  await respondToCollaboration(invited.task, "reject", reply("11.4", "UCAROL"), repo, {
+    userId: "UCAROL",
+    teamIds: [],
+  });
+  await edit("UBOB", invited.task);
+  assert(await rejection(() => edit("UCAROL", invited.task)) instanceof TaskAccessError);
+  await respondToAssignment(
+    task,
+    { kind: "delegate", assignees: ["UDAN"] },
+    reply("11.5", "UALICE"),
+    repo,
+    { userId: "UALICE", teamIds: [] },
+  );
+  assert(await rejection(() => edit("UALICE", task)) instanceof TaskAccessError);
+  // Existing role membership cannot bypass private task visibility.
+  await updateTask(task, { viewPerms: ["UCREATOR"] }, reply("11.6"), repo, access);
+  assert(await rejection(() => edit("UBOB", invited.task)) instanceof TaskAccessError);
 });

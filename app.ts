@@ -23,3 +23,26 @@ ReplyWorkflow.addStep(MessageFunction, {
 });
 
 export default ReplyWorkflow;
+
+/** Slow delegation work runs outside the modal's three-second response window. */
+export const DelegationWorkflow = DefineWorkflow({
+  callback_id: "delebot_delegate",
+  title: "DeleBot delegation",
+  description: "Verify and deliver a submitted task delegation",
+  input_parameters: {
+    properties: {
+      submission: MessageProperties.delegation_submission,
+      channel_id: MessageProperties.channel_id,
+      user_id: MessageProperties.user_id,
+      message_ts: MessageProperties.message_ts,
+    },
+    required: ["submission", "channel_id", "user_id", "message_ts"],
+  },
+});
+DelegationWorkflow.addStep(MessageFunction, {
+  delegation_submission: DelegationWorkflow.inputs.submission,
+  channel_id: DelegationWorkflow.inputs.channel_id,
+  channel_type: "im",
+  user_id: DelegationWorkflow.inputs.user_id,
+  message_ts: DelegationWorkflow.inputs.message_ts,
+});

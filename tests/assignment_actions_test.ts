@@ -1,15 +1,22 @@
 import {
   type AssignmentAction,
+  assignmentBlockActionHandler,
   type AssignmentClient,
   type AssignmentDependencies,
+  type AssignmentSubmission,
   assignmentViewSubmissionHandler,
   handleAssignmentAction,
   handleAssignmentSubmission,
+  productionDependencies,
+  queueDelegationSubmission,
+  runQueuedAssignmentAction,
+  runQueuedDelegation,
 } from "../delebot/slack/actions.ts";
 import {
   ASSIGNMENT_ACCEPT,
   ASSIGNMENT_DELEGATE,
   ASSIGNMENT_REJECT,
+  ASSIGNMENT_RETURN_DELETE,
   invitationValue,
   type NotificationBatch,
   type NotificationStore,
@@ -263,7 +270,8 @@ Deno.test("reject returns a direct assignment to its creator with a fresh invita
   assert(f.invitation("UCREATOR").invitation.status === "pending");
   assert(f.posts.length === 2 && f.posts[1].channel === "DUCREATOR");
   assert(
-    f.posts[1].text.includes("returned to you") && f.posts[1].text.includes("<@UALICE>"),
+    f.posts[1].text.includes("has come back to you") &&
+      f.posts[1].text.includes("*Delete*"),
   );
   assert(JSON.stringify(f.posts[1].blocks).includes("Delegate"));
   assert(
@@ -474,23 +482,60 @@ Deno.test("failed return delivery retries without repeating the rejection or a s
   assert(f.invitation("UCREATOR").invitation.status === "pending");
 });
 
-Deno.test("once the creator accepts a competing assignee cannot reject and create a return", async () => {
+Deno.test("direct self-assignment immediately claims a competing assignment without invitations", async () => {
   const f = await fixture({ assignees: ["UALICE", "UCREATOR"] });
+  assert(f.posts.length === 0);
+  const task = f.repository.rows.get(f.task.id)!;
+  assert(task.assignmentTree?.acceptedBy === "UCREATOR");
+  assert(task.assignees.join() === "UCREATOR");
+  assert(
+    Object.values(task.assignmentTree!.nodes).filter((node) =>
+      node.principalId === "UALICE"
+    ).every((node) => node.status === "cancelled"),
+  );
+});
+
+Deno.test("creator return after a repeated squad member has distinct controls and no old note", async () => {
+  const f = await fixture();
+  f.groups.set("SRETURN", ["UCREATOR"]);
+  assert((await submitRecipients(f, mentions("SRETURN"), "old squad note")).ok);
   assert(
     (await handleAssignmentAction(
-      f.action(ASSIGNMENT_ACCEPT, "UCREATOR"),
+      f.action(ASSIGNMENT_REJECT, "UCREATOR"),
       f.dependencies,
     )).ok,
   );
-  const acceptedInvitation = f.invitation("UCREATOR").invitation.id;
-  assert((await handleAssignmentAction(f.action(ASSIGNMENT_REJECT), f.dependencies)).ok);
-  assert(f.posts.length === 2);
-  assert(f.invitation("UCREATOR").invitation.id === acceptedInvitation);
-  assert(f.invitation("UCREATOR").invitation.status === "accepted");
   assert(
-    f.repository.rows.get(f.task.id)!.assignmentResponses?.UCREATOR.status === "accepted",
+    (await handleAssignmentAction(f.action(ASSIGNMENT_REJECT, "UALICE"), f.dependencies))
+      .ok,
   );
-  assert(f.completed.join() === "FXORIGIN");
+  const task = f.repository.rows.get(f.task.id)!;
+  assert(task.assignmentResponses?.UCREATOR.status === "pending");
+  const post = f.posts.at(-1)!;
+  assert(
+    post.channel === "DUCREATOR" && post.text.includes("Your task") &&
+      post.text.includes("has come back to you"),
+  );
+  assert(!post.text.includes("*Assignees:*") && !post.text.includes("old squad note"));
+  const buttons = JSON.stringify(post.blocks);
+  assert(
+    buttons.includes(ASSIGNMENT_RETURN_DELETE) && buttons.includes(ASSIGNMENT_ACCEPT) &&
+      buttons.includes(ASSIGNMENT_DELEGATE),
+  );
+  assert(!buttons.includes(ASSIGNMENT_REJECT));
+  const deletion = f.action(ASSIGNMENT_RETURN_DELETE, "UCREATOR");
+  assert((await handleAssignmentAction(deletion, f.dependencies)).ok);
+  assert(f.repository.rows.get(f.task.id)!.deleted);
+  assert((await handleAssignmentAction(deletion, f.dependencies)).ok);
+});
+
+Deno.test("creator Delete control cannot delete an ordinary assignment", async () => {
+  const f = await fixture();
+  const result = await handleAssignmentAction(
+    f.action(ASSIGNMENT_RETURN_DELETE),
+    f.dependencies,
+  );
+  assert(!result.ok && !f.repository.rows.get(f.task.id)!.deleted);
 });
 
 Deno.test("combined delegation mentions support people and teams and forward a note once", async () => {
@@ -626,13 +671,18 @@ Deno.test("Slack's submitted rich-text modal payload delegates to a team and for
   }
   const privateMetadata =
     (f.views.at(-1)!.view as { private_metadata: string }).private_metadata;
+  let queued: AssignmentSubmission | undefined;
   const response = await assignmentViewSubmissionHandler(
     {
       client,
       body: { user: { id: "UALICE" }, function_data: { execution_id: "FXORIGIN" } },
       view: {
         id: "V1",
-        private_metadata: privateMetadata,
+        private_metadata: JSON.stringify({
+          ...JSON.parse(privateMetadata),
+          workerUrl: "https://hooks.slack.com/triggers/TTEST/FTEST/secret",
+          channelId: "DUALICE",
+        }),
         state: {
           values: {
             delegation_recipients: {
@@ -648,9 +698,29 @@ Deno.test("Slack's submitted rich-text modal payload delegates to a team and for
         },
       },
     } as unknown as Parameters<typeof assignmentViewSubmissionHandler>[0],
+    (_url, submission) => {
+      queued = submission as AssignmentSubmission;
+      return Promise.resolve();
+    },
   );
   assert(response.response_action === "clear", JSON.stringify(response));
+  assert(queued && (await repository.findById(f.task.id))?.assignees.join() === "UALICE");
+  const dependencies = productionDependencies(
+    client as unknown as Parameters<typeof productionDependencies>[0],
+  );
+  dependencies.deliveryExecutionId = "FXWORKER";
+  const result = await runQueuedDelegation(queued, dependencies);
+  assert(result.ok, JSON.stringify(result));
   assert((await repository.findById(f.task.id))?.assignees.join() === "SBACKEND");
+  const before = f.posts.length;
+  assert((await runQueuedDelegation(queued, dependencies)).ok);
+  assert(f.posts.length === before);
+  const batches = await dependencies.store.get(
+    `${f.task.id}:${
+      Object.keys((await repository.findById(f.task.id))!.assignmentEvents!).at(-1)
+    }`,
+  );
+  assert(batches?.invitations?.UCAROL.executionId === "FXWORKER");
   assert(f.posts.length === 2 && f.posts[1].channel === "DUCAROL");
   assert(f.posts[1].text.includes("*Note:* Please check this today."));
   assert(
@@ -659,4 +729,361 @@ Deno.test("Slack's submitted rich-text modal payload delegates to a team and for
       update.text.includes("*Note:* Please check this today.")
     ),
   );
+});
+
+Deno.test("creator-return Delete follows Access and requests approval without consuming the invitation", async () => {
+  const f = await fixture({ editPerms: ["UMANAGER"] });
+  assert((await handleAssignmentAction(f.action(ASSIGNMENT_REJECT), f.dependencies)).ok);
+  const deletion = f.action(ASSIGNMENT_RETURN_DELETE, "UCREATOR");
+  assert((await handleAssignmentAction(deletion, f.dependencies)).ok);
+  let task = f.repository.rows.get(f.task.id)!;
+  assert(!task.deleted && !task.assignmentTree?.deleted);
+  assert(f.invitation("UCREATOR").invitation.status === "pending");
+  assert(
+    Object.values(task.participation!.requests).some((request) =>
+      request.kind === "delete" && request.status === "pending"
+    ),
+  );
+  assert(
+    f.posts.some((post) =>
+      post.channel === "DUMANAGER" && post.text.includes("deletion")
+    ),
+  );
+  const posts = f.posts.length;
+  assert((await handleAssignmentAction(deletion, f.dependencies)).ok);
+  task = f.repository.rows.get(f.task.id)!;
+  assert(
+    Object.keys(task.participation!.requests).length === 1 && f.posts.length === posts,
+  );
+});
+
+async function queuedForm(f: Awaited<ReturnType<typeof fixture>>, ...targets: string[]) {
+  f.dependencies.delegationEndpoint = () =>
+    Promise.resolve("https://hooks.slack.com/triggers/TTEST/FTEST/secret");
+  assert(
+    (await handleAssignmentAction(f.action(ASSIGNMENT_DELEGATE), f.dependencies)).ok,
+  );
+  return {
+    privateMetadata:
+      (f.views.at(-1)!.view as { private_metadata: string }).private_metadata,
+    userId: "UALICE",
+    viewId: `V${f.views.length}`,
+    executionId: "FXORIGIN",
+    recipients: mentions(...targets),
+    note: "Check this with the squad.",
+  };
+}
+
+Deno.test("modal handoff finishes before slow team verification and the queued workflow sends invitations", async () => {
+  const f = await fixture();
+  const submission = await queuedForm(f, "SFRONTEND");
+  let handoffs = 0;
+  assert(
+    (await queueDelegationSubmission(submission, () => {
+      handoffs++;
+      return Promise.resolve();
+    })).ok,
+  );
+  assert(
+    handoffs === 1 && f.repository.rows.get(f.task.id)!.assignees.join() === "UALICE",
+  );
+  let release!: () => void;
+  let reached!: () => void;
+  const slow = new Promise<void>((resolve) => release = resolve);
+  const started = new Promise<void>((resolve) => reached = resolve);
+  const list = f.client.usergroups.users.list;
+  f.client.usergroups.users.list = async (args) => {
+    reached();
+    await slow;
+    return await list(args);
+  };
+  f.dependencies.deliveryExecutionId = "FXWORKER";
+  const work = runQueuedDelegation(submission, f.dependencies);
+  await started;
+  assert(
+    f.posts.length === 1,
+    "The modal already closed while team verification is still waiting",
+  );
+  release();
+  assert((await work).ok);
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "SFRONTEND");
+  assert(f.invitation("UALICE").invitation.executionId === "FXWORKER");
+  assert(f.invitation("UBOB").invitation.executionId === "FXWORKER");
+  assert(
+    !f.repository.rows.get(f.task.id)!.assignmentTree?.acceptedBy,
+    "Own-squad delegation must stay pending",
+  );
+  assert(
+    f.completed.length === 0,
+    "The worker must not complete the source execution using its token",
+  );
+});
+
+Deno.test("queued squad delegation waits for all rejections and returns through its delegator to the creator", async () => {
+  const f = await fixture();
+  const submission = await queuedForm(f, "SFRONTEND");
+  f.dependencies.deliveryExecutionId = "FXWORKER";
+  assert((await runQueuedDelegation(submission, f.dependencies)).ok);
+  delete f.dependencies.deliveryExecutionId;
+  assert(
+    (await handleAssignmentAction(f.action(ASSIGNMENT_REJECT, "UALICE"), f.dependencies))
+      .ok,
+  );
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "SFRONTEND");
+  assert(![...f.rows.values()].some((batch) => batch.invitations?.UCREATOR));
+  assert(
+    (await handleAssignmentAction(f.action(ASSIGNMENT_REJECT, "UBOB"), f.dependencies))
+      .ok,
+  );
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UALICE");
+  assert(f.invitation("UALICE").invitation.status === "pending");
+  assert(
+    (await handleAssignmentAction(f.action(ASSIGNMENT_REJECT, "UALICE"), f.dependencies))
+      .ok,
+  );
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UCREATOR");
+  assert(f.posts.at(-1)!.text.includes("has come back to you"));
+  assert(JSON.stringify(f.posts.at(-1)!.blocks).includes(ASSIGNMENT_RETURN_DELETE));
+});
+
+Deno.test("queued mixed team and person delegation selects one owner and closes competing controls", async () => {
+  const f = await fixture();
+  const submission = await queuedForm(f, "SFRONTEND", "UCAROL");
+  f.dependencies.deliveryExecutionId = "FXWORKER";
+  assert((await runQueuedDelegation(submission, f.dependencies)).ok);
+  delete f.dependencies.deliveryExecutionId;
+  const stale = f.action(ASSIGNMENT_DELEGATE, "UCAROL");
+  assert(
+    (await handleAssignmentAction(f.action(ASSIGNMENT_ACCEPT, "UBOB"), f.dependencies))
+      .ok,
+  );
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UBOB");
+  assert(f.invitation("UCAROL").invitation.closedBy === "UBOB");
+  await handleAssignmentAction(stale, f.dependencies);
+  assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UBOB");
+  assert(f.completed.includes("FXWORKER"));
+});
+
+Deno.test("modal validates empty recipients and handoff failures without changing the task", async () => {
+  const f = await fixture();
+  const submission = await queuedForm(f, "UBOB");
+  let dispatches = 0;
+  const dispatch = () => {
+    dispatches++;
+    return Promise.reject(new Error("network unavailable"));
+  };
+  assert(
+    !(await queueDelegationSubmission(
+      { ...submission, recipients: mentions() },
+      dispatch,
+    )).ok,
+  );
+  assert(dispatches === 0);
+  const failure = await queueDelegationSubmission(submission, dispatch);
+  assert(!failure.ok && failure.error?.includes("Retry Delegate"));
+  assert(
+    Number(dispatches) === 1 &&
+      f.repository.rows.get(f.task.id)!.assignees.join() === "UALICE",
+  );
+  assert(f.invitation().invitation.status === "pending");
+});
+
+Deno.test("queued delegation rechecks visibility and rejects forged or superseded forms", async () => {
+  const f = await fixture({ viewPerms: ["UALICE"] });
+  const submission = await queuedForm(f, "UCAROL");
+  f.dependencies.deliveryExecutionId = "FXWORKER";
+  const writes = f.repository.writes;
+  const denied = await runQueuedDelegation(submission, f.dependencies);
+  assert(!denied.ok && f.repository.writes === writes);
+  assert(
+    f.posts.at(-1)!.channel === "DUALICE" &&
+      f.posts.at(-1)!.thread_ts === f.invitation().invitation.messageTs,
+  );
+  const posts = f.posts.length;
+  assert(
+    !(await runQueuedDelegation({ ...submission, userId: "UFORGED" }, f.dependencies)).ok,
+  );
+  assert(f.posts.length === posts && f.repository.writes === writes);
+  await queuedForm(f, "UBOB");
+  assert(!(await runQueuedDelegation(submission, f.dependencies)).ok);
+  assert(f.posts.length === posts && f.repository.writes === writes);
+});
+
+Deno.test("concurrent webhook retries share a mutation and never duplicate team delegation or invitations", async () => {
+  const f = await fixture();
+  const submission = await queuedForm(f, "SFRONTEND");
+  const results = await Promise.all([
+    runQueuedDelegation(submission, {
+      ...f.dependencies,
+      deliveryExecutionId: "FXWORKERONE",
+    }),
+    runQueuedDelegation(submission, {
+      ...f.dependencies,
+      deliveryExecutionId: "FXWORKERTWO",
+    }),
+  ]);
+  assert(results.every((result) => result.ok), JSON.stringify(results));
+  assert(f.repository.writes === 2, "Creation and exactly one delegation are saved");
+  assert(
+    f.posts.length === 3,
+    "Original invitation and two deduplicated squad invitations",
+  );
+  const task = f.repository.rows.get(f.task.id)!;
+  assert(
+    Object.values(task.assignmentTree!.nodes).filter((node) => node.kind === "team")
+      .length === 1,
+  );
+});
+
+Deno.test("a failed delegation workflow setup leaves the task untouched and gives actionable recovery", async () => {
+  const f = await fixture();
+  f.dependencies.delegationEndpoint = () => Promise.reject(new Error("missing_scope"));
+  const result = await handleAssignmentAction(
+    f.action(ASSIGNMENT_DELEGATE),
+    f.dependencies,
+  );
+  assert(!result.ok && result.error?.includes("updated app permissions"));
+  assert(
+    f.repository.writes === 1 && f.views.length === 0 &&
+      f.invitation().invitation.status === "pending",
+  );
+});
+
+Deno.test("serialized Slack stores preserve X to Y to X rejections and creator Delete across worker executions", async () => {
+  const f = await fixture();
+  const records = new Map<string, Map<string, Record<string, unknown>>>();
+  const dataClient = {
+    apps: {
+      datastore: {
+        put: (
+          { datastore, item }: { datastore: string; item: Record<string, unknown> },
+        ) => {
+          if (!records.has(datastore)) records.set(datastore, new Map());
+          records.get(datastore)!.set(item.id as string, structuredClone(item));
+          return Promise.resolve({ ok: true });
+        },
+        get: ({ datastore, id }: { datastore: string; id: string }) =>
+          Promise.resolve({
+            ok: true,
+            item: structuredClone(records.get(datastore)?.get(id) ?? {}),
+          }),
+        query: ({ datastore }: { datastore: string }) =>
+          Promise.resolve({
+            ok: true,
+            items: [...records.get(datastore)?.values() ?? []],
+          }),
+      },
+    },
+  };
+  const repository = new SlackTaskRepository(dataClient);
+  await repository.save(f.task);
+  const persisted = new SlackNotificationStore(dataClient);
+  for (const batch of f.rows.values()) await persisted.save(batch);
+  f.dependencies.repository = repository;
+  f.dependencies.store = {
+    get: (id) => persisted.get(id),
+    save: async (batch) => {
+      await persisted.save(batch);
+      f.rows.set(batch.id, structuredClone(batch));
+    },
+  };
+  // Slack reports no-op updates and already-removed messages as errors rather
+  // than returning ok:true as the simpler client does.
+  const removed = new Set<string>();
+  f.client.chat.delete = (args) => {
+    const key = `${args.channel}:${args.ts}`;
+    const missing = removed.has(key);
+    removed.add(key);
+    return Promise.resolve(
+      missing ? { ok: false, error: "message_not_found" } : { ok: true },
+    );
+  };
+  f.client.chat.update = (args) =>
+    Promise.resolve(
+      removed.has(`${args.channel}:${args.ts}`)
+        ? { ok: false, error: "message_not_found" }
+        : { ok: false, error: "message_not_modified" },
+    );
+  const submission = await queuedForm(f, "UCREATOR");
+  f.dependencies.deliveryExecutionId = "FXDELEGATE";
+  assert((await runQueuedDelegation(submission, f.dependencies)).ok);
+  f.dependencies.deliveryExecutionId = "FXREJECTX";
+  const xReject = f.action(ASSIGNMENT_REJECT, "UCREATOR");
+  assert((await runQueuedAssignmentAction(xReject, f.dependencies)).ok);
+  assert((await repository.findById(f.task.id))!.assignees.join() === "UALICE");
+  f.dependencies.deliveryExecutionId = "FXREJECTY";
+  assert(
+    (await runQueuedAssignmentAction(
+      f.action(ASSIGNMENT_REJECT, "UALICE"),
+      f.dependencies,
+    )).ok,
+  );
+  const returned = (await repository.findById(f.task.id))!;
+  assert(returned.assignees.join() === "UCREATOR" && !returned.deleted);
+  assert(f.invitation("UCREATOR").invitation.creatorReturn);
+  // Retrying an earlier rejection must never reject the new creator generation.
+  assert((await runQueuedAssignmentAction(xReject, f.dependencies)).ok);
+  assert(!(await repository.findById(f.task.id))!.deleted);
+  f.dependencies.deliveryExecutionId = "FXDELETE";
+  const deletion = f.action(ASSIGNMENT_RETURN_DELETE, "UCREATOR");
+  assert((await runQueuedAssignmentAction(deletion, f.dependencies)).ok);
+  assert((await repository.findById(f.task.id))!.deleted);
+  assert((await runQueuedAssignmentAction(deletion, f.dependencies)).ok);
+});
+
+Deno.test("Slack Reject and creator Delete callbacks hand off before task mutation, then complete in fresh workflows", async () => {
+  const f = await fixture();
+  const client = {
+    ...f.client,
+    apps: {
+      datastore: {
+        get: () =>
+          Promise.resolve({
+            ok: true,
+            item: { url: "https://hooks.slack.com/triggers/TTEST/FTEST/secret" },
+          }),
+      },
+    },
+  };
+  let queued: { kind: string; action: AssignmentAction } | undefined;
+  for (
+    const [index, actionId, userId] of [[1, ASSIGNMENT_REJECT, "UALICE"], [
+      2,
+      ASSIGNMENT_RETURN_DELETE,
+      "UCREATOR",
+    ]] as const
+  ) {
+    const action = f.action(actionId, userId);
+    const before = f.repository.writes;
+    await assignmentBlockActionHandler(
+      {
+        client,
+        action: {
+          action_id: action.actionId,
+          value: action.value,
+          action_ts: action.actionTs,
+        },
+        body: {
+          user: { id: userId },
+          container: { channel_id: action.channelId, message_ts: action.messageTs },
+          function_data: { execution_id: action.executionId },
+          interactivity: { interactivity_pointer: "pointer" },
+        },
+      } as unknown as Parameters<typeof assignmentBlockActionHandler>[0],
+      (_url, payload) => {
+        queued = payload as typeof queued;
+        return Promise.resolve();
+      },
+    );
+    assert(
+      queued?.kind === "assignment_action" && f.repository.writes === before,
+      "The Slack callback must not wait for mutation or cleanup",
+    );
+    const result = await runQueuedAssignmentAction(queued.action, {
+      ...f.dependencies,
+      deliveryExecutionId: `FXACTION${index}`,
+    });
+    assert(result.ok, JSON.stringify(result));
+  }
+  assert(f.repository.rows.get(f.task.id)!.deleted);
 });

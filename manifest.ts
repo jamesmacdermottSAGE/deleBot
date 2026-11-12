@@ -1,5 +1,6 @@
 import { Manifest } from "deno-slack-sdk/mod.ts";
-import ReplyWorkflow from "./app.ts";
+import ReplyWorkflow, { DelegationWorkflow } from "./app.ts";
+import { DelegationDispatchDatastore } from "./delebot/slack/delegation_dispatch.ts";
 import { APP_NAME } from "./delebot/config.ts";
 import { TasksDatastore } from "./delebot/db.ts";
 import { DmContextsDatastore } from "./delebot/slack/dm_context.ts";
@@ -16,16 +17,18 @@ export default Manifest({
       messagesTabReadOnlyEnabled: false,
     },
   },
-  workflows: [ReplyWorkflow],
+  workflows: [ReplyWorkflow, DelegationWorkflow],
   datastores: [
     TasksDatastore,
+    DelegationDispatchDatastore,
     AssignmentNotificationsDatastore,
     DmContextsDatastore,
     TaskDisplaysDatastore,
   ],
-  outgoingDomains: [],
+  outgoingDomains: ["hooks.slack.com"],
   botScopes: [
     "commands",
+    "triggers:write",
     "chat:write",
     "channels:history",
     "channels:read",

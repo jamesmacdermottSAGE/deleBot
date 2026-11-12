@@ -59,7 +59,7 @@ Deno.test("assignment decisions retain history and delegation repeats the pendin
     repo,
     access,
   );
-  assert(formatTask(task).includes("<@UALICE> ⏳ Pending"));
+  assert(formatTask(task).includes("<@UALICE> ✅ Accepted"));
   const delegated = await respondToAssignment(
     task,
     { kind: "delegate", assignees: ["UBOB"] },
@@ -85,7 +85,7 @@ Deno.test("assignment decisions retain history and delegation repeats the pendin
   );
   assert(
     !rejected.task.assignees.includes("UBOB") &&
-      formatTask(rejected.task).includes("<@UBOB> ❌ Rejected"),
+      formatTask(rejected.task).includes("*Declined:* <@UBOB>"),
   );
   const again = await updateTask(
     rejected.task,

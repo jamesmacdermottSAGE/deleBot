@@ -26,8 +26,25 @@ function mention(userId: string): string {
 function assignees(task: Task, teamNames: Record<string, string>): string {
   if (task.assignmentTree) {
     const tree = task.assignmentTree;
-    const render = (id: string, depth = 0): string => {
+    if (tree.acceptedBy) return `${mention(tree.acceptedBy)} ✅ Accepted`;
+    const active = new Map<string, boolean>();
+    const live = (id: string): boolean => {
+      if (active.has(id)) return active.get(id)!;
+      const n = tree.nodes[id];
+      const value = n.status === "pending" || n.status === "accepted" ||
+        (n.status === "delegated" && n.children.some(live));
+      active.set(id, value);
+      return value;
+    };
+    const lines: string[] = [];
+    let hidden = 0;
+    const render = (id: string, depth = 0): void => {
+      if (!live(id)) return;
       const node = tree.nodes[id];
+      if (lines.length >= 12) {
+        hidden++;
+        return;
+      }
       const label = node.kind === "team"
         ? escapeText(
           teamNames[node.principalId]
@@ -35,27 +52,16 @@ function assignees(task: Task, teamNames: Record<string, string>): string {
             : `Team ${node.principalId}`,
         )
         : mention(node.principalId);
-      const state = node.status === "accepted"
-        ? "✅ Accepted"
-        : node.status === "rejected"
-        ? "❌ Rejected"
-        : node.status === "cancelled"
-        ? (tree.acceptedBy
-          ? `Closed — accepted by ${mention(tree.acceptedBy)}`
-          : "Closed")
-        : node.status === "delegated"
-        ? "↪️ Delegated"
-        : "⏳ Pending";
-      return `${"  ".repeat(depth)}${label} ${state}${
-        node.children.length
-          ? "\n" + node.children.map((child) => render(child, depth + 1)).join("\n")
-          : ""
-      }`;
+      const state = node.status === "delegated" ? "↪️ Delegated" : "⏳ Pending";
+      lines.push(`${"  ".repeat(Math.min(depth, 2))}${label} ${state}`);
+      for (const child of node.children) render(child, depth + 1);
     };
     const root = tree.nodes[tree.rootId];
-    return root.status === "delegated" && !root.returned && !root.explicit
-      ? root.children.map((id) => render(id)).join("\n")
-      : render(root.id);
+    if (root.status === "delegated" && !root.returned && !root.explicit) {
+      for (const child of root.children) render(child);
+    } else render(root.id);
+    if (hidden) lines.push(`… ${hidden} more branches`);
+    return lines.join("\n");
   }
   const ids = task.assignmentBased
     ? task.assignees
@@ -88,6 +94,31 @@ function assignees(task: Task, teamNames: Record<string, string>): string {
   const lines = nodes.filter((id) => !targets.has(id)).map(render).filter(Boolean);
   for (const id of nodes) if (!visited.has(id)) lines.push(render(id));
   return lines.join("\n");
+}
+
+/** Summarize historical declines once per person, outside the current assignees. */
+function declinedSummary(task: Task): string[] {
+  if (!task.assignmentTree) return [];
+  const nodes = Object.values(task.assignmentTree.nodes);
+  const current = new Set(
+    nodes.filter((n) => n.status === "pending" || n.status === "accepted").map((n) =>
+      n.principalId
+    ),
+  );
+  const counts = new Map<string, number>();
+  for (const n of nodes) {
+    if (n.kind === "user" && n.status === "rejected" && !current.has(n.principalId)) {
+      counts.set(n.principalId, (counts.get(n.principalId) ?? 0) + 1);
+    }
+  }
+  if (!counts.size) return [];
+  const entries = [...counts];
+  const text = entries.slice(0, 5).map(([id, count]) =>
+    `${mention(id)}${count > 1 ? ` ×${count}` : ""}`
+  ).join(", ");
+  return [
+    `*Declined:* ${text}${entries.length > 5 ? `, +${entries.length - 5} others` : ""}`,
+  ];
 }
 
 function permissions(
@@ -123,9 +154,7 @@ export function formatTask(task: Task, teamNames: Record<string, string> = {}): 
   return [
     `*Task #${task.number}: ${escapeText(task.name)}*`,
     `*Assignees:* ${assignees(task, teamNames)}`,
-    ...(task.assignmentTree?.acceptedBy
-      ? [`*Accepted by:* ${mention(task.assignmentTree.acceptedBy)}`]
-      : []),
+    ...declinedSummary(task),
     ...(task.participation &&
         Object.entries(task.participation.collaborators).some(([, entry]) =>
           entry.status === "accepted"

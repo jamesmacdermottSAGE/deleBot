@@ -7,8 +7,8 @@ import { taskAccessLoader } from "./access_context.ts";
 import {
   assignmentBlocks,
   type AssignmentInvitation,
+  assignmentInvitationDetails,
   assignmentNotificationText,
-  escapeNotificationText,
   type MessageBlocks,
   type NotificationBatch,
   SlackNotificationStore,
@@ -337,19 +337,23 @@ export class SlackTaskDisplays implements TaskDisplays {
         }
         // Also repairs invitations whose blocks were removed by the previous
         // refresh implementation, retaining their original recipient binding.
-        const returnedBy = invitation.returnedBy ??
-          task.assignmentResponses?.[invitation.recipientId]?.returnedBy;
-        const note = invitation.note ??
-          task.assignmentResponses?.[invitation.recipientId]?.note;
-        const text = returnedBy
-          ? assignmentNotificationText(task, invitation.recipientId, invitation)
-          : formatTask(task, access.teamNames) +
-            (note?.trim() ? `\n\n*Note:* ${escapeNotificationText(note.trim())}` : "");
+        const details = assignmentInvitationDetails(
+          task,
+          invitation.recipientId,
+          batch.invitationKeys,
+        );
+        const contextualInvitation = { ...invitation, ...details };
+        const text = assignmentNotificationText(
+          task,
+          invitation.recipientId,
+          contextualInvitation,
+          access.teamNames,
+        );
         const result = await this.client.chat.update({
           channel: invitation.channelId!,
           ts: invitation.messageTs!,
           text,
-          blocks: assignmentBlocks(text, batch, invitation),
+          blocks: assignmentBlocks(text, batch, contextualInvitation),
           unfurl_links: false,
           unfurl_media: false,
         });

@@ -5,6 +5,7 @@ import {
   ASSIGNMENT_ACCEPT,
   ASSIGNMENT_DELEGATE,
   ASSIGNMENT_REJECT,
+  ASSIGNMENT_RETURN_DELETE,
   type MessageBlocks,
   type NotificationBatch,
   notifyTaskAssignments,
@@ -147,16 +148,41 @@ Deno.test("short confirmations stored as conversation context are never promoted
   assert(!f.updates.some((entry) => entry.ts === "99.1"));
 });
 
-for (const variant of ["person", "team", "returned", "note"]) {
+for (const variant of ["person", "team", "returned", "note", "creator-return"]) {
   const teamAssignment = variant === "team";
   Deno.test(`refresh preserves and repairs pending ${variant} invitation buttons recovered from DM context`, async () => {
     const repo = new MemoryTaskRepository();
-    const { task } = await createTask(
+    let { task } = await createTask(
       { name: "Invite", assignees: [teamAssignment ? "SJSQUAD" : "UALICE"] },
       { channelId: "DTEST", messageTs: "1.1", userId: "UCREATOR" },
       repo,
       { userId: "UCREATOR", teamIds: [] },
     );
+    if (variant === "creator-return") {
+      for (
+        const [userId, kind, extra] of [
+          ["UALICE", "delegate", { assignees: ["SJSQUAD"], note: "old squad note" }],
+          ["UCREATOR", "reject", {}],
+          ["UALICE", "reject", {}],
+        ] as Array<
+          [string, "delegate" | "reject", { assignees?: string[]; note?: string }]
+        >
+      ) {
+        task = (await respondToAssignment(
+          task,
+          { kind, ...extra },
+          {
+            channelId: "DTEST",
+            messageTs: `2.${task.appliedEvents!.length}`,
+            userId,
+            groupMembers: { SJSQUAD: ["UCREATOR"] },
+          },
+          repo,
+          { userId, teamIds: ["SJSQUAD"] },
+        )).task;
+      }
+      assert(task.assignmentResponses?.UCREATOR.status === "pending");
+    }
     if (variant === "returned") {
       task.assignmentResponses!.UALICE = {
         status: "pending",
@@ -257,13 +283,20 @@ for (const variant of ["person", "team", "returned", "note"]) {
     );
     assert(result.interactive && posts === 1);
     const originalText = messages.get("DALICE:10.1")!.text;
+    if (variant === "creator-return") {
+      assert(
+        originalText.includes("has come back to you") &&
+          originalText.includes("*Delete*"),
+      );
+      assert(!originalText.includes("old squad note"));
+    }
     const originalButtons = JSON.stringify(messages.get("DALICE:10.1")!.blocks);
     const displays = taskDisplays(
       client as unknown as Parameters<typeof taskDisplays>[0],
     );
     await displays.track(task.id, "DCREATOR", "11.1", "UCREATOR");
     assert(await displays.refresh(task) === 0);
-    if (variant === "returned") {
+    if (variant === "returned" || variant === "creator-return") {
       assert(messages.get("DALICE:10.1")!.text === originalText);
       assert(!originalText.includes("*Assignees:*"));
     }
@@ -280,8 +313,18 @@ for (const variant of ["person", "team", "returned", "note"]) {
         assert(!messages.get(key)!.text.includes("Team SJSQUAD"));
       }
     }
+    assert(
+      messages.get("DALICE:10.1")!.text === originalText,
+      "Initial invitations and refreshed invitations must use the same message",
+    );
     const after = JSON.stringify(messages.get("DALICE:10.1")!.blocks);
-    for (const action of [ASSIGNMENT_ACCEPT, ASSIGNMENT_REJECT, ASSIGNMENT_DELEGATE]) {
+    for (
+      const action of [
+        ASSIGNMENT_ACCEPT,
+        variant === "creator-return" ? ASSIGNMENT_RETURN_DELETE : ASSIGNMENT_REJECT,
+        ASSIGNMENT_DELEGATE,
+      ]
+    ) {
       assert(after.includes(action));
     }
     const originalValue = JSON.parse(originalButtons)[1].elements[0].value;
@@ -289,7 +332,7 @@ for (const variant of ["person", "team", "returned", "note"]) {
     // Reproduce the old version stripping the controls, then recover on a list refresh.
     messages.set("DALICE:10.1", { text: "Plain task card", blocks: [] });
     assert(await displays.refresh(task) === 0);
-    if (variant === "returned") {
+    if (variant === "returned" || variant === "creator-return") {
       assert(messages.get("DALICE:10.1")!.text === originalText);
     }
     if (variant === "note") {

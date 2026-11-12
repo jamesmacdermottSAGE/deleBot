@@ -1,3 +1,10 @@
+import { delegationEndpoint } from "./delegation_dispatch.ts";
+import {
+  productionDependencies,
+  runQueuedAssignmentAction,
+  runQueuedDelegation,
+} from "./actions.ts";
+import type { AssignmentSubmission } from "./actions.ts";
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 import { resetTaskDatabase } from "../tasks/reset.ts";
 import { clearDmHistory } from "./clear.ts";
@@ -807,6 +814,7 @@ export async function handleMessage(
 }
 
 export const MessageProperties = {
+  delegation_submission: { type: Schema.types.string },
   channel_id: { type: Schema.slack.types.channel_id },
   channel_type: { type: Schema.types.string },
   user_id: { type: Schema.slack.types.user_id },
@@ -837,8 +845,34 @@ export const MessageFunction = DefineFunction({
 
 export default SlackFunction(MessageFunction, async ({ inputs, client, event, env }) => {
   try {
+    if (inputs.delegation_submission) {
+      const payload = JSON.parse(inputs.delegation_submission);
+      const dependencies = productionDependencies(client);
+      dependencies.deliveryExecutionId = event.function_execution_id;
+      let result;
+      if (payload?.kind === "assignment_action") {
+        const action = payload.action;
+        if (
+          !action || action.userId !== inputs.user_id ||
+          typeof action.value !== "string" || typeof action.actionId !== "string"
+        ) return { error: "Invalid assignment response." };
+        result = await runQueuedAssignmentAction(action, dependencies);
+      } else {
+        const submission = payload as AssignmentSubmission;
+        if (
+          !submission || submission.userId !== inputs.user_id ||
+          typeof submission.privateMetadata !== "string" ||
+          typeof submission.executionId !== "string" ||
+          typeof submission.viewId !== "string"
+        ) return { error: "Invalid delegation submission." };
+        result = await runQueuedDelegation(submission, dependencies);
+      }
+      if (result.interactive) return { completed: false };
+      return { outputs: { ignored: !result.ok } };
+    }
     const repository = new SlackTaskRepository(client);
     const directory = new SlackTeamDirectory(client);
+    let delegationReady: Promise<string> | undefined;
     const result = await handleMessage(
       inputs,
       client,
@@ -848,6 +882,9 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event, en
         client,
         store: new SlackNotificationStore(client),
         context: {
+          prepareInteractivity: async () => {
+            await (delegationReady ??= delegationEndpoint(client));
+          },
           loadTask: (id) => repository.findById(id),
           rememberTask: async (channel, ts, user, id) => {
             const store = new SlackDmContexts(client);

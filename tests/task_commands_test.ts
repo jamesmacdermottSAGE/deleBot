@@ -360,6 +360,16 @@ Deno.test("assignment values include users, teams, all, and explicit self assign
     patch: { assignees: ["all"] },
   });
   equal(parseTaskCommand("assign -"), { kind: "update", patch: { assignees: [] } });
+  equal(parseTaskCommand("assign me"), { kind: "update", patch: { assignees: [] } });
+  equal(parseTaskCommand("edit assign me"), {
+    kind: "update",
+    patch: { set: { assignees: [] } },
+  });
+  equal(parseTaskCommand("task Personal assign me"), {
+    kind: "create",
+    name: "Personal",
+    patch: { assignees: [] },
+  });
   for (
     const text of [
       "assign",

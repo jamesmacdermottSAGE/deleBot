@@ -1,3 +1,7 @@
+import {
+  createAssignmentTree,
+  respondInAssignmentTree,
+} from "../delebot/tasks/assignment_tree.ts";
 import type { Task } from "../delebot/tasks/models.ts";
 import { TASK_CREATE_USAGE } from "../delebot/tasks/commands.ts";
 import {
@@ -286,4 +290,52 @@ Deno.test("general help is brief and introduces task creation and listing", () =
     assert(GREETING.includes(command), `Missing brief help: ${command}`);
   }
   assert(GREETING.includes("direct and team assignments"));
+});
+
+Deno.test("accepted cards collapse long repeated rejection chains into one owner and bounded decline summary", () => {
+  let tree = createAssignmentTree("UCREATOR", ["UALICE"]);
+  for (let round = 0; round < 30; round++) {
+    tree = respondInAssignmentTree(tree, { userId: "UALICE", kind: "reject" }).tree;
+    if (round < 29) {
+      tree = respondInAssignmentTree(tree, {
+        userId: "UCREATOR",
+        kind: "delegate",
+        assignees: ["UALICE"],
+      }).tree;
+    }
+  }
+  tree = respondInAssignmentTree(tree, { userId: "UCREATOR", kind: "accept" }).tree;
+  const text = formatTask(
+    task({
+      createdBy: "UCREATOR",
+      assignees: ["UCREATOR"],
+      teams: [],
+      assignmentBased: true,
+      assignmentTree: tree,
+    }),
+  );
+  assert(text.includes("*Assignees:* <@UCREATOR> ✅ Accepted"));
+  assert(text.includes("*Declined:* <@UALICE> ×30"));
+  assert(!text.includes("*Accepted by:*"));
+  assert((text.match(/<@UALICE>/g) ?? []).length === 1 && text.length < 1000);
+});
+
+Deno.test("partial squad rejection stays visible in a separate decline summary", () => {
+  let tree = createAssignmentTree("UCREATOR", ["SFRONTEND"], {
+    SFRONTEND: ["UALICE", "UBOB"],
+  });
+  tree = respondInAssignmentTree(tree, { userId: "UALICE", kind: "reject" }).tree;
+  const text = formatTask(
+    task({
+      assignees: ["SFRONTEND"],
+      teams: ["SFRONTEND"],
+      assignmentBased: true,
+      assignmentTree: tree,
+    }),
+    { SFRONTEND: "frontend" },
+  );
+  assert(text.includes("@frontend ↪️ Delegated") && text.includes("<@UBOB> ⏳ Pending"));
+  assert(
+    text.includes("*Declined:* <@UALICE>") && !text.includes("<@UALICE> ❌ Rejected"),
+  );
 });

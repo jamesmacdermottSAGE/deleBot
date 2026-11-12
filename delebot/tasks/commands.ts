@@ -35,15 +35,15 @@ export const TASK_CREATE_USAGE = [
   "Use print in a task's thread to reprint its latest details, or 123 print elsewhere. Thread edits use short confirmations and update existing cards automatically.",
   "💬 *Create:* `task Name` in your DM with DeleBot; no bot mention needed. In a channel, start with @DeleBot. A name is required; other fields are optional and tasks start unassigned. Example: `task Review PRs assign @person @team p 1 due 6/11/26`.",
   "*Fields:* `assign @person @team`, `desc text`, `p 1` (highest) through `p 5`, `due 6/11/26` (day/month/year), `link https://…`, `jira https://…`, `github https://…`, and `access @person @team` or `access all`.",
-  "*Assignments:* `assign @person @team` adds assignees, `assign -` assigns yourself, and `assign all` replaces specific assignees with everyone. Select people from Slack's @ menu; type `teams` to find team handles you can type directly. Assigning a team sends each current member who can view the task an invitation DM; overlapping recipients receive one invitation per assignment event. Assigning all does not send invitations to everyone.",
-  "*Respond and delegate:* reply with `accept`, `reject`, `delegate @person @team`, or use the Accept / Reject / Delegate buttons. A number also works, e.g. `123 accept`. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. Delegation changes only your branch; siblings stay pending. A squad snapshots its members when invited and returns only after every member's branch rejects. Returns unwind one delegator at a time; if the creator rejects the returned task, it is deleted. One acceptance selects the single owner and closes all competing invitations with an accepted-by message. Other people cannot claim or reassign an owned task. Only the owner can delegate it further.",
+  "*Assignments:* `assign @person @team` adds assignees, `assign me` (or `assign -`) assigns yourself and accepts automatically; assigning your own team stays pending, and `assign all` replaces specific assignees with everyone. Select people from Slack's @ menu; type `teams` to find team handles you can type directly. Assigning a team sends each current member who can view the task an invitation DM; overlapping recipients receive one invitation per assignment event. Assigning all does not send invitations to everyone.",
+  "*Respond and delegate:* reply with `accept`, `reject`, `delegate @person @team`, or use the Accept / Reject / Delegate buttons. A number also works, e.g. `123 accept`. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. Delegation changes only your branch; siblings stay pending. A squad snapshots its members when invited and returns only after every member's branch rejects. Returns unwind one delegator at a time; the creator receives a distinct return message with Accept / Delete / Delegate choices. One acceptance selects the single owner and closes all competing invitations with an accepted-by message. Other people cannot claim or reassign an owned task. Only the owner can delegate it further.",
   "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
   '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
   "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
   "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
   "*Clear chat:* `clear` in a DM clears that chat; in a DM thread it clears only that thread. Large histories run in resumable batches: repeat clear when prompted. Your messages require your Slack user authorization to delete; without it only bot messages are removed. Saved tasks are unchanged.",
   "*Complete:* `done` or `work done` completes a task. `edit completed no` reopens it. Reply in the task's thread or specify its number, e.g. `123 done`. Bare done also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
-  "*Access:* `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Creators and current access holders administer access. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
+  "*Access:* `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Only the creator, accepted assignee, or accepted collaborators can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
   "*Collaborate:* the accepted owner can use `collab @person` to send a separate collaboration invitation. Recipients use its buttons or `collab accept` / `collab reject` in the task thread. `ls collab` lists accepted collaborations; collaborators are not assignees.",
   "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
@@ -373,15 +373,15 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
     const target: TaskSet = replacing && key ? patch.set ??= {} : patch;
     switch (operation.field) {
       case "assign": {
-        const people = parseAssignees(value);
+        const people = /^me$/i.test(value) ? [] : parseAssignees(value);
         if (!people) {
-          return "After assign, select one or more people or teams from Slack's @ menu, use '-' for yourself, or 'all'.";
+          return "After assign, select one or more people or teams from Slack's @ menu, use 'me' for yourself, or 'all'.";
         }
         if (
           (!people.length && target.assignees?.length) ||
           (people.length && selfAssignment)
         ) {
-          return "Use your own Slack mention when combining yourself with other assignees; do not mix assign - with other assignment values in one command.";
+          return "Use your own Slack mention when combining yourself with other assignees; do not mix assign me or assign - with other assignment values in one command.";
         }
         selfAssignment ||= people.length === 0;
         target.assignees = [...new Set([...(target.assignees ?? []), ...people])];

@@ -1,3 +1,8 @@
+import {
+  delegationEndpoint,
+  dispatchDelegation,
+  isDelegationEndpoint,
+} from "./delegation_dispatch.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
 import { SlackDmContexts } from "./dm_context.ts";
 import { recipientMentions } from "./delegation_input.ts";
@@ -6,21 +11,25 @@ import type {
   ActionContext,
   ViewSubmissionContext,
 } from "deno-slack-sdk/functions/interactivity/types.ts";
-import { canDelegateTask, canViewTask } from "../tasks/access.ts";
+import { canDelegateTask, canManageTask, canViewTask } from "../tasks/access.ts";
 import { taskAccessLoader } from "./access_context.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
 import { SlackTaskRepository, type TaskRepository } from "../tasks/repository.ts";
 import {
+  deleteTask,
   respondToAssignment,
   TaskAccessError,
   TaskCommandError,
 } from "../tasks/service.ts";
+import { requestTaskAction } from "../tasks/participation.ts";
+import { notifyParticipation } from "./participation_messages.ts";
 import type { TeamClient } from "./teams.ts";
 import { resolveWorkspace } from "./workspace.ts";
 import {
   ASSIGNMENT_ACCEPT,
   ASSIGNMENT_DELEGATE,
   ASSIGNMENT_REJECT,
+  ASSIGNMENT_RETURN_DELETE,
   type AssignmentInvitation,
   escapeNotificationText,
   type MessageBlocks,
@@ -63,6 +72,8 @@ export interface AssignmentClient extends NotificationClient {
 }
 
 export interface AssignmentDependencies {
+  delegationEndpoint?: () => Promise<string>;
+  deliveryExecutionId?: string;
   displays?: TaskDisplays;
   rememberTask?: NotificationContext["rememberTask"];
   client: AssignmentClient;
@@ -174,6 +185,9 @@ async function finishExecution(
   dependencies: AssignmentDependencies,
 ): Promise<void> {
   const executionId = bound.invitation.executionId;
+  if (
+    dependencies.deliveryExecutionId && dependencies.deliveryExecutionId !== executionId
+  ) return;
   // Every invitation created by this function execution belongs to this one task,
   // including assignments delegated later from a modal.
   const keys = new Set([
@@ -195,7 +209,16 @@ async function finishExecution(
     function_execution_id: executionId,
     outputs: { ignored: false },
   });
-  if (!result.ok) throw new Error("Cannot complete assignment interaction.");
+  if (
+    !result.ok &&
+    !["already_complete", "function_execution_already_completed"].includes(
+      result.error ?? "",
+    )
+  ) {
+    throw new Error(
+      `Cannot complete assignment interaction: ${result.error ?? "unknown_error"}`,
+    );
+  }
   bound.batch.completedExecutions = [
     ...new Set([...bound.batch.completedExecutions ?? [], executionId]),
   ];
@@ -251,7 +274,14 @@ async function renderDecision(
       text,
       blocks: [],
     });
-    if (!result.ok) throw new Error("Cannot update assignment message.");
+    if (
+      !result.ok &&
+      !["message_not_modified", "message_not_found"].includes(result.error ?? "")
+    ) {
+      throw new Error(
+        `Cannot update assignment message: ${result.error ?? "unknown_error"}`,
+      );
+    }
   }
   await finishExecution(bound, dependencies);
 }
@@ -281,7 +311,7 @@ async function deliverDecision(
     dependencies.client,
     dependencies.store,
     {
-      executionId: bound.invitation.executionId,
+      executionId: dependencies.deliveryExecutionId ?? bound.invitation.executionId,
       loadTask: (id) => dependencies.repository.findById(id),
       loadAccess: dependencies.loadAccess,
       rememberTask: dependencies.rememberTask,
@@ -397,7 +427,14 @@ async function applyDecision(
       kind,
       ...(assignees ? { assignees } : {}),
       ...(note ? { note } : {}),
-      messageTs: decisionTimestamp(actionTs),
+      messageTs: dependencies.deliveryExecutionId && bound.invitation.modalNonce
+        ? `${
+          Number.parseInt(
+            bound.invitation.modalNonce.replaceAll("-", "").slice(0, 13),
+            16,
+          )
+        }.000001`
+        : decisionTimestamp(actionTs),
     };
     await dependencies.store.save(bound.batch);
   }
@@ -469,10 +506,79 @@ export async function handleAssignmentAction(
       bound.invitation.messageTs !== action.messageTs
     ) return { ok: false, error: "This assignment control is not available." };
     if (
-      ![ASSIGNMENT_ACCEPT, ASSIGNMENT_REJECT, ASSIGNMENT_DELEGATE].includes(
+      ![
+        ASSIGNMENT_ACCEPT,
+        ASSIGNMENT_REJECT,
+        ASSIGNMENT_DELEGATE,
+        ASSIGNMENT_RETURN_DELETE,
+      ].includes(
         action.actionId,
       )
     ) return { ok: false, error: "Unknown assignment response." };
+    if (action.actionId === ASSIGNMENT_RETURN_DELETE) {
+      const tree = bound.task.assignmentTree;
+      const root = tree?.nodes[tree.rootId];
+      if (
+        bound.task.createdBy !== action.userId || !root?.returned ||
+        root.status !== "pending" ||
+        (bound.batch.invitationKeys?.length &&
+          !bound.batch.invitationKeys.includes(`${root.id}:${root.generation}`))
+      ) return { ok: false, error: "This creator-return control is no longer active." };
+      if (bound.task.deleted) {
+        await renderDecision(bound, dependencies);
+        return { ok: true };
+      }
+      const access = await currentAccess(bound, dependencies);
+      if (!access) return await cancelUnavailable(bound, dependencies);
+      if (!canManageTask(bound.task, access)) {
+        const request = await requestTaskAction(
+          bound.task,
+          "delete",
+          {
+            channelId: action.channelId,
+            messageTs: decisionTimestamp(action.actionTs),
+            userId: action.userId,
+          },
+          dependencies.repository,
+          access,
+        );
+        const notifications = await notifyParticipation(
+          request.task,
+          bound.batch.workspaceId,
+          dependencies.client,
+          {
+            executionId: dependencies.deliveryExecutionId ?? action.executionId,
+            loadAccess: dependencies.loadAccess,
+            rememberTask: dependencies.rememberTask,
+          },
+          dependencies.repository,
+        );
+        if (dependencies.displays) await dependencies.displays.refresh(request.task);
+        return notifications.failed.length
+          ? {
+            ok: false,
+            error:
+              "Deletion requested, but some Access holders could not be notified. Retry Delete.",
+          }
+          : { ok: true, interactive: true };
+      }
+      // Use the deletion service so Access is checked on the fresh task state,
+      // just as it is for a typed delete command.
+      await deleteTask(
+        bound.task,
+        {
+          channelId: action.channelId,
+          messageTs: decisionTimestamp(action.actionTs),
+          userId: action.userId,
+        },
+        dependencies.repository,
+        access,
+      );
+      bound.task = { ...bound.task, deleted: true };
+      bound.invitation.status = "rejected";
+      await dependencies.store.save(bound.batch);
+      return await deliverDecision(bound, dependencies);
+    }
     if (action.actionId !== ASSIGNMENT_DELEGATE) {
       return await applyDecision(
         bound,
@@ -495,6 +601,16 @@ export async function handleAssignmentAction(
     if (!action.interactivityPointer) {
       return { ok: false, error: "Open Delegate again to choose an assignee." };
     }
+    let workerUrl: string | undefined;
+    try {
+      workerUrl = await dependencies.delegationEndpoint?.();
+    } catch {
+      return {
+        ok: false,
+        error:
+          "The delegation workflow is not ready. Restart DeleBot and approve its updated app permissions, then reopen Delegate. If it still fails, check the workflow activity log.",
+      };
+    }
     const nonce = crypto.randomUUID();
     bound.invitation.modalNonce = nonce;
     delete bound.invitation.modalId;
@@ -504,7 +620,11 @@ export async function handleAssignmentAction(
       view: {
         type: "modal",
         callback_id: ASSIGNMENT_DELEGATE_VIEW,
-        private_metadata: JSON.stringify({ ...ref, nonce }),
+        private_metadata: JSON.stringify({
+          ...ref,
+          nonce,
+          ...(workerUrl ? { workerUrl, channelId: bound.invitation.channelId } : {}),
+        }),
         title: { type: "plain_text", text: "Delegate task" },
         submit: { type: "plain_text", text: "Delegate" },
         close: { type: "plain_text", text: "Cancel" },
@@ -550,8 +670,21 @@ export async function handleAssignmentAction(
     bound.invitation.modalId = opened.view.id;
     await dependencies.store.save(bound.batch);
     return { ok: true, interactive: true };
-  } catch {
-    return { ok: false, error: "I could not update this assignment. Please try again." };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const code = /: ([a-z_]+)$/.exec(message)?.[1] ?? "unexpected_error";
+    console.error(
+      JSON.stringify({
+        event: "assignment_action_failed",
+        action_id: action.actionId,
+        error_code: code,
+      }),
+    );
+    return {
+      ok: false,
+      error:
+        "I could not finish this assignment response. Retry it, or use the task's thread. The saved task state will be checked before applying it again.",
+    };
   }
 }
 
@@ -719,8 +852,9 @@ export async function handleAssignmentSubmission(
   }
 }
 
-function productionDependencies(client: SlackAPIClient): AssignmentDependencies {
+export function productionDependencies(client: SlackAPIClient): AssignmentDependencies {
   return {
+    delegationEndpoint: () => delegationEndpoint(client),
     displays: taskDisplays(client),
     rememberTask: async (channel, ts, user, id) => {
       const store = new SlackDmContexts(client);
@@ -737,10 +871,11 @@ function productionDependencies(client: SlackAPIClient): AssignmentDependencies 
 
 export async function assignmentBlockActionHandler(
   { body, action, client }: ActionContext<Record<string, unknown>>,
+  dispatch = dispatchDelegation,
 ): Promise<void> {
   const raw = action as unknown as Record<string, unknown>;
   const container = body.container as { channel_id?: string; message_ts?: string };
-  const result = await handleAssignmentAction({
+  const submitted: AssignmentAction = {
     actionId: typeof raw.action_id === "string" ? raw.action_id : "",
     value: typeof raw.value === "string" ? raw.value : "",
     userId: body.user.id,
@@ -749,7 +884,31 @@ export async function assignmentBlockActionHandler(
     executionId: body.function_data.execution_id,
     interactivityPointer: body.interactivity.interactivity_pointer,
     actionTs: typeof raw.action_ts === "string" ? raw.action_ts : undefined,
-  }, productionDependencies(client));
+  };
+  const dependencies = productionDependencies(client);
+  let result: AssignmentActionResult;
+  if (
+    [ASSIGNMENT_ACCEPT, ASSIGNMENT_REJECT, ASSIGNMENT_RETURN_DELETE].includes(
+      submitted.actionId,
+    )
+  ) {
+    try {
+      await dispatch(
+        await delegationEndpoint(client),
+        { kind: "assignment_action", action: submitted },
+        submitted.channelId,
+        submitted.userId,
+      );
+      return;
+    } catch {
+      result = {
+        ok: false,
+        error:
+          "Slack could not confirm receipt of your response. Please retry; your task won't be changed twice.",
+      };
+    }
+  } else result = await handleAssignmentAction(submitted, dependencies);
+
   if (!result.ok && result.error && container.channel_id) {
     await client.chat.postEphemeral({
       channel: container.channel_id,
@@ -760,13 +919,14 @@ export async function assignmentBlockActionHandler(
 }
 
 export async function assignmentViewSubmissionHandler(
-  { body, view, client }: ViewSubmissionContext<Record<string, unknown>>,
+  { body, view }: ViewSubmissionContext<Record<string, unknown>>,
+  dispatch = dispatchDelegation,
 ) {
   const values = view.state.values;
   const recipientValue = values.delegation_recipients?.recipients as unknown as {
     rich_text_value?: unknown;
   } | undefined;
-  const result = await handleAssignmentSubmission({
+  const submission: AssignmentSubmission = {
     privateMetadata: view.private_metadata ?? "",
     userId: body.user.id,
     viewId: view.id,
@@ -775,7 +935,9 @@ export async function assignmentViewSubmissionHandler(
     note: values.delegation_note?.note?.value ?? "",
     selectedUsers: values.delegation_people?.people?.selected_users ?? [],
     teamText: values.delegation_teams?.teams?.value ?? "",
-  }, productionDependencies(client));
+  };
+  const result = await queueDelegationSubmission(submission, dispatch);
+
   return result.ok ? { response_action: "clear" as const } : {
     response_action: "errors" as const,
     errors: {
@@ -785,4 +947,116 @@ export async function assignmentViewSubmissionHandler(
       ]: result.error ?? "Could not delegate task.",
     },
   };
+}
+
+/** Only local input validation and one durable handoff belong on the modal deadline. */
+export async function queueDelegationSubmission(
+  submission: AssignmentSubmission,
+  dispatch = dispatchDelegation,
+): Promise<AssignmentActionResult> {
+  const text = submission.recipients !== undefined
+    ? recipientMentions(submission.recipients)
+    : [...submission.selectedUsers ?? [], submission.teamText ?? ""].join(" ").trim();
+  if (!text?.trim()) return { ok: false, error: "Mention at least one person or team." };
+  if (submission.note && submission.note.length > 2000) {
+    return {
+      ok: false,
+      error: "Keep the note to 2,000 characters or fewer.",
+      errorField: "delegation_note",
+    };
+  }
+  try {
+    const metadata = JSON.parse(submission.privateMetadata);
+    const ref = reference(submission.privateMetadata);
+    if (
+      !ref?.nonce || ref.recipientId !== submission.userId ||
+      !isDelegationEndpoint(metadata.workerUrl) ||
+      !/^D[A-Z0-9]+$/.test(metadata.channelId)
+    ) {
+      return { ok: false, error: "Reopen Delegate to load the updated form." };
+    }
+    await dispatch(metadata.workerUrl, submission, metadata.channelId, submission.userId);
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      error:
+        "Slack could not confirm receipt. Retry Delegate; repeated submissions do not delegate twice.",
+    };
+  }
+}
+
+/** The webhook is not an authorization source: verify its invitation and nonce again. */
+export async function runQueuedDelegation(
+  submission: AssignmentSubmission,
+  dependencies: AssignmentDependencies,
+): Promise<AssignmentActionResult> {
+  const ref = reference(submission.privateMetadata);
+  const bound = await boundInvitation(
+    ref,
+    submission.userId,
+    submission.executionId,
+    dependencies,
+  );
+  if (
+    !bound || !ref?.nonce || ref.nonce !== bound.invitation.modalNonce ||
+    submission.viewId !== bound.invitation.modalId
+  ) return { ok: false, error: "This delegation form is no longer available." };
+  const result = await handleAssignmentSubmission(submission, dependencies);
+  if (!result.ok) {
+    const access = await currentAccess(bound, dependencies);
+    if (access) {
+      const message = {
+        channel: bound.invitation.channelId!,
+        text: result.error ??
+          "Delegation could not be completed. Open Delegate to retry.",
+        unfurl_links: false,
+        unfurl_media: false,
+      };
+      const sent = await dependencies.client.chat.postMessage({
+        ...message,
+        thread_ts: bound.invitation.messageTs!,
+      });
+      // The delegation may have committed and removed its source invitation
+      // before a later notification failed. Still give the sender a recovery path.
+      if (!sent.ok) {
+        const fallback = await dependencies.client.chat.postMessage(message);
+        if (!fallback.ok) throw new Error("Cannot report delegation failure.");
+      }
+    }
+  }
+  return result;
+}
+
+/** Reauthenticate queued button actions against their original invitation. */
+export async function runQueuedAssignmentAction(
+  action: AssignmentAction,
+  dependencies: AssignmentDependencies,
+): Promise<AssignmentActionResult> {
+  if (
+    ![ASSIGNMENT_ACCEPT, ASSIGNMENT_REJECT, ASSIGNMENT_RETURN_DELETE].includes(
+      action.actionId,
+    )
+  ) return { ok: false, error: "Unsupported queued response." };
+  const bound = await boundInvitation(
+    reference(action.value),
+    action.userId,
+    action.executionId,
+    dependencies,
+  );
+  if (
+    !bound || bound.invitation.channelId !== action.channelId ||
+    bound.invitation.messageTs !== action.messageTs
+  ) return { ok: false, error: "This assignment control is no longer available." };
+  const result = await handleAssignmentAction(action, dependencies);
+  if (!result.ok && await currentAccess(bound, dependencies)) {
+    await dependencies.client.chat.postMessage({
+      channel: action.channelId,
+      text: result.error ??
+        "Response could not be completed. Retry in the task's thread.",
+      unfurl_links: false,
+      unfurl_media: false,
+    });
+  }
+  return result;
 }

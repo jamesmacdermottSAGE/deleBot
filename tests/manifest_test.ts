@@ -26,6 +26,7 @@ Deno.test("manifest targets Slack hosting and allows people to send DMs", () => 
       "usergroups:read",
       "datastore:read",
       "datastore:write",
+      "triggers:write",
     ]
   ) {
     if (!scopes.includes(scope)) throw new Error(`Missing required scope: ${scope}`);
@@ -62,4 +63,15 @@ Deno.test("trigger connects messages to the registered workflow with thread cont
     throw new Error("Thread replies must preserve their thread root");
   }
   if (!trigger.event?.filter) throw new Error("MessagePosted requires an event filter");
+});
+
+Deno.test("durable delegation workflow is registered with its dispatcher datastore and outgoing domain", () => {
+  if (
+    !manifest.workflows?.delebot_delegate || !manifest.datastores?.delegation_dispatch ||
+    !manifest.outgoing_domains?.includes("hooks.slack.com")
+  ) throw new Error("Delegation handoff must be deployable alongside the reply workflow");
+  const step = manifest.workflows.delebot_delegate.steps[0];
+  if (step.function_id !== "#/functions/delebot_handle_message") {
+    throw new Error("Worker invitations must support the same interactive handlers");
+  }
 });

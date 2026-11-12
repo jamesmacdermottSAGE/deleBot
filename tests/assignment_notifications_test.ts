@@ -115,7 +115,7 @@ Deno.test("assignment notifications include task details and notify each directl
   assert(!posts[0].text.includes("<!channel>"));
   assert(
     !posts[0].text.includes("Open task thread") &&
-      posts[0].text.includes("delegate @person"),
+      posts[0].text.includes("*Assignees:*"),
   );
   assert([...store.rows.values()][0].delivered.join() === "UJAMES,UCREATOR");
 });
@@ -489,4 +489,51 @@ Deno.test("notification datastore round trips IDs and rejects corrupt or failed 
     rejected = true;
   }
   assert(rejected);
+});
+
+Deno.test("initial assignment buttons wait for durable action-handler provisioning", async () => {
+  const f = fixture();
+  let release!: () => void;
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => release = resolve);
+  const provisioning = new Promise<void>((resolve) => started = resolve);
+  const work = notifyAssignments(
+    f.task,
+    f.task.assignees,
+    "event1",
+    "TWORKSPACE",
+    f.client,
+    f.store,
+    {
+      executionId: "FXORIGIN",
+      prepareInteractivity: async () => {
+        started();
+        await ready;
+      },
+    },
+  );
+  await provisioning;
+  assert(f.posts.length === 0);
+  release();
+  const result = await work;
+  assert(
+    result.interactive && result.failed.length === 0 && Number(f.posts.length) === 1,
+  );
+});
+
+Deno.test("failed handler provisioning never exposes nonfunctional assignment buttons", async () => {
+  const f = fixture();
+  const result = await notifyAssignments(
+    f.task,
+    f.task.assignees,
+    "event1",
+    "TWORKSPACE",
+    f.client,
+    f.store,
+    {
+      executionId: "FXORIGIN",
+      prepareInteractivity: () => Promise.reject(new Error("missing_scope")),
+    },
+  );
+  assert(result.failed.includes("UJAMES") && f.posts.length === 0 && !result.interactive);
 });

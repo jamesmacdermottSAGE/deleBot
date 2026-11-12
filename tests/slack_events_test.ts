@@ -309,7 +309,7 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
     );
     if (index === 0) {
       assert(repo.rows.get(task.id)!.assignees.join() === "SJSQUAD");
-      assert(f.posts.at(-1)!.text.includes("<@UALICE> ❌ Rejected"));
+      assert(f.posts.at(-1)!.text.includes("*Declined:* <@UALICE>"));
       assert(f.posts.at(-1)!.text.includes("@jsquad"));
     }
   }
@@ -318,7 +318,8 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
   assert(updated.assignmentResponses?.UBOB.status === "accepted");
   assert(updated.assignees.join() === "UBOB" && updated.teams.length === 0);
   assert(f.posts.at(-1)!.text.includes("<@UBOB> ✅"));
-  assert(f.posts.at(-1)!.text.includes("Accepted by:* <@UBOB>"));
+  assert(f.posts.at(-1)!.text.includes("*Assignees:* <@UBOB> ✅ Accepted"));
+  assert(!f.posts.at(-1)!.text.includes("*Accepted by:*"));
   assert(
     f.notificationPosts.length === 2,
     "One rejection does not return an unresolved squad assignment",
@@ -975,7 +976,7 @@ Deno.test("name-only creation and combined thread updates show current fields an
   assert(posts.at(-1)!.text.includes("Already applied"));
 });
 
-Deno.test("explicit assign - assigns the creator and delivers one assignment DM", async () => {
+Deno.test("explicit assign - assigns and accepts the creator without an invitation", async () => {
   const { event, client, posts, notificationPosts, openedDms } = fixture();
   const repo = new MemoryTaskRepository();
   const command = { ...event, text: "<@UBOT> task Personal followup assign -" };
@@ -986,10 +987,10 @@ Deno.test("explicit assign - assigns the creator and delivers one assignment DM"
     posts[0].text.includes("Created task") &&
       posts[0].text.includes(`<@${event.user_id}>`),
   );
-  assert(openedDms.join() === event.user_id && notificationPosts.length === 1);
-  assert(notificationPosts[0].text.includes(`#${task.number}: Personal followup`));
+  assert(task.assignmentTree?.acceptedBy === event.user_id);
+  assert(openedDms.length === 0 && notificationPosts.length === 0);
   await handleMessage(command, client, repo);
-  assert(repo.writes === 1 && notificationPosts.length === 1);
+  assert(repo.writes === 1 && notificationPosts.length === 0);
 });
 
 Deno.test("links and descriptions append across thread messages without duplicate links", async () => {
@@ -1838,4 +1839,37 @@ Deno.test("a failed channel confirmation preserves the active assignment interac
   );
   assert("error" in result && result.interactive === true);
   assert(repo.writes === 1 && notificationPosts.length === 1);
+});
+
+Deno.test("assign me creates and updates self-assigned tasks as accepted without invitation DMs", async () => {
+  for (const later of [false, true]) {
+    const { event, client, notificationPosts, openedDms } = fixture();
+    const repo = new MemoryTaskRepository();
+    await handleMessage(
+      {
+        ...event,
+        text: later ? "<@UBOT> task Personal" : "<@UBOT> task Personal assign me",
+      },
+      client,
+      repo,
+    );
+    if (later) {
+      await handleMessage(
+        {
+          ...event,
+          message_ts: "9.2",
+          thread_ts: event.message_ts,
+          text: "<@UBOT> assign me",
+        },
+        client,
+        repo,
+      );
+    }
+    const task = [...repo.rows.values()][0];
+    assert(
+      task.assignees.join() === event.user_id &&
+        task.assignmentTree?.acceptedBy === event.user_id,
+    );
+    assert(notificationPosts.length === 0 && openedDms.length === 0);
+  }
 });

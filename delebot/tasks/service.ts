@@ -11,6 +11,7 @@ import type { Task, TaskAccess, TaskInput, TaskQuery } from "./models.ts";
 import type { TaskRepository } from "./repository.ts";
 import {
   addAssignmentTreeTargets,
+  autoAcceptSelfAssignment,
   initializeAssignmentTree,
   resetAssignmentTree,
   transitionAssignmentTree,
@@ -249,13 +250,24 @@ async function updateTaskUnlocked(
   }
   const creator = task.createdBy === access.userId;
   const manager = canManageTask(task, access);
+  const acceptedOwner = task.assignmentTree?.acceptedBy === access.userId ||
+    (!task.assignmentTree && task.assignees.includes(access.userId) &&
+      task.assignmentResponses?.[access.userId]?.status === "accepted");
+  const collaborator =
+    task.participation?.collaborators[access.userId]?.status === "accepted";
+  const completionOnly = changesCompletion &&
+    Object.keys(patch).every((key) => ["completed", "set", "clear"].includes(key)) &&
+    Object.keys(patch.set ?? {}).every((key) => key === "completed") &&
+    (patch.clear ?? []).every((key) => key === "completed");
   if (
     context.userId !== access.userId || !canAccessTask(task, access) ||
     (changesPolicy && !creator && !manager) ||
     (changesCompletion && !manager) ||
-    (!creator && !manager && !canDelegateTask(task, access))
+    (!creator && !acceptedOwner && !collaborator && !(manager && completionOnly))
   ) {
-    throw new TaskAccessError("You need view and edit permission to update this task.");
+    throw new TaskAccessError(
+      "Only the creator, accepted assignee, or an accepted collaborator can edit this task. Completion and deletion also require Access.",
+    );
   }
   const key = mutationKey(context);
   if (task.appliedEvents?.includes(key)) return { task, updated: false };
@@ -392,6 +404,14 @@ async function updateTaskUnlocked(
       if (error instanceof AssignmentTreeError) throw new TaskCommandError(error.message);
       throw error;
     }
+  }
+  if (assignmentChanged) {
+    const direct = patch.assignees !== undefined
+      ? (!patch.assignees.length || patch.assignees.includes(context.userId))
+      : replacements.assignees !== undefined &&
+        (!replacements.assignees.length ||
+          replacements.assignees.includes(context.userId));
+    finalTask = autoAcceptSelfAssignment(finalTask, context, direct);
   }
   await repository.save(finalTask);
   return { task: finalTask, updated: true };

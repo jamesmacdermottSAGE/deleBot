@@ -26,18 +26,43 @@ export function initializeAssignmentTree(task: Task, context: TaskContext): Task
   const tree = createAssignmentTree(task.createdBy, task.assignees, context.groupMembers);
   const nodes = pendingAssignmentNodes(tree);
   const key = `${context.channelId}:${context.messageTs}`;
-  return {
-    ...task,
-    assignmentTree: tree,
-    assignmentEvents: {
-      ...task.assignmentEvents,
-      [key]: invitationRecipients(tree, nodes.map((n) => n.id)),
+  return autoAcceptSelfAssignment(
+    {
+      ...task,
+      assignmentTree: tree,
+      assignmentEvents: {
+        ...task.assignmentEvents,
+        [key]: invitationRecipients(tree, nodes.map((n) => n.id)),
+      },
+      assignmentEventNodes: {
+        ...task.assignmentEventNodes,
+        [key]: nodes.map(assignmentInvitationKey),
+      },
     },
-    assignmentEventNodes: {
-      ...task.assignmentEventNodes,
-      [key]: nodes.map(assignmentInvitationKey),
-    },
-  };
+    context,
+    task.assignees.includes(context.userId),
+  );
+}
+
+/** Only a direct assignment by this same person is an automatic acceptance. */
+export function autoAcceptSelfAssignment(
+  task: Task,
+  context: TaskContext,
+  direct: boolean,
+): Task {
+  if (!direct || !task.assignmentTree) return task;
+  const tree = task.assignmentTree;
+  const node = Object.values(tree.nodes).find((n) =>
+    n.kind === "user" && n.principalId === context.userId && n.status === "pending" &&
+    (!n.parentId || tree.nodes[n.parentId].kind !== "team")
+  );
+  if (!node) return task;
+  const accepted = transitionAssignmentTree(task, {
+    kind: "accept",
+    invitationKeys: [assignmentInvitationKey(node)],
+  }, context)!;
+  accepted.appliedEvents = task.appliedEvents;
+  return accepted;
 }
 
 /** Explicit reassignment replaces invitation generations; ordinary edits do not. */
@@ -138,7 +163,14 @@ export function transitionAssignmentTree(
     ...(nodeId ? { nodeId, generation: Number(generation) } : {}),
   });
   const responses = { ...task.assignmentResponses };
-  for (const node of Object.values(result.tree.nodes)) {
+  // A person can occur in several historical branches; their active invitation
+  // must take precedence over a rejected descendant in the principal projection.
+  for (
+    const node of Object.values(result.tree.nodes).sort((a, b) =>
+      Number(["pending", "accepted"].includes(a.status)) -
+      Number(["pending", "accepted"].includes(b.status))
+    )
+  ) {
     if (node.status === "cancelled") continue;
     responses[node.principalId] = {
       status: node.kind === "team" && node.status === "delegated"

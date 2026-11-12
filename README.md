@@ -20,14 +20,14 @@ continues to show the creator. Creating, editing or looking up one task starts o
 continues a reply thread. Collection lists such as `ls me` send task-picker messages in
 the main DM.
 
-Task cards now show **Access** (the editing access field), regular links, **Jira** links,
+Task cards now show **Access** (the completion and deletion policy), regular links, **Jira** links,
 and **GitHub** links. The view-permissions field is omitted from cards. Existing stored
 visibility rules remain enforced for older restricted tasks.
 
 Use `jira https://jira.example/ABC-1`, `github https://github.com/org/repo/pull/1`, and
 `link https://example.com` independently. `edit jira URL` replaces Jira links;
-`delete jira github` clears those categories. `access @person @team` changes editing
-access; `access all` allows everyone who can view the task to edit it.
+`delete jira github` clears those categories. `access @person @team` adds completion/deletion access; `access all` allows all
+viewers to complete or delete a task.
 
 Each task returned by `ls me`, `ls@username` (select the real person mention), or another
 list command arrives as a separate top-level DM message. Reply to a specific card to edit,
@@ -72,8 +72,9 @@ A new task is initially incomplete and unassigned unless assignees are provided.
 Description, priority, due date, and links can be left unset. The reply confirms the task
 and displays its current fields, including **Unassigned** and **Not set** where
 appropriate. Priorities display as a plain number, and links display their full URLs. New
-tasks start with `viewPerms all` and `editPerms all`, so everyone can view and edit them
-until those fields are changed. Assignments and permissions are separate.
+tasks start with `viewPerms all` and `editPerms all`, so everyone can view them and
+complete or delete them. Editing details requires being the creator, accepted assignee,
+or an accepted collaborator. Assignments and permissions are separate.
 
 Add any combination of named fields after the name:
 
@@ -119,15 +120,18 @@ the task, so no task number is needed:
 ```
 
 Assignments and links are additive. Repeating an assignment or link does not duplicate it.
-`assign -` adds the requesting user. `assign all` replaces the existing assignment set
+`assign me` (or `assign -`) adds the requesting user and automatically accepts the task.
+Selecting your own Slack mention has the same effect. Assigning your own squad stays
+pending for the squad; membership alone does not auto-accept. `assign all` replaces the existing assignment set
 with everyone; adding specific people or teams to an `all` task replaces `all` with those
-assignments. Use `assign -` on its own in a command; to combine yourself with others,
+assignments. Use `assign me` or `assign -` on its own in a command; to combine yourself with others,
 select your own mention explicitly. Repeated descriptions append paragraphs. A command can
 update several fields at once, and its reply displays the complete current task data after
 saving the changes. Conflicting repeated priority or due values are rejected; repeating
 the same value is accepted.
 
-People allowed by both view and edit permissions can update the task. If multiple tasks
+The creator, accepted assignee, and accepted collaborators can edit task details, provided
+they can view the task. Pending assignees can respond to or delegate their invitation. If multiple tasks
 belong to the same thread, use a task number to select one. The bot will not guess which
 task to update. Creating a task inside an existing thread associates it with that thread's
 root.
@@ -179,13 +183,31 @@ replies in the original thread with a confirmation; deleted tasks no longer appe
 lists. Bare `delete` removes the whole task; `delete` followed by field names clears only
 those fields.
 
+When every delegation branch rejects and the task returns to its creator, DeleBot keeps a
+special return invitation with **Accept**, **Delete**, and **Delegate** controls. Refreshing
+task cards preserves this invitation and omits notes from earlier delegation branches.
+Delete still follows the task's Access policy; without Access it requests approval.
+
+Delegation dialogs and Accept/Reject/Delete buttons hand submissions to a separate Slack workflow before responding. Team
+membership verification, task changes, invitation delivery, and card refreshes happen
+there, outside Slack's three-second modal response deadline. Failed processing is
+reported in the sender's task conversation. Retrying a submitted form uses the same
+mutation identity and does not repeat the delegation.
+
+Restart `slack run` (or update the hosted installation) after this change and approve the
+new `triggers:write` permission. The app registers its delegation webhook on first use
+and saves it in `delegation_dispatch`; no webhook URL needs to be added to `.env`.
+Close any already-open delegation dialogs and reopen them after updating. The webhook
+starts the worker; invitation identity, recipient, form nonce, active assignment, and
+current permissions are still checked before any task changes.
+
 ## Access
 
 `access @person @team` adds people and teams allowed to complete or delete a task.
 `edit access @person` replaces that policy; `access all` and `delete access` allow all
-viewers. The creator and current Access holders can administer the policy in the task
-thread. Old `editPerms` commands remain compatible. Ordinary metadata updates are also
-available to the creator and active assignees, but do not grant management permission.
+viewers. Access changes require an editing role (creator, accepted assignee, or accepted
+collaborator) and being either the creator or a current Access holder. Old `editPerms`
+commands remain compatible. Editing task details does not grant management permission.
 
 A viewer without Access using `done` or `delete` creates a pending request. The task is
 not completed/deleted until a current Access holder approves. Access holders receive
@@ -542,3 +564,9 @@ installed app.
 - [Datastore query pagination](https://docs.slack.dev/reference/methods/apps.datastore.query/)
 - [Slack user groups and membership](https://docs.slack.dev/reference/methods/usergroups.list/)
 - [Opening direct messages](https://docs.slack.dev/reference/methods/conversations.open/)
+
+Initial assignment invitations use the full task card immediately, with the same text on
+refresh. Returned assignments keep their distinct return message. Current assignees show
+only active branches (at most twelve rows); accepted tasks show one owner. Historical
+rejections appear in a separate **Declined** line, grouped by person with repeat counts
+and at most five names. The stored delegation tree remains complete.
