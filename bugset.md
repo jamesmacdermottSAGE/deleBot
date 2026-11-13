@@ -9,6 +9,8 @@
 - `!` means "declines"
 - `|` separates branches
 - `^` means "updates task"
+- `^^` means "makes request update"
+- `^+ , ^!` means "accepts/rejects update request
 
 ## Bug set 1
 
