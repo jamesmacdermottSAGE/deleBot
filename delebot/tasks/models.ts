@@ -62,19 +62,22 @@ export type TaskTarget =
   | { kind: "my-teams" };
 
 export type TaskQuery =
-  | { kind: "all" }
-  | { kind: "number"; number: number }
-  | { kind: "name"; name: string }
-  | { kind: "assignee"; userId: string }
-  | { kind: "priority"; priority: Priority }
-  | { kind: "due"; dueDate: string }
-  | { kind: "team"; teamId: string }
-  | { kind: "completed"; completed: boolean }
-  | { kind: "collaborator" }
-  | {
-    kind: "filters";
-    targets?: TaskTarget[];
-    priority?: Priority;
-    dueDate?: string;
-    soon?: boolean;
-  };
+  & (
+    | { kind: "all" }
+    | { kind: "number"; number: number }
+    | { kind: "name"; name: string }
+    | { kind: "assignee"; userId: string }
+    | { kind: "priority"; priority: Priority }
+    | { kind: "due"; dueDate: string }
+    | { kind: "team"; teamId: string }
+    | { kind: "completed"; completed: boolean }
+    | { kind: "collaborator" }
+    | {
+      kind: "filters";
+      targets?: TaskTarget[];
+      priority?: Priority;
+      dueDate?: string;
+      soon?: boolean;
+    }
+  )
+  & { completed?: boolean };

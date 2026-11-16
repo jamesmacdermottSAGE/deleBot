@@ -2,13 +2,13 @@ import type { Task } from "../tasks/models.ts";
 
 /** Brief introduction; task ? contains the full creation and delegation guide. */
 export const GREETING = [
-  "💬 Talk directly to DeleBot in a DM; no bot mention needed.",
-  "*Create:* `task Name`, or `task Name assign @person @team p 1 due 6/11/26`. Type `teams` to find team handles.",
-  "*List:* `ls` shows available tasks; `ls me` includes your direct and team assignments. `ls collab` shows your collaborations. Each task arrives as a separate DM message.",
-  "Reply in a task's thread with `accept`, `reject`, `delegate @person`, edits, or `done`. You can also select a task by number, e.g. `123 done`.",
-  "*Help:* `task ?` for full task creation, editing and delegation instructions; `ls ?` for all list filters.",
-  "The accepted owner can invite collaborators with `collab @person`. Access holders approve completion/deletion requests.",
-  "*Clear:* in a DM clears that chat; in a DM thread clears that thread. Your own messages require Slack user authorization. Repeat when prompted; tasks remain.",
+  "💬 DM DeleBot directly; no bot mention needed.",
+  "*Create:* `task Name assign @person @team p 1 due 6/11/26`. Use `teams` to find team handles.",
+  "*List:* `ls` prints the thread’s task or lists incomplete tasks. `ls complete` lists completed tasks; `ls me` includes direct and team assignments; `ls collab` shows collaborations.",
+  "Reply in a task’s thread with `accept`, `reject`, `delegate @person`, edits, `complete`, or `incomplete`. A number also works: `123 complete`.",
+  "*Help:* `task ?` for creation, editing and delegation; `ls ?` for list filters.",
+  "Owners invite collaborators with `collab @person`. Without Access, complete/incomplete/delete send approval requests.",
+  "*Clear:* clears the DM or current DM thread. Your own messages require Slack user authorization; tasks remain.",
 ].join("\n\n");
 
 export const UNKNOWN_COMMAND =

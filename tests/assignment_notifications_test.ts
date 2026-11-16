@@ -1,5 +1,6 @@
 import {
   AssignmentNotificationsDatastore,
+  type MessageBlocks,
   type NotificationBatch,
   type NotificationClient,
   type NotificationStore,
@@ -8,7 +9,7 @@ import {
   notifyTaskAssignments,
   SlackNotificationStore,
 } from "../delebot/slack/notifications.ts";
-import { createTask, updateTask } from "../delebot/tasks/service.ts";
+import { createTask, respondToAssignment, updateTask } from "../delebot/tasks/service.ts";
 import { MemoryTaskRepository } from "./task_fixtures.ts";
 
 function assert(condition: unknown, message = "Assertion failed"): asserts condition {
@@ -536,4 +537,49 @@ Deno.test("failed handler provisioning never exposes nonfunctional assignment bu
     },
   );
   assert(result.failed.includes("UJAMES") && f.posts.length === 0 && !result.interactive);
+});
+
+Deno.test("reassignment replaces the old owner's invitation with a distinct response without buttons", async () => {
+  const f = fixture();
+  const repository = new MemoryTaskRepository();
+  const access = { userId: "UCREATOR", teamIds: [] };
+  const context = { channelId: "DTEST", messageTs: "1.1", userId: access.userId };
+  const { task } = await createTask(
+    { name: "Reassigned", assignees: ["UALICE"] },
+    context,
+    repository,
+    access,
+  );
+  const updates: Array<{ channel: string; text: string; blocks: MessageBlocks }> = [];
+  f.client.chat.update = (args) => {
+    updates.push(args);
+    return Promise.resolve({ ok: true });
+  };
+  const delivery = {
+    executionId: "FXTEST",
+    loadTask: (id: string) => repository.findById(id),
+    loadAccess: (_task: unknown, userId: string) =>
+      Promise.resolve({ userId, teamIds: [] }),
+  };
+  await notifyTaskAssignments(task, "TWORKSPACE", f.client, f.store, delivery);
+  const accepted = await respondToAssignment(
+    task,
+    { kind: "accept" },
+    { ...context, userId: "UALICE", messageTs: "2.1" },
+    repository,
+    { userId: "UALICE", teamIds: [] },
+  );
+  await notifyTaskAssignments(accepted.task, "TWORKSPACE", f.client, f.store, delivery);
+  const reassigned = await updateTask(
+    accepted.task,
+    { assignees: ["UBOB"] },
+    { ...context, messageTs: "2.2" },
+    repository,
+    access,
+  );
+  await notifyTaskAssignments(reassigned.task, "TWORKSPACE", f.client, f.store, delivery);
+  const original = updates.filter((update) => update.channel === "DUALICE").at(-1)!;
+  assert(original.text.includes("Assignment changed") && original.blocks.length === 0);
+  assert(f.posts.filter((post) => post.channel === "DUALICE").length === 1);
+  assert(f.posts.filter((post) => post.channel === "DUBOB").length === 1);
 });

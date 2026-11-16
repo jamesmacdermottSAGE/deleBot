@@ -36,21 +36,21 @@ export const TASK_CREATE_USAGE = [
   "💬 *Create:* `task Name` in your DM with DeleBot; no bot mention needed. In a channel, start with @DeleBot. A name is required; other fields are optional and tasks start unassigned. Example: `task Review PRs assign @person @team p 1 due 6/11/26`.",
   "*Fields:* `assign @person @team`, `desc text`, `p 1` (highest) through `p 5`, `due 6/11/26` (day/month/year), `link https://…`, `jira https://…`, `github https://…`, and `access @person @team` or `access all`.",
   "*Assignments:* `assign @person @team` adds assignees, `assign me` (or `assign -`) assigns yourself and accepts automatically; assigning your own team stays pending, and `assign all` replaces specific assignees with everyone. Select people from Slack's @ menu; type `teams` to find team handles you can type directly. Assigning a team sends each current member who can view the task an invitation DM; overlapping recipients receive one invitation per assignment event. Assigning all does not send invitations to everyone.",
-  "*Respond and delegate:* reply with `accept`, `reject`, `delegate @person @team`, or use the Accept / Reject / Delegate buttons. A number also works, e.g. `123 accept`. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. Delegation changes only your branch; siblings stay pending. A squad snapshots its members when invited and returns only after every member's branch rejects. Returns unwind one delegator at a time; the creator receives a distinct return message with Accept / Delete / Delegate choices. One acceptance selects the single owner and closes all competing invitations with an accepted-by message. Other people cannot claim or reassign an owned task. Only the owner can delegate it further.",
+  "*Respond and delegate:* reply with `accept`, `reject`, `delegate @person @team`, or use the Accept / Reject / Delegate buttons. A number also works, e.g. `123 accept`. Assignment status: ⏳ pending, ✅ accepted, ❌ rejected, ↪️ delegated. Delegation changes only your branch; siblings stay pending. A squad snapshots its members when invited and returns only after every member's branch rejects. Returns unwind one delegator at a time; the creator receives a distinct return message with Accept / Delete / Delegate choices. One acceptance selects the single owner and closes all competing invitations with an accepted-by message. Other people cannot claim an owned task. Access holders can reassign it; only the owner can delegate its branch further.",
   "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
   '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
   "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
   "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
   "*Clear chat:* `clear` in a DM clears that chat; in a DM thread it clears only that thread. Large histories run in resumable batches: repeat clear when prompted. Your messages require your Slack user authorization to delete; without it only bot messages are removed. Saved tasks are unchanged.",
-  "*Complete:* `done` or `work done` completes a task. `edit completed no` reopens it. Reply in the task's thread or specify its number, e.g. `123 done`. Bare done also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
-  "*Access:* `access me` adds yourself; `edit access me` replaces Access with yourself. `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. Only the creator, accepted assignee, or accepted collaborators can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using done or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve delete`, `deny complete`, `deny delete` in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
+  "*Complete:* `complete` completes a task. `incomplete` requests reopening it when you lack Access. Reply in the task's thread or specify its number, e.g. `123 complete`. Bare complete also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
+  "*Access:* `access me` adds yourself; `edit access me` replaces Access with yourself. `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. The creator, accepted assignee, accepted collaborators, and anyone with Access can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using complete, incomplete, or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve incomplete`, `approve delete`, or the matching `deny` command in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
   "*Collaborate:* the accepted owner can use `collab @person` to send a separate collaboration invitation. Recipients use its buttons or `collab accept` / `collab reject` in the task thread. `ls collab` lists accepted collaborations; collaborators are not assignees.",
   "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
 ].join("\n\n");
 
 export const TASK_LIST_USAGE = [
-  "*List:* `@DeleBot ls` shows all tasks available to you. All list results are sent to you in a DM. `ls me` includes direct assignments and assignments to your current teams; `ls @person` shows direct assignments, `ls @team` selects one team, and `ls team` selects all your current teams. Select people and teams from Slack's @ menu, or type a team handle found with `teams`.",
+  "*List:* `ls` in a task thread prints that task. Elsewhere, `@DeleBot ls` shows incomplete tasks available to you; add `complete` to show only completed tasks, e.g. `ls complete` or `ls me complete`. All list results are sent to you in a DM. `ls me` includes direct assignments and assignments to your current teams; `ls @person` shows direct assignments, `ls @team` selects one team, and `ls team` selects all your current teams. Select people and teams from Slack's @ menu, or type a team handle found with `teams`.",
   "*Filters:* `ls 1` (or `ls (1)`), `ls p1`, `ls 6/11/26` (or `ls date (6/11/26)`), and `ls soon` filter your assigned tasks. Priority 1 is highest. Dates use day/month/year. Soon means due from today through the next three calendar days, inclusive, using London dates.",
   "Combine targets and filters: `ls @person soon`, `ls 1 soon`, `ls me p1`, or `ls team priority 1`. Multiple people or teams match any selected target; priority and due filters apply together. Use either soon or one exact date.",
   "*Lookup:* `ls task 5` or `ls task Clean PRs`. Existing forms also work: `ls tasks`, `tasks ls`, `ls tasks @person`, `ls tasks @team`, `ls tasks team all`, `ls tasks priority 1`, `ls tasks due 6/11/26`, and `ls tasks completed no`.",
@@ -71,7 +71,7 @@ export type TaskCommand =
   | {
     kind: "approval-response";
     number?: number;
-    kindOfAction: "complete" | "delete";
+    kindOfAction: "complete" | "incomplete" | "delete";
     approve: boolean;
     requestId?: string;
   }
@@ -158,6 +158,7 @@ type Field =
   | "githubLinks"
   | "link"
   | "done"
+  | "incomplete"
   | "delete"
   | "edit"
   | "name"
@@ -270,7 +271,8 @@ function operationAt(
   if (["github", "githublink", "githublinks"].includes(word)) {
     return { field: "githubLinks", size: 1 };
   }
-  if (word === "done") return { field: "done", size: 1 };
+  if (["complete", "done"].includes(word)) return { field: "done", size: 1 };
+  if (word === "incomplete") return { field: "incomplete", size: 1 };
   if (word === "delete") return { field: "delete", size: 1 };
   if (word === "edit") return { field: "edit", size: 1 };
   if (word === "viewperms") return { field: "viewPerms", size: 1 };
@@ -371,6 +373,7 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
       jiraLinks: "jiraLinks",
       githubLinks: "githubLinks",
       done: "completed",
+      incomplete: "completed",
       completed: "completed",
       name: "name",
       viewPerms: "viewPerms",
@@ -453,12 +456,16 @@ function parsePatch(tokens: Token[], start: number): TaskPatch | string {
         }
         break;
       }
+      case "incomplete":
       case "done":
         if (values.length) {
-          return "Use done (or work done) without a value. Put other changes after their field keyword.";
+          return "Use complete or incomplete without a value. Put other changes after their field keyword.";
         }
-        if (target.completed === false) return "Use one completed value per command.";
-        target.completed = true;
+        if (
+          target.completed !== undefined &&
+          target.completed !== (operation.field !== "incomplete")
+        ) return "Use one completed value per command.";
+        target.completed = operation.field !== "incomplete";
         break;
       case "name":
         if (!value || value.length > 200) {
@@ -535,6 +542,7 @@ function parseClearFields(tokens: Token[]): TaskPatch | string {
     githublinks: "githubLinks",
     access: "editPerms",
     editaccess: "editPerms",
+    complete: "completed",
     done: "completed",
     completed: "completed",
     viewperms: "viewPerms",
@@ -662,6 +670,24 @@ function parseListFilters(text: string): TaskCommand {
 }
 
 function parseList(command: string): TaskCommand {
+  const tokens = tokenize(command);
+  const isStatus = (token: Token) => !token.quoted && /^complete$/i.test(token.value);
+  if (Array.isArray(tokens) && tokens.some(isStatus)) {
+    const parsed = parseList(
+      tokens.filter((token) => !isStatus(token)).map((token) =>
+        token.quoted ? JSON.stringify(token.value) : token.value
+      ).join(" "),
+    );
+    if (parsed.kind === "list" && parsed.query.completed === false) {
+      return invalid("Use one completion filter per list command.");
+    }
+    return parsed.kind === "list"
+      ? { ...parsed, query: { ...parsed.query, completed: true } }
+      : parsed;
+  }
+  if (/^ls\s+(?:tasks\s+)?collab$/i.test(command)) {
+    return { kind: "list", query: { kind: "collaborator" } };
+  }
   const single = /^ls\s+task\s+([\s\S]+)$/i.exec(command);
   if (single) {
     let selector = single[1].trim();
@@ -739,7 +765,7 @@ export function parseTaskCommand(text: string): TaskCommand {
       }
       return { kind: "collaborate", ...(number ? { number } : {}), users };
     }
-    const request = /^(complete|done|delete)(?:\s+(\S+))?$/i.exec(value);
+    const request = /^(complete|incomplete|done|delete)(?:\s+(\S+))?$/i.exec(value);
     if (!request) {
       return invalid(
         "Use approve complete, approve delete, deny complete, or deny delete in the task thread.",
@@ -748,7 +774,11 @@ export function parseTaskCommand(text: string): TaskCommand {
     return {
       kind: "approval-response",
       ...(number ? { number } : {}),
-      kindOfAction: /^delete$/i.test(request[1]) ? "delete" : "complete",
+      kindOfAction: /^delete$/i.test(request[1])
+        ? "delete"
+        : /^incomplete$/i.test(request[1])
+        ? "incomplete"
+        : "complete",
       approve: word === "approve",
       ...(request[2] ? { requestId: request[2] } : {}),
     };
@@ -792,7 +822,7 @@ export function parseTaskCommand(text: string): TaskCommand {
     if (!number) return invalid("Task numbers must be positive whole numbers.");
     start = 1;
     if (start === tokens.length) {
-      return invalid("Add a change after the task number, e.g. 123 done.");
+      return invalid("Add a change after the task number, e.g. 123 complete.");
     }
   } else if (
     !operationAt(tokens, 0) &&

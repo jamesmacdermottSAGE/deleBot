@@ -230,7 +230,26 @@ async function renderDecision(
   bound: BoundInvitation,
   dependencies: AssignmentDependencies,
 ): Promise<void> {
-  if (dependencies.displays && await dependencies.displays.refresh(bound.task)) {
+  const decision = bound.invitation.decision;
+  const notice = decision
+    ? {
+      eventKey: `${bound.invitation.channelId}:${decision.messageTs}`,
+      sourceChannel: bound.invitation.channelId!,
+      sourceThread: bound.invitation.messageTs!,
+      text: `*Task #${bound.task.number}: ${
+        escapeNotificationText(bound.task.name)
+      }* <@${bound.invitation.recipientId}> ${
+        decision.kind === "accept"
+          ? "✅ Assignment accepted"
+          : decision.kind === "reject" ||
+              bound.task.assignmentResponses?.[bound.invitation.recipientId]?.status ===
+                "rejected"
+          ? "❌ Assignment rejected"
+          : "↪️ Assignment delegated"
+      }.`,
+    }
+    : undefined;
+  if (dependencies.displays && await dependencies.displays.refresh(bound.task, notice)) {
     throw new Error("Some task messages could not be refreshed.");
   }
   const { invitation } = bound;

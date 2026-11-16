@@ -37,9 +37,9 @@ Assignment states are ⏳ pending, ✅ accepted, ❌ rejected, and ↪️ delega
 Rejected/delegated people remain in the displayed history; each replacement starts a new
 pending invitation. The completion field is last and displays ✅ or ⬜.
 
-DM DeleBot directly, with no bot mention. `ls me` followed by `done` completes the task
+DM DeleBot directly, with no bot mention. `ls me` followed by `complete` completes the task
 when exactly one task was shown. Replies in a task-list thread use that list's context;
-lists containing several tasks require a number (`123 done`) or `ls task Name` to select
+lists containing several tasks require a number (`123 complete`) or `ls task Name` to select
 one. Permissions are checked again on each update. Task-picker lists appear in the main
 DM; other commands start or continue a thread.
 
@@ -97,7 +97,7 @@ share the same assignment field. The supported fields are:
 | `due`                 | Set a UK day/month/year date                   | `due 6/11/26`                     |
 | `due -`               | Clear the due date                             | `due -`                           |
 | `link` or `links`     | Add HTTP/HTTPS links                           | `link https://example.com/review` |
-| `done` or `work done` | Mark the task completed                        | `done`                            |
+| `complete` | Mark the task completed                        | `complete`                            |
 | `viewPerms`           | Replace the view permission list               | `viewPerms @james @frontend`      |
 | `editPerms`           | Replace the edit permission list               | `editPerms @frontend`             |
 | `perms match`         | Copy view permissions to edit permissions once | `perms match`                     |
@@ -116,7 +116,7 @@ the task, so no task number is needed:
 @DeleBot link https://example.com/a
 @DeleBot link https://example.com/b
 @DeleBot link https://example.com/c link https://example.com/d
-@DeleBot done
+@DeleBot complete
 ```
 
 Assignments and links are additive. Repeating an assignment or link does not duplicate it.
@@ -130,7 +130,7 @@ update several fields at once, and its reply displays the complete current task 
 saving the changes. Conflicting repeated priority or due values are rejected; repeating
 the same value is accepted.
 
-The creator, accepted assignee, and accepted collaborators can edit task details, provided
+The creator, accepted assignee, accepted collaborators, and current Access holders can edit task details, provided
 they can view the task. Pending assignees can respond to or delegate their invitation. If multiple tasks
 belong to the same thread, use a task number to select one. The bot will not guess which
 task to update. Creating a task inside an existing thread associates it with that thread's
@@ -140,12 +140,12 @@ Outside a task thread, prefix the update with its task number:
 
 ```text
 @DeleBot 123 assign @alice link https://example.com/review
-@DeleBot 123 done
-@DeleBot 123 work done
+@DeleBot 123 complete
+@DeleBot 123 incomplete
 ```
 
-Use the actual number from the task confirmation or list. `done` is idempotent: marking an
-already completed task done keeps it completed. Use `edit completed no` to reopen it.
+Use the actual number from the task confirmation or list. `complete` is idempotent: marking an
+already completed task complete keeps it completed. Use `incomplete` to reopen it. Without Access, either command sends an approval request and keeps the status unchanged until approval.
 
 ## Replace or clear fields
 
@@ -216,14 +216,13 @@ Thread context selects the task; it does not grant permission to view or edit it
 
 `access @person @team` adds people and teams allowed to complete or delete a task.
 `edit access @person` replaces that policy; `access all` and `delete access` allow all
-viewers. Access changes require an editing role (creator, accepted assignee, or accepted
-collaborator) and being either the creator or a current Access holder. Old `editPerms`
+viewers. Access changes require being either the creator or a current Access holder. Old `editPerms`
 commands remain compatible. Editing task details does not grant management permission.
 
-A viewer without Access using `done` or `delete` creates a pending request. The task is
-not completed/deleted until a current Access holder approves. Access holders receive
+A viewer without Access using `complete`, `incomplete`, or `delete` creates a pending request. The task is
+not completed, reopened, or deleted until a current Access holder approves. Access holders receive
 Approve/Decline buttons and can also use `approve complete`, `approve delete`,
-`deny complete`, or `deny delete` in the task thread. If several matching requests are
+`approve incomplete`, `deny complete`, `deny incomplete`, or `deny delete` in the task thread. If several matching requests are
 pending, include the request ID. Approval rechecks current permissions and squad
 membership; revoked Access cannot be exercised through an old button. Viewing
 permission remains a separate policy and is never widened implicitly by assignment,
@@ -295,8 +294,10 @@ also write priority as `ls (1)` or `ls p1`, and an exact date as `ls (6/11/26)` 
 
 For individual lookup, `ls task 123` selects a task number and `ls task Clean PRs` selects
 an exact name ignoring case; duplicate names return all accessible matches. A bare number
-after `ls` is a priority filter. Lists include completed and incomplete tasks unless
-filtered with `ls tasks completed no` or `ls tasks completed yes`. The older `ls tasks`
+after `ls` is a priority filter. Lists show incomplete tasks by default. Add `complete`
+to show only completed tasks, e.g. `ls complete`, `ls me complete`, or `ls collab complete`.
+Inside a task thread, `ls` prints that thread's task, subject to the completion filter.
+Legacy `ls tasks completed no` and `ls tasks completed yes` filters remain supported. The older `ls tasks`
 and `tasks ls` spellings still work; old priority and due filters use the same personal
 defaults as their short forms.
 
@@ -313,7 +314,12 @@ Newly assigned people who have view permission receive a private message from De
 after the task has been saved. Assigning a team notifies its current members who can view
 the task, with overlapping people deduplicated. Assigning `all` marks everyone as an
 assignee without changing permissions or broadcasting assignment DMs to the workspace.
-Existing assignees are not notified again merely because another field changes.
+Existing assignees are not notified again merely because another field changes. Update
+confirmations identify the changed fields, and short notices are sent to each known
+participant's latest task thread after checking current visibility. Public tasks also
+notify their original shared thread. Successful notices
+are recorded to avoid repeating them on workflow retries. Collaboration request messages
+show each invitee's accepted, rejected, or pending response.
 Notification delivery state is saved separately so a retry can resume failed deliveries. A
 task can be saved even if Slack cannot deliver one of its assignment notifications. A
 later authorized task update also retries saved, undelivered assignment notifications.
@@ -322,10 +328,15 @@ Assignment invitations include **Accept**, **Reject**, and **Delegate** buttons:
 
 - **Accept** selects one accepted owner for the task. All competing invitations are
   updated to identify that owner and lose their action buttons. Other people cannot
-  accept, delegate, or change assignees on an owned task. The owner can delegate again.
+  accept or delegate an owned task. The owner can delegate again; Access holders can
+  explicitly change its assignees. Adding a new recipient after acceptance does not
+  reinvite the previous owner. Replaced invitations display a separate assignment-changed
+  response without buttons.
 - **Reject** exhausts only your branch. A squad snapshots its members when assigned;
   the squad does not return until every member's branch is exhausted. A sibling who is
-  still pending, or has delegated to a live descendant, keeps the branch open.
+  still pending, or has delegated to a live descendant, keeps the branch open. Delegating
+  directly back to an ancestor rejects that branch; a creator return waits for the other
+  branches to finish.
 - **Delegate** opens a modal with one required **People and teams** field. Use `@` to
   mention people and Slack user groups together, up to 20 combined. Add an optional
   **Note** below; it is included in each recipient's invitation and omitted when blank.
@@ -393,7 +404,7 @@ channel; use a DM when entering private details. Task access does not grant acce
 linked Slack messages or documents.
 
 Every list, lookup, update, deletion, and assignment notification enforces view
-permissions before showing fields. Completion and deletion additionally require Access.
+permissions before showing fields. Completion, reopening, and deletion additionally require Access.
 Group membership is freshly verified per incoming interaction (with an interaction-local
 cache), including direct group membership lookup
 when Slack's group discovery omits a selected or saved group. Failed verification grants
@@ -413,6 +424,10 @@ The source channel and creation-message timestamp form a task's storage key, so 
 the same creation event does not create a second task. Thread updates retain their event
 identity to avoid applying the same update twice. Slack datastores do not expose atomic
 conditional updates; simultaneous edits from separate workflow executions can still race.
+Within one running instance, task locks serialize creation, edits, responses, delivery,
+and display refreshes using fresh records. Lock waits are bounded and release after
+errors; a timed-out waiter cannot overtake the active operation. These locks do not
+coordinate separate workflow instances.
 Notification delivery and Slack messaging likewise cannot form a single database
 transaction, so an interrupted delivery may need retrying.
 

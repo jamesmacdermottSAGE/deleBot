@@ -1,3 +1,4 @@
+import { SlackTaskRepository } from "../delebot/tasks/repository.ts";
 import { SlackTaskDisplays, taskDisplays } from "../delebot/slack/task_displays.ts";
 import { createTask, respondToAssignment } from "../delebot/tasks/service.ts";
 import { assert, MemoryTaskRepository } from "./task_fixtures.ts";
@@ -23,10 +24,14 @@ async function fixture() {
   const records = new Map<string, Record<string, unknown>>();
   const updates: Array<{ channel: string; ts: string; text: string }> = [];
   const deleted: string[] = [];
+  const notices: Array<
+    { channel: string; thread_ts: string; text: string; client_msg_id: string }
+  > = [];
   const client = {
     apps: {
       datastore: {
-        get: () => Promise.resolve({ ok: true, item: {} }),
+        get: ({ id }: { id: string }) =>
+          Promise.resolve({ ok: true, item: records.get(id) ?? {} }),
         put: ({ item }: { datastore: string; item: Record<string, unknown> }) => {
           records.set(item.id as string, item);
           return Promise.resolve({ ok: true });
@@ -46,6 +51,12 @@ async function fixture() {
       },
     },
     chat: {
+      postMessage: (
+        args: { channel: string; thread_ts: string; text: string; client_msg_id: string },
+      ) => {
+        notices.push(args);
+        return Promise.resolve({ ok: true, ts: `20.${notices.length}` });
+      },
       update: (args: { channel: string; ts: string; text: string }) => {
         updates.push(args);
         return Promise.resolve({ ok: true });
@@ -62,7 +73,7 @@ async function fixture() {
   );
   await displays.track(task.id, "DALICE", "2.1", "UALICE");
   await displays.track(task.id, "DCREATOR", "2.2", "UCREATOR");
-  return { displays, client, task, repo, updates, deleted };
+  return { displays, client, task, repo, updates, deleted, notices };
 }
 
 Deno.test("acceptance and completion refresh every tracked card and recover older DM copies", async () => {
@@ -294,6 +305,7 @@ for (const variant of ["person", "team", "returned", "note", "creator-return"]) 
       assert(!originalText.includes("old squad note"));
     }
     const originalButtons = JSON.stringify(messages.get("DALICE:10.1")!.blocks);
+    await new SlackTaskRepository(client).save(task);
     const displays = taskDisplays(
       client as unknown as Parameters<typeof taskDisplays>[0],
     );
@@ -473,4 +485,71 @@ Deno.test("deleted cards still show deletion without revealing identity when vie
     f.updates.length > 0 &&
       f.updates.every((message) => message.text === "🗑️ Task deleted"),
   );
+});
+
+Deno.test("task updates reach other participants' threads once and honor revoked visibility", async () => {
+  const f = await fixture();
+  const notice = {
+    eventKey: "DALICE:3.1",
+    text: "✅ Priority updated to 2.",
+    sourceChannel: "DALICE",
+    sourceThread: "2.1",
+  };
+  assert(await f.displays.refresh(f.task, notice) === 0);
+  assert(
+    f.notices.some((entry) =>
+      entry.channel === "DCREATOR" && entry.thread_ts === "2.2" &&
+      entry.text === notice.text
+    ),
+  );
+  assert(!f.notices.some((entry) => entry.channel === "DALICE"));
+  const count = f.notices.length;
+  assert(await f.displays.refresh(f.task, notice) === 0);
+  assert(
+    f.notices.length === count,
+    "Workflow retries must not repeat a delivered update",
+  );
+  f.notices.length = 0;
+  assert(
+    await f.displays.refresh({ ...f.task, viewPerms: ["UALICE"] }, {
+      ...notice,
+      eventKey: "DALICE:3.2",
+    }) === 0,
+  );
+  assert(!f.notices.some((entry) => entry.channel === "DCREATOR"));
+});
+
+Deno.test("display refresh reads the current task under its mutation lock", async () => {
+  const f = await fixture();
+  await f.repo.save({ ...f.task, priority: 1 });
+  const displays = new SlackTaskDisplays(
+    f.client,
+    (_task, userId) => Promise.resolve({ userId, teamIds: [] }),
+    (id) => f.repo.findById(id),
+  );
+  assert(await displays.refresh(f.task) === 0);
+  assert(f.updates.every((entry) => entry.text.includes("*Priority:* 1")));
+});
+
+Deno.test("updates reach the original shared task thread only while viewing is public", async () => {
+  const f = await fixture();
+  const publicTask = { ...f.task, channelId: "CTEAM", threadTs: "1.1" };
+  const notice = {
+    eventKey: "DALICE:4.1",
+    text: "✅ Description updated.",
+    sourceChannel: "DALICE",
+    sourceThread: "2.1",
+  };
+  assert(await f.displays.refresh(publicTask, notice) === 0);
+  assert(
+    f.notices.some((entry) => entry.channel === "CTEAM" && entry.thread_ts === "1.1"),
+  );
+  f.notices.length = 0;
+  assert(
+    await f.displays.refresh({ ...publicTask, viewPerms: ["UCREATOR", "UALICE"] }, {
+      ...notice,
+      eventKey: "DALICE:4.2",
+    }) === 0,
+  );
+  assert(!f.notices.some((entry) => entry.channel === "CTEAM"));
 });

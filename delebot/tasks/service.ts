@@ -140,7 +140,7 @@ function resolveSelfPermissions<T extends { viewPerms?: string[]; editPerms?: st
   };
 }
 
-export async function createTask(
+async function createTaskUnlocked(
   draft: Pick<TaskInput, "name"> & Partial<Omit<TaskInput, "name">> & {
     matchPerms?: boolean;
   },
@@ -212,6 +212,18 @@ export async function createTask(
   await repository.save(initialized);
   return { task: initialized, created: true };
 }
+/** Creation shares the task lock with all later mutations and delivery. */
+export async function createTask(
+  draft: Parameters<typeof createTaskUnlocked>[0],
+  context: TaskContext,
+  repository: TaskRepository,
+  access: TaskAccess,
+): ReturnType<typeof createTaskUnlocked> {
+  return await withKeyLock(
+    mutationKey(context),
+    () => createTaskUnlocked(draft, context, repository, access),
+  );
+}
 export async function resolveTaskForUpdate(
   number: number | undefined,
   context: TaskContext,
@@ -234,7 +246,7 @@ export async function resolveTaskForUpdate(
   }
   if (visible.length !== 1) {
     throw new TaskCommandError(
-      "More than one task matches. Put the task number before the update, e.g. 123 done.",
+      "More than one task matches. Put the task number before the update, e.g. 123 complete.",
     );
   }
   return visible[0];
@@ -262,10 +274,10 @@ async function updateTaskUnlocked(
     patch.set?.assignees !== undefined || patch.clear?.includes("assignees");
   if (
     changesOwnership && task.assignmentTree?.acceptedBy &&
-    task.assignmentTree.acceptedBy !== access.userId
+    task.assignmentTree.acceptedBy !== access.userId && !canManageTask(task, access)
   ) {
     throw new TaskAccessError(
-      "Only the accepted owner can change this task's assignees.",
+      "You need Access or accepted ownership to change this task's assignees.",
     );
   }
   const creator = task.createdBy === access.userId;
@@ -275,18 +287,14 @@ async function updateTaskUnlocked(
       task.assignmentResponses?.[access.userId]?.status === "accepted");
   const collaborator =
     task.participation?.collaborators[access.userId]?.status === "accepted";
-  const completionOnly = changesCompletion &&
-    Object.keys(patch).every((key) => ["completed", "set", "clear"].includes(key)) &&
-    Object.keys(patch.set ?? {}).every((key) => key === "completed") &&
-    (patch.clear ?? []).every((key) => key === "completed");
   if (
     context.userId !== access.userId || !canAccessTask(task, access) ||
     (changesPolicy && !creator && !manager) ||
     (changesCompletion && !manager) ||
-    (!creator && !acceptedOwner && !collaborator && !(manager && completionOnly))
+    (!creator && !acceptedOwner && !collaborator && !manager)
   ) {
     throw new TaskAccessError(
-      "Only the creator, accepted assignee, or an accepted collaborator can edit this task. Completion and deletion also require Access.",
+      "You need Access, creator status, accepted ownership, or accepted collaboration to edit this task. Completion, reopening, and deletion require Access.",
     );
   }
   const key = mutationKey(context);
@@ -339,9 +347,13 @@ async function updateTaskUnlocked(
       : task.teams.includes("all")
       ? ["all"]
       : [...new Set([...task.assignees, ...task.teams])];
+    const retained =
+      task.assignmentTree?.acceptedBy && !added.includes(task.assignmentTree.acceptedBy)
+        ? previous.filter((id) => id !== task.assignmentTree!.acceptedBy)
+        : previous;
     assignees = added.includes("all")
       ? ["all"]
-      : [...new Set([...(previous.includes("all") ? [] : previous), ...added])];
+      : [...new Set([...(retained.includes("all") ? [] : retained), ...added])];
   }
   const next: Task = {
     ...task,
@@ -688,6 +700,7 @@ export async function listTasks(
   const dueWindow = query.kind === "filters" && query.soon ? soonWindow(now) : undefined;
   return (await repository.list(access)).filter((task) => {
     if (!canAccessTask(task, access)) return false;
+    if (task.completed !== (query.completed ?? false)) return false;
     switch (query.kind) {
       case "all":
         return true;

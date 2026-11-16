@@ -292,11 +292,25 @@ export function respondInAssignmentTree(
     for (const candidate of candidates) {
       const current = tree.nodes[candidate.id];
       if (decision.kind === "delegate") {
+        // Delegating solely to an ancestor is a rejection of this branch.
+        // Unwind only when the ancestor's other branches have also finished.
+        const ancestors = new Set<string>();
+        let parent = current.parentId ? tree.nodes[current.parentId] : undefined;
+        while (parent) {
+          if (parent.kind === "user") ancestors.add(parent.principalId);
+          parent = parent.parentId ? tree.nodes[parent.parentId] : undefined;
+        }
+        const forwardTargets = decision.assignees!.filter((id) => !ancestors.has(id));
+        if (!forwardTargets.length) {
+          current.status = "rejected";
+          unwind(tree, current.parentId, decision.userId, invited);
+          continue;
+        }
         current.status = "delegated";
         addTargets(
           tree,
           current.id,
-          decision.assignees!,
+          forwardTargets,
           decision.groupMembers ?? {},
           decision.note,
         ).forEach((id) => invited.add(id));

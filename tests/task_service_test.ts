@@ -173,7 +173,7 @@ Deno.test("every filter including completed matches authorized tasks across chan
     repo,
     access,
   );
-  assert((await listTasks({ kind: "all" }, access, repo)).length === 2);
+  assert((await listTasks({ kind: "all" }, access, repo)).length === 1);
   for (
     const query of [
       { kind: "number", number: first.task.number },
@@ -751,11 +751,11 @@ Deno.test("combined task filters OR assignment targets and AND date and priority
       targets: [{ kind: "me" }, { kind: "user", userId: "UALICE" }],
       priority: 1,
       dueDate: "2026-11-04",
-    }) === "Alice,Frontend,Mine",
+    }) === "Alice,Frontend",
   );
   assert(
     await names({ kind: "filters", targets: [{ kind: "me" }] }) ===
-      "Frontend,Later,Lower priority,Mine",
+      "Frontend,Later,Lower priority",
   );
   assert(
     await names({ kind: "filters", targets: [{ kind: "my-teams" }] }) === "Frontend",
@@ -770,10 +770,12 @@ Deno.test("combined task filters OR assignment targets and AND date and priority
     await names({ kind: "filters", targets: [{ kind: "team", teamId: "all" }] }) ===
       "Everyone",
   );
-  assert((await listTasks({ kind: "filters" }, access, repo)).length === cases.length);
+  assert(
+    (await listTasks({ kind: "filters" }, access, repo)).length === cases.length - 1,
+  );
   assert(
     (await listTasks({ kind: "filters", targets: [] }, access, repo)).length ===
-      cases.length,
+      cases.length - 1,
   );
 });
 
@@ -832,12 +834,24 @@ Deno.test("soon filters use London calendar days with inclusive bounds across cl
       new Date(scenario.now),
     );
     assert(
-      tasks.map((task) => task.dueDate).join() === `${scenario.start},${scenario.end}`,
+      tasks.map((task) => task.dueDate).join() === scenario.start,
       `Wrong calendar window at ${scenario.now}`,
     );
-    assert(tasks[1].completed, "Completion is independent from the soon date filter.");
+    const completed = await listTasks(
+      { kind: "filters", soon: true, completed: true },
+      access,
+      repo,
+      new Date(scenario.now),
+    );
+    assert(completed.length === 1 && completed[0].dueDate === scenario.end);
     const combined = await listTasks(
-      { kind: "filters", soon: true, dueDate: scenario.end, priority: 1 },
+      {
+        kind: "filters",
+        soon: true,
+        dueDate: scenario.end,
+        priority: 1,
+        completed: true,
+      },
       access,
       repo,
       new Date(scenario.now),
@@ -854,17 +868,18 @@ Deno.test("soon filters use London calendar days with inclusive bounds across cl
   }
 });
 
-Deno.test("public Access permits management but does not let an unrelated viewer edit details", async () => {
+Deno.test("public Access permits an unrelated viewer to edit details and complete", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask({ name: "Shared" }, context, repo, access);
   const stranger = { userId: "USTRANGER", teamIds: [] };
-  const writes = repo.writes;
-  assert(
-    await rejection(() =>
-      updateTask(task, { priority: 1 }, reply("9.1", stranger.userId), repo, stranger)
-    ) instanceof TaskAccessError,
+  const edited = await updateTask(
+    task,
+    { priority: 1 },
+    reply("9.1", stranger.userId),
+    repo,
+    stranger,
   );
-  assert(repo.writes === writes);
+  assert(edited.task.priority === 1);
   const completed = await updateTask(
     task,
     { completed: true },
@@ -911,17 +926,14 @@ Deno.test("explicit view and edit permissions grant no creator or assignee bypas
       (await listTasks({ kind: "all" }, access, repo)).length === 0,
   );
   const alice = { userId: "UALICE", teamIds: [] };
-  assert(
-    await rejection(() =>
-      updateTask(
-        task,
-        { description: "Visible editor, not an assignee." },
-        reply("9.3", alice.userId),
-        repo,
-        alice,
-      )
-    ) instanceof TaskAccessError,
+  const edited = await updateTask(
+    task,
+    { description: "Visible editor, not an assignee." },
+    reply("9.3", alice.userId),
+    repo,
+    alice,
   );
+  assert(edited.task.description === "Visible editor, not an assignee.");
 });
 
 Deno.test("viewer and editor groups are independent and revocation fails closed", async () => {
@@ -1720,7 +1732,7 @@ Deno.test("creators administer access while completion and deletion always requi
   assert(completed.task.completed);
 });
 
-Deno.test("a non-owner cannot reopen accepted ownership through assignment edits even with management access", async () => {
+Deno.test("Access holders can explicitly reassign an owned task with fresh permission checks", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
     { name: "Protected owner", assignees: ["UALICE", "UBOB"] },
@@ -1741,30 +1753,18 @@ Deno.test("a non-owner cannot reopen accepted ownership through assignment edits
     canEditTask(accepted.task, other),
     "Management Access does not confer assignment ownership",
   );
-  const writes = repo.writes;
-  for (
-    const [index, patch] of [
-      { assignees: [] },
-      { assignees: ["UBOB"] },
-      { set: { assignees: ["UBOB"] } },
-      { clear: ["assignees"] },
-    ].entries()
-  ) {
-    const error = await rejection(() =>
-      updateTask(
-        task,
-        patch as TaskPatch,
-        reply(`10.${index + 1}`, other.userId),
-        repo,
-        other,
-      )
-    );
-    assert(error instanceof TaskAccessError || error instanceof TaskCommandError);
-    assert(
-      repo.writes === writes &&
-        repo.rows.get(task.id)!.assignmentTree?.acceptedBy === owner.userId,
-    );
-  }
+  const reassigned = await updateTask(
+    accepted.task,
+    { assignees: ["UBOB"] },
+    reply("10.1", other.userId),
+    repo,
+    other,
+  );
+  assert(
+    reassigned.task.assignees.join() === "UBOB" &&
+      reassigned.task.assignmentTree?.acceptedBy === "UBOB",
+  );
+  await repo.save(accepted.task);
   const delegated = await updateTask(
     accepted.task,
     { set: { assignees: ["UCAROL"] } },
@@ -1829,7 +1829,7 @@ Deno.test("direct self-assignment accepts on creation and updates, while your ow
 Deno.test("editing requires creator, accepted ownership, or accepted collaboration, with fresh role checks", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
-    { name: "Roles", assignees: ["UALICE"] },
+    { name: "Roles", assignees: ["UALICE"], editPerms: ["UCREATOR"] },
     context,
     repo,
     access,

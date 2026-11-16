@@ -87,6 +87,12 @@ Deno.test("DM list threads and the latest single-task conversation support done 
       repository,
       access,
     );
+    await createTask(
+      { name: "Third" },
+      { userId: access.userId, channelId: "COTHER", messageTs: "1.3" },
+      repository,
+      access,
+    );
     await handleMessage(
       { ...event, message_ts: "2.3", text: "ls" },
       client,
@@ -119,7 +125,7 @@ Deno.test("DM list threads and the latest single-task conversation support done 
       undefined,
       contexts,
     );
-    assert([...repository.rows.values()].every((item) => item.completed));
+    assert([...repository.rows.values()].filter((item) => item.completed).length === 2);
     repository.rows.set(task.id, { ...task, viewPerms: [] });
     await handleMessage(
       { ...event, message_ts: "2.5", thread_ts: "10.1", text: "done" },

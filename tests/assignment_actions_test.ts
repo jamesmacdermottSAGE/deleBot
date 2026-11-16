@@ -721,7 +721,12 @@ Deno.test("Slack's submitted rich-text modal payload delegates to a team and for
     }`,
   );
   assert(batches?.invitations?.UCAROL.executionId === "FXWORKER");
-  assert(f.posts.length === 2 && f.posts[1].channel === "DUCAROL");
+  assert(f.posts.length === 3 && f.posts[1].channel === "DUCAROL");
+  assert(
+    f.posts.some((post) =>
+      post.channel === f.task.channelId && post.text.includes("Assignment delegated")
+    ),
+  );
   assert(f.posts[1].text.includes("*Note:* Please check this today."));
   assert(
     f.updates.some((update) =>
@@ -1007,22 +1012,12 @@ Deno.test("serialized Slack stores preserve X to Y to X rejections and creator D
   const submission = await queuedForm(f, "UCREATOR");
   f.dependencies.deliveryExecutionId = "FXDELEGATE";
   assert((await runQueuedDelegation(submission, f.dependencies)).ok);
-  f.dependencies.deliveryExecutionId = "FXREJECTX";
-  const xReject = f.action(ASSIGNMENT_REJECT, "UCREATOR");
-  assert((await runQueuedAssignmentAction(xReject, f.dependencies)).ok);
-  assert((await repository.findById(f.task.id))!.assignees.join() === "UALICE");
-  f.dependencies.deliveryExecutionId = "FXREJECTY";
-  assert(
-    (await runQueuedAssignmentAction(
-      f.action(ASSIGNMENT_REJECT, "UALICE"),
-      f.dependencies,
-    )).ok,
-  );
+  // Delegation directly back to the creator exhausts Y's only branch.
   const returned = (await repository.findById(f.task.id))!;
   assert(returned.assignees.join() === "UCREATOR" && !returned.deleted);
   assert(f.invitation("UCREATOR").invitation.creatorReturn);
-  // Retrying an earlier rejection must never reject the new creator generation.
-  assert((await runQueuedAssignmentAction(xReject, f.dependencies)).ok);
+  // Replaying delegation must never consume the returned creator generation.
+  assert((await runQueuedDelegation(submission, f.dependencies)).ok);
   assert(!(await repository.findById(f.task.id))!.deleted);
   f.dependencies.deliveryExecutionId = "FXDELETE";
   const deletion = f.action(ASSIGNMENT_RETURN_DELETE, "UCREATOR");

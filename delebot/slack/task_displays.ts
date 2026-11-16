@@ -1,5 +1,8 @@
+import { withKeyLock } from "../tasks/mutation.ts";
+import { SlackTaskRepository } from "../tasks/repository.ts";
+import { SlackDmContexts } from "./dm_context.ts";
 import { DefineDatastore, Schema } from "deno-slack-sdk/mod.ts";
-import { canAccessTask } from "../tasks/access.ts";
+import { canAccessTask, isPublicTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
 import { formatTask, splitTaskReply, taskTitle } from "./messages.ts";
 import type { SlackAPIClient } from "deno-slack-api/types.ts";
@@ -15,7 +18,16 @@ import {
 } from "./notifications.ts";
 
 export function taskDisplays(client: SlackAPIClient): TaskDisplays {
-  return new SlackTaskDisplays(client, taskAccessLoader(client));
+  return new SlackTaskDisplays(
+    client,
+    taskAccessLoader(client),
+    (id) => new SlackTaskRepository(client).findById(id),
+    async (channel, ts, user, taskId) => {
+      const contexts = new SlackDmContexts(client);
+      await contexts.save(channel, ts, user, [taskId], "context");
+      await contexts.save(channel, ts, "*", [taskId], "context");
+    },
+  );
 }
 
 export const TaskDisplaysDatastore = DefineDatastore({
@@ -28,8 +40,16 @@ export const TaskDisplaysDatastore = DefineDatastore({
     message_ts: { type: Schema.types.string },
     user_id: { type: Schema.types.string },
     part: { type: Schema.types.integer },
+    thread_ts: { type: Schema.types.string },
+    kind: { type: Schema.types.string },
   },
 });
+export interface TaskUpdateNotice {
+  eventKey: string;
+  text: string;
+  sourceChannel: string;
+  sourceThread: string;
+}
 export interface TaskDisplays {
   track(
     taskId: string,
@@ -37,8 +57,9 @@ export interface TaskDisplays {
     ts: string,
     user: string,
     part?: number,
+    threadTs?: string,
   ): Promise<void>;
-  refresh(task: Task): Promise<number>;
+  refresh(task: Task, notice?: TaskUpdateNotice): Promise<number>;
 }
 interface Client {
   apps: {
@@ -69,6 +90,16 @@ interface Client {
     };
   };
   chat: {
+    postMessage?(
+      args: {
+        channel: string;
+        thread_ts: string;
+        text: string;
+        client_msg_id: string;
+        unfurl_links: boolean;
+        unfurl_media: boolean;
+      },
+    ): Promise<{ ok: boolean; ts?: string; error?: string }>;
     update(
       args: {
         channel: string;
@@ -92,8 +123,22 @@ export class SlackTaskDisplays implements TaskDisplays {
       user: string,
       workspaceId?: string,
     ) => Promise<TaskAccess & { teamNames?: Record<string, string> }>,
+    private loadTask?: (id: string) => Promise<Task | null>,
+    private rememberTask?: (
+      channel: string,
+      ts: string,
+      user: string,
+      taskId: string,
+    ) => Promise<void>,
   ) {}
-  async track(taskId: string, channel: string, ts: string, user: string, part = 0) {
+  async track(
+    taskId: string,
+    channel: string,
+    ts: string,
+    user: string,
+    part = 0,
+    threadTs = ts,
+  ) {
     const result = await this.client.apps.datastore.put({
       datastore: TaskDisplaysDatastore.name,
       item: {
@@ -103,11 +148,19 @@ export class SlackTaskDisplays implements TaskDisplays {
         message_ts: ts,
         user_id: user,
         part,
+        thread_ts: threadTs,
       },
     });
     if (!result.ok) throw new Error("Cannot track task message.");
   }
-  async refresh(task: Task): Promise<number> {
+  async refresh(task: Task, notice?: TaskUpdateNotice): Promise<number> {
+    return await withKeyLock(task.id, async () => {
+      const current = this.loadTask ? await this.loadTask(task.id) : task;
+      if (!current) return 0;
+      return await this.refreshUnlocked(current, notice);
+    });
+  }
+  private async refreshUnlocked(task: Task, notice?: TaskUpdateNotice): Promise<number> {
     // Conversation context also references interactive invitations. Identify those
     // before recovering old cards, so card refreshes can never strip their controls.
     const invitations = new Map<
@@ -168,7 +221,7 @@ export class SlackTaskDisplays implements TaskDisplays {
       if (!page.ok || !Array.isArray(page.items)) {
         throw new Error("Cannot load displayed task messages.");
       }
-      rows.push(...page.items);
+      rows.push(...page.items.filter((row) => row.kind !== "update"));
       cursor = page.next_cursor || page.response_metadata?.next_cursor || undefined;
       if (cursor && cursors.has(cursor)) throw new Error("Repeated display cursor.");
       if (cursor) cursors.add(cursor);
@@ -364,6 +417,96 @@ export class SlackTaskDisplays implements TaskDisplays {
         if (!result.ok && result.error !== "message_not_modified") failed++;
       } catch {
         failed++;
+      }
+    }
+    if (notice && this.client.chat.postMessage) {
+      const destinations = new Map<
+        string,
+        { channel: string; thread: string; user: string }
+      >();
+      const add = (channel: unknown, thread: unknown, user: unknown) => {
+        if (
+          typeof channel !== "string" || !/^[CDG][A-Z0-9]+$/.test(channel) ||
+          (!channel.startsWith("D") && !isPublicTask(task)) ||
+          typeof thread !== "string" || !/^\d+\.\d+$/.test(thread) ||
+          typeof user !== "string" || !/^[UW][A-Z0-9]+$/.test(user)
+        ) return;
+        const key = `${channel}:${user}`;
+        const previous = destinations.get(key);
+        if (!previous || Number(thread) > Number(previous.thread)) {
+          destinations.set(key, { channel, thread, user });
+        }
+      };
+      add(task.channelId, task.threadTs, task.createdBy);
+      for (const row of rows) {
+        if (!row.combined) {
+          add(row.channel_id, row.thread_ts ?? row.message_ts, row.user_id);
+        }
+      }
+      const newlyInvited = new Set<string>();
+      for (const { batch, invitation } of invitations.values()) {
+        if (batch.eventKey === notice.eventKey && invitation.status === "pending") {
+          newlyInvited.add(invitation.recipientId);
+        }
+        add(invitation.channelId, invitation.messageTs, invitation.recipientId);
+      }
+      for (const delivery of Object.values(task.participation?.deliveryEvents ?? {})) {
+        for (const message of delivery.confirmations ?? []) {
+          add(message.channelId, message.messageTs, message.userId);
+        }
+        for (const [user, binding] of Object.entries(delivery.deliveries ?? {})) {
+          add(binding.channelId, binding.messageTs, user);
+        }
+      }
+      for (const destination of destinations.values()) {
+        if (newlyInvited.has(destination.user)) continue;
+        if (
+          destination.channel === notice.sourceChannel &&
+          destination.thread === notice.sourceThread
+        ) continue;
+        try {
+          const access = await this.loadAccess(task, destination.user, workspaceId);
+          if (!canAccessTask({ ...task, deleted: false }, access)) continue;
+          const id =
+            `update:${task.id}:${notice.eventKey}:${destination.channel}:${destination.user}`;
+          const saved = await this.client.apps.datastore.get({
+            datastore: TaskDisplaysDatastore.name,
+            id,
+          });
+          if (!saved.ok) throw new Error("Cannot check update delivery.");
+          if (saved.item?.kind === "update") continue;
+          const bytes = new Uint8Array(
+            await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id)),
+          );
+          const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+          const clientId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${
+            hex.slice(13, 16)
+          }-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+          const result = await this.client.chat.postMessage({
+            channel: destination.channel,
+            thread_ts: destination.thread,
+            text: notice.text,
+            client_msg_id: clientId,
+            unfurl_links: false,
+            unfurl_media: false,
+          });
+          if (!result.ok || !result.ts) throw new Error("Cannot send task update.");
+          if (this.rememberTask) {
+            await this.rememberTask(
+              destination.channel,
+              result.ts,
+              destination.user,
+              task.id,
+            );
+          }
+          const stored = await this.client.apps.datastore.put({
+            datastore: TaskDisplaysDatastore.name,
+            item: { id, task_id: task.id, kind: "update" },
+          });
+          if (!stored.ok) throw new Error("Cannot save update delivery.");
+        } catch {
+          failed++;
+        }
       }
     }
     return failed;

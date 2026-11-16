@@ -966,7 +966,7 @@ Deno.test("name-only creation and combined thread updates show current fields an
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   assert(
     posts.at(-1)!.text.includes(`#${initial.number}`) &&
-      posts.at(-1)!.text.includes("Updated.") &&
+      posts.at(-1)!.text.includes("updated") &&
       posts.at(-1)!.text.includes("Review PRs") &&
       !posts.at(-1)!.text.includes("*Assignees:*") &&
       !posts.at(-1)!.text.includes("https://b.example"),
@@ -1054,7 +1054,7 @@ Deno.test("a numbered update completes a task outside its original thread", asyn
   const updated = [...repo.rows.values()][0];
   assert(updated.completed && updated.status === "completed" && updated.priority === 2);
   assert(posts.at(-1)!.channel === "COTHER" && posts.at(-1)!.thread_ts === "10.1");
-  assert(posts.at(-1)!.text.includes("*Completed:* ✅"));
+  assert(posts.at(-1)!.text.includes("Completed."));
 });
 
 Deno.test("work done completes the unique task in the current thread", async () => {
@@ -1073,7 +1073,7 @@ Deno.test("work done completes the unique task in the current thread", async () 
   );
   assert([...repo.rows.values()][0].completed && repo.writes === 2);
   assert(
-    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Updated.") &&
+    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Completed.") &&
       !posts.at(-1)!.text.includes("*Completed:*"),
   );
 });
@@ -1094,7 +1094,7 @@ Deno.test("print reprints current task details without editing or assigning it",
   );
   assert(
     posts.at(-1)!.text.startsWith("✅ *Task #") &&
-      posts.at(-1)!.text.includes("Updated.") &&
+      posts.at(-1)!.text.includes("updated") &&
       !posts.at(-1)!.text.includes("Current description"),
   );
   const writes = repo.writes;
@@ -1271,7 +1271,7 @@ Deno.test("a later task update resumes pending assignment notifications without 
   );
   assert(Number(repo.writes) === 2 && Number(notificationPosts.length) === 2);
   assert(notificationPosts[1].channel === "DUALICE");
-  assert(posts.at(-1)!.text.includes("Updated."));
+  assert(posts.at(-1)!.text.includes("updated"));
   await handleMessage(
     { ...event, thread_ts: event.message_ts, message_ts: "9.3", text: "<@UBOT> done" },
     client,
@@ -1543,7 +1543,7 @@ Deno.test("edit replaces complete fields and delete clears only the named fields
       replaced.dueDate === "2026-11-07",
   );
   assert(
-    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Updated.") &&
+    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("updated") &&
       !posts.at(-1)!.text.includes("Old description"),
   );
   await handleMessage(
@@ -1761,7 +1761,7 @@ Deno.test("unknown permission groups and invalid mixed edits are rejected withou
       repo,
     );
     assert(repo.writes === 1 && [...repo.rows.values()][0].description === "");
-    assert(!posts.at(-1)!.text.includes("Updated."));
+    assert(!posts.at(-1)!.text.includes("updated"));
   }
 });
 
@@ -1884,4 +1884,35 @@ Deno.test("assign me creates and updates self-assigned tasks as accepted without
     );
     assert(notificationPosts.length === 0 && openedDms.length === 0);
   }
+});
+
+Deno.test("an identical assign retry resumes failed delivery without reopening the original invitation", async () => {
+  const f = fixture();
+  const repo = new MemoryTaskRepository();
+  await handleMessage(
+    { ...f.event, text: "<@UBOT> task Retry assign <@UALICE>" },
+    f.client,
+    repo,
+  );
+  const send = f.notificationClient.chat.postMessage;
+  let fail = true;
+  f.notificationClient.chat.postMessage = (args) =>
+    args.channel === "DUBOB" && fail
+      ? Promise.resolve({ ok: false, error: "ratelimited" })
+      : send(args);
+  const assignment = {
+    ...f.event,
+    thread_ts: f.event.message_ts,
+    message_ts: "9.2",
+    text: "<@UBOT> assign <@UBOB>",
+  };
+  await handleMessage(assignment, f.client, repo);
+  assert(repo.writes === 2 && f.posts.at(-1)!.text.includes("could not be delivered"));
+  fail = false;
+  await handleMessage(assignment, f.client, repo);
+  assert(repo.writes === 2);
+  assert(f.notificationPosts.filter((post) => post.channel === "DUALICE").length === 1);
+  assert(f.notificationPosts.filter((post) => post.channel === "DUBOB").length === 1);
+  await handleMessage(assignment, f.client, repo);
+  assert(f.notificationPosts.length === 2);
 });

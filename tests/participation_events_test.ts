@@ -127,7 +127,7 @@ function fixture() {
   }
   const invitation = (userId: string, action: string) =>
     posts.filter((post) =>
-      post.channel === `D${userId}` && JSON.stringify(post.blocks).includes(action)
+      post.channel === `D${userId}` && JSON.stringify(post.blocks ?? []).includes(action)
     ).at(-1)!;
   const task = () => [...repository.rows.values()][0];
   return {
@@ -237,7 +237,7 @@ Deno.test("access me cannot grant a pending assignee editing privileges", async 
   await f.command("UALICE", "access me", invite.ts);
   assert(f.task().editPerms?.join() === "UMANAGER");
   assert(
-    f.posts.at(-1)!.text.includes("Only the creator") &&
+    f.posts.at(-1)!.text.includes("You need Access") &&
       f.posts.at(-1)!.text.includes(`#${f.task().number}: Restricted`),
   );
 });
@@ -343,7 +343,9 @@ Deno.test("task-related channel messages support replies from another authorized
   await f.command("UALICE", "<@UBOT> p 2", accepted.ts, "CTEST");
   assert(f.task().priority === 2);
   await f.command("UOTHER", "<@UBOT> p 3", accepted.ts, "CTEST");
-  assert(f.task().priority === 2 && f.posts.at(-1)!.text.includes("Only the creator"));
+  assert(
+    f.task().priority === 3 && f.posts.at(-1)!.text.includes("Priority updated to 3"),
+  );
 });
 
 Deno.test("private-channel task acknowledgements retain context without granting other viewers access", async () => {
@@ -360,4 +362,105 @@ Deno.test("private-channel task acknowledgements retain context without granting
   assert(f.task().priority === 1);
   await f.command("UOTHER", "<@UBOT> p 3", acknowledgement.ts, "CPRIVATE");
   assert(f.task().priority === 1 && !f.posts.at(-1)!.text.includes("Secret"));
+});
+
+Deno.test("incomplete requests leave completion in place until an Access holder approves", async () => {
+  const f = fixture();
+  await f.command("UCREATOR", "task Reopen access <@UMANAGER>");
+  const number = f.task().number;
+  await f.command("UMANAGER", `${number} complete`);
+  assert(f.task().completed);
+  await f.command("UBOB", `${number} incomplete`);
+  const request = Object.values(f.task().participation!.requests)[0];
+  assert(
+    request.kind === "incomplete" && request.status === "pending" && f.task().completed,
+  );
+  const approval = f.invitation("UMANAGER", "delebot_request_approve");
+  assert(approval.text.includes("reopening"));
+  await f.command("UOTHER", `${number} approve incomplete`);
+  assert(f.task().completed && request.status === "pending");
+  await f.command("UMANAGER", "approve incomplete", approval.ts);
+  assert(!f.task().completed && f.task().status === "open");
+  assert(
+    f.updates.some((update) => update.text.includes("✅ Reopening request approved")),
+  );
+});
+
+Deno.test("an incomplete request rejection has an X and preserves completion", async () => {
+  const f = fixture();
+  await f.command("UCREATOR", "task Reopen access <@UMANAGER>");
+  const number = f.task().number;
+  await f.command("UMANAGER", `${number} complete`);
+  await f.command("UBOB", `${number} edit incomplete`);
+  const approval = f.invitation("UMANAGER", "delebot_request_approve");
+  await f.command("UMANAGER", "deny incomplete", approval.ts);
+  assert(f.task().completed);
+  assert(
+    f.updates.some((update) => update.text.includes("❌ Reopening request rejected")),
+  );
+});
+
+Deno.test("ls stays on the task of the current thread and complete selects completed tasks", async () => {
+  const f = fixture();
+  const created = await f.command("UCREATOR", "task First");
+  const first = f.task();
+  await f.command("UCREATOR", "task Second");
+  const before = f.posts.length;
+  await f.command("UCREATOR", "ls", created.message_ts);
+  const listed = f.posts.slice(before);
+  assert(
+    listed.length === 1 && listed[0].text.includes("First") &&
+      !listed[0].text.includes("Second"),
+  );
+  assert(listed[0].thread_ts === created.message_ts);
+  await f.command("UCREATOR", `${first.number} complete`);
+  await f.command("UCREATOR", "ls complete", created.message_ts);
+  assert(
+    f.posts.at(-1)!.text.includes("First") &&
+      f.posts.at(-1)!.text.includes("*Completed:* ✅"),
+  );
+  await f.command("UCREATOR", "ls");
+  assert(
+    f.posts.at(-1)!.text.includes("Second") && !f.posts.at(-1)!.text.includes("First"),
+  );
+  await f.command("UCREATOR", "ls complete");
+  assert(
+    f.posts.at(-1)!.text.includes("First") && !f.posts.at(-1)!.text.includes("Second"),
+  );
+});
+
+Deno.test("the inviter's collaboration request updates for acceptance and rejection", async () => {
+  const f = fixture();
+  await f.command("UCREATOR", "task Together assign <@UALICE>");
+  const ownerInvite = f.invitation("UALICE", "delebot_assignment_accept");
+  await f.command("UALICE", "accept", ownerInvite.ts);
+  await f.command("UALICE", "collab <@UBOB> <@UCAROL>", ownerInvite.ts);
+  const confirmation = f.posts.filter((post) => post.channel === "DUALICE").at(-1)!;
+  const bob = f.invitation("UBOB", "delebot_collab_accept");
+  const carol = f.invitation("UCAROL", "delebot_collab_reject");
+  await f.command("UBOB", "collab accept", bob.ts);
+  await f.command("UCAROL", "collab reject", carol.ts);
+  const updated = f.updates.filter((entry) =>
+    entry.channel === confirmation.channel && entry.ts === confirmation.ts
+  ).at(-1)!;
+  assert(
+    updated.text.includes("<@UBOB> ✅ accepted") &&
+      updated.text.includes("<@UCAROL> ❌ rejected"),
+  );
+  assert(
+    f.updates.some((entry) =>
+      entry.ts === bob.ts && entry.text.includes("Collaboration accepted") &&
+      entry.blocks.length === 0
+    ),
+  );
+});
+
+Deno.test("assigning an already assigned person gives a distinct response and keeps existing invitations", async () => {
+  const f = fixture();
+  const created = await f.command("UCREATOR", "task Assigned assign <@UALICE>");
+  const invitation = f.invitation("UALICE", "delebot_assignment_accept");
+  await f.command("UCREATOR", "assign <@UALICE>", created.message_ts);
+  assert(f.posts.at(-1)!.text.includes("Already assigned to these recipients"));
+  assert(f.posts.filter((post) => post.channel === "DUALICE").length === 1);
+  assert(f.invitation("UALICE", "delebot_assignment_accept").ts === invitation.ts);
 });

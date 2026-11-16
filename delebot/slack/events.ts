@@ -1,3 +1,5 @@
+import { TaskLockTimeoutError } from "../tasks/mutation.ts";
+import { describeTaskChanges } from "./task_changes.ts";
 import { delegationEndpoint } from "./delegation_dispatch.ts";
 import {
   productionDependencies,
@@ -13,12 +15,14 @@ import { SlackAPI } from "deno-slack-api/mod.ts";
 import { canManageTask } from "../tasks/access.ts";
 import {
   inviteCollaborators,
+  rememberCollaborationConfirmation,
   rememberRequestConfirmation,
   requestTaskAction,
   respondToCollaboration,
   respondToTaskAction,
 } from "../tasks/participation.ts";
 import {
+  collaborationStatusText,
   handleParticipationAction,
   notifyParticipation,
   PARTICIPATION_ACTION_IDS,
@@ -46,7 +50,7 @@ async function resolveDmTarget(
       : await conversations.get(context.channelId, key, "*");
     if (ids.length > 1) {
       throw new TaskCommandError(
-        "Several tasks were shown. Use a task number, e.g. 123 done, or use ls task Name to select one.",
+        "Several tasks were shown. Use a task number, e.g. 123 complete, or use ls task Name to select one.",
       );
     }
     if (ids.length === 1) {
@@ -269,6 +273,8 @@ export async function handleMessage(
   let includeTaskIdentity = true;
   let requestConfirmationId: string | undefined;
   let listedTasks: Task[] = [];
+  let threadList = false;
+  let updateNotice: string | undefined;
   let replies = [text ? UNKNOWN_COMMAND : GREETING];
   let hasTaskCards = false;
   let replyWorkspaceId: string | undefined;
@@ -420,7 +426,32 @@ export async function handleMessage(
       }
       if (command.kind === "list") {
         hasTaskCards = true;
-        const tasks = await listTasks(command.query, access, repository);
+        let tasks: Task[];
+        if (
+          event.thread_ts && event.thread_ts !== event.message_ts &&
+          command.query.kind !== "number" && command.query.kind !== "name"
+        ) {
+          try {
+            const target = await resolveDmTarget(
+              undefined,
+              context,
+              repository,
+              access,
+              dmContexts,
+              event.thread_ts,
+            );
+            tasks = target.completed === (command.query.completed ?? false)
+              ? [target]
+              : [];
+            threadList = true;
+          } catch (error) {
+            if (
+              !(error instanceof TaskCommandError) ||
+              !error.message.startsWith("No task available in this thread")
+            ) throw error;
+            tasks = await listTasks(command.query, access, repository);
+          }
+        } else tasks = await listTasks(command.query, access, repository);
         listedTasks = tasks;
         shownTaskIds = tasks.map((task) => task.id);
         replies = command.query.kind === "number" || command.query.kind === "name"
@@ -483,7 +514,7 @@ export async function handleMessage(
           await deleteTask(target, context, repository, access);
           changedTask = { ...target, deleted: true };
           privateReply = !isDm && !isPublicTask(target);
-          replies = [`${taskTitle(target)} — Deleted.`];
+          replies = [`✅ ${taskTitle(target)} Deleted.`];
           shownTaskIds = [target.id];
           if (notifications) {
             try {
@@ -506,6 +537,7 @@ export async function handleMessage(
             }
           }
         }
+        updateNotice = replies[0];
       } else {
         let task;
         let acknowledgement: string;
@@ -539,6 +571,21 @@ export async function handleMessage(
           );
           identifiedTask = target;
           shownTaskIds = [target.id];
+          if (
+            command.kind === "update" && !canManageTask(target, access) &&
+            (command.patch.completed !== undefined ||
+              command.patch.set?.completed !== undefined ||
+              command.patch.clear?.includes("completed")) &&
+            (!Object.keys(command.patch).every((key) =>
+              ["completed", "set", "clear"].includes(key)
+            ) ||
+              !Object.keys(command.patch.set ?? {}).every((key) => key === "completed") ||
+              !(command.patch.clear ?? []).every((key) => key === "completed"))
+          ) {
+            throw new TaskCommandError(
+              "Send complete or incomplete separately from other edits when requesting approval.",
+            );
+          }
           const approvalRequestId = command.kind === "approval-response"
             ? command.requestId ?? uniqueRequest(target, command.kindOfAction)
             : undefined;
@@ -567,12 +614,20 @@ export async function handleMessage(
               repository,
               access,
             )
-            : command.kind === "update" && command.patch.completed === true &&
+            : command.kind === "update" &&
+                (command.patch.completed !== undefined ||
+                  command.patch.set?.completed !== undefined ||
+                  command.patch.clear?.includes("completed")) &&
                 !canManageTask(target, access)
-            ? await requestTaskAction(target, "complete", context, repository, access)
-            : command.kind === "update" && command.patch.set?.completed === true &&
-                !canManageTask(target, access)
-            ? await requestTaskAction(target, "complete", context, repository, access)
+            ? await requestTaskAction(
+              target,
+              (command.patch.completed ?? command.patch.set?.completed ?? false)
+                ? "complete"
+                : "incomplete",
+              context,
+              repository,
+              access,
+            )
             : command.kind === "response"
             ? await respondToAssignment(
               target,
@@ -589,37 +644,41 @@ export async function handleMessage(
               access,
             );
           task = result.task;
-          acknowledgement = result.updated ? "Updated" : "Already applied to";
+          acknowledgement = result.updated
+            ? describeTaskChanges(target, task)
+            : "Already applied";
           if ("requestId" in result && typeof result.requestId === "string") {
             requestConfirmationId = result.requestId;
           }
           if (command.kind === "approval-response") {
             const request = task.participation!.requests[approvalRequestId!];
             acknowledgement = `${
-              request.kind === "complete" ? "Completion" : "Deletion"
+              request.kind === "complete"
+                ? "Completion"
+                : request.kind === "incomplete"
+                ? "Reopening"
+                : "Deletion"
             } request ${request.status}`;
           } else if (command.kind === "collaboration-response") {
             acknowledgement = `Collaboration ${command.accept ? "accepted" : "rejected"}`;
           } else if (command.kind === "collaborate") {
             acknowledgement = "Collaboration requested";
           } else if (
-            command.kind === "update" &&
-            ["editPerms", "viewPerms", "set", "matchPerms"].some((key) =>
-              key in command.patch
-            ) && Object.keys(command.patch).every((key) =>
-              ["editPerms", "viewPerms", "set", "matchPerms"].includes(key)
-            ) && Object.keys(command.patch.set ?? {}).every((key) =>
-              ["editPerms", "viewPerms"].includes(key)
-            )
+            command.kind === "update" && acknowledgement === "No fields changed" &&
+            (command.patch.assignees !== undefined ||
+              command.patch.set?.assignees !== undefined)
           ) {
-            acknowledgement = "Access updated";
-          }
-          if (
-            command.kind === "update" &&
-            (command.patch.completed || command.patch.set?.completed) &&
-            !canManageTask(target, access)
-          ) {
-            acknowledgement = "Requested completion of";
+            acknowledgement =
+              "Already assigned to these recipients. Existing responses kept";
+          } else if (command.kind === "response") {
+            const response = task.assignmentResponses?.[event.user_id];
+            acknowledgement = response?.status === "rejected"
+              ? "Assignment rejected"
+              : command.decision.kind === "accept"
+              ? "Assignment accepted"
+              : command.decision.kind === "delegate"
+              ? "Assignment delegated"
+              : "Assignment rejected";
           }
         }
         const stillVisible = canAccessTask(task, access);
@@ -628,7 +687,7 @@ export async function handleMessage(
         const shortReply = quiet || !!requestConfirmationId ||
           command.kind === "approval-response" ||
           command.kind === "collaboration-response" || command.kind === "collaborate" ||
-          acknowledgement === "Access updated";
+          command.kind === "update";
         includeTaskIdentity = stillVisible || !!task.deleted;
         hasTaskCards = stillVisible && !shortReply;
         changedTask = task;
@@ -643,8 +702,11 @@ export async function handleMessage(
                   task.participation!.requests[requestConfirmationId],
                 )
                 : `${
-                  command.kind === "approval-response" && !command.approve ? "❌" : "✅"
-                } ${taskTitle(task)} — ${acknowledgement}.`
+                  (command.kind === "approval-response" && !command.approve) ||
+                    (command.kind === "collaboration-response" && !command.accept)
+                    ? "❌"
+                    : "✅"
+                } ${taskTitle(task)} ${acknowledgement}.`
               : `${acknowledgement} task #${task.number}.\n\n${
                 formatTask(task, teamNames)
               }`,
@@ -658,6 +720,7 @@ export async function handleMessage(
                 : `${taskTitle(task)} — Deleted.`)
               : "Changes saved. Your viewing permissions no longer include this task.",
           ];
+        if (command.kind !== "create") updateNotice = replies[0];
         const key = mutationKey(context);
         const assigned = task.assignmentEvents?.[key] ?? [];
         if (notifications) {
@@ -704,8 +767,24 @@ export async function handleMessage(
         );
       }
     } catch (error) {
+      if (
+        !(error instanceof TaskAccessError) && !(error instanceof TaskCommandError) &&
+        !(error instanceof TaskLockTimeoutError)
+      ) {
+        console.error(
+          JSON.stringify({
+            event: "task_command_failed",
+            command: command.kind,
+            errorType: error instanceof Error ? error.name : "unknown",
+            frames: error instanceof Error
+              ? error.stack?.split("\n").slice(1, 5)
+              : undefined,
+          }),
+        );
+      }
       replies = [
-        error instanceof TaskAccessError || error instanceof TaskCommandError
+        error instanceof TaskAccessError || error instanceof TaskCommandError ||
+          error instanceof TaskLockTimeoutError
           ? error.message
           : command.kind === "list"
           ? "I couldn't load tasks. Please try again shortly."
@@ -739,7 +818,17 @@ export async function handleMessage(
     try {
       let failed = 0;
       for (const task of changedTask ? [changedTask] : listedTasks) {
-        failed += await displays.refresh(task);
+        failed += await displays.refresh(
+          task,
+          updateNotice
+            ? {
+              eventKey: mutationKey(context),
+              text: updateNotice,
+              sourceChannel: event.channel_id,
+              sourceThread: context.threadTs!,
+            }
+            : undefined,
+        );
       }
       if (failed) {
         replies.push(
@@ -800,7 +889,7 @@ export async function handleMessage(
   // create or continue the thread of the user's message.
   if (
     command.kind === "list" && command.query.kind !== "name" &&
-    command.query.kind !== "number"
+    command.query.kind !== "number" && !threadList
   ) replyThread = undefined;
   if (directReply && !isDm) {
     try {
@@ -886,7 +975,14 @@ export async function handleMessage(
     ) {
       try {
         const part = parts.get(ids[0]) ?? 0;
-        await displays.track(ids[0], replyChannel, replyTs, event.user_id, part);
+        await displays.track(
+          ids[0],
+          replyChannel,
+          replyTs,
+          event.user_id,
+          part,
+          replyThread,
+        );
         parts.set(ids[0], part + 1);
       } catch {
         return {
@@ -922,6 +1018,30 @@ export async function handleMessage(
             "Reply sent, but I couldn't remember its task context. Use the task number for your next update.",
           ...(interactive ? { interactive: true } : {}),
         };
+      }
+    }
+    if (
+      command.kind === "collaborate" && changedTask && replyTs && !privateReply &&
+      repository &&
+      changedTask.participation?.deliveryEvents[mutationKey(context)]?.kind ===
+        "collaboration"
+    ) {
+      const current = await rememberCollaborationConfirmation(
+        changedTask,
+        mutationKey(context),
+        { channelId: replyChannel, messageTs: replyTs, userId: event.user_id },
+        repository,
+      );
+      if (notifications?.client.chat.update) {
+        await notifications.client.chat.update({
+          channel: replyChannel,
+          ts: replyTs,
+          text: collaborationStatusText(
+            current,
+            current.participation!.deliveryEvents[mutationKey(context)],
+          ),
+          blocks: [],
+        });
       }
     }
     if (requestConfirmationId && changedTask && replyTs && !privateReply && repository) {
@@ -1108,7 +1228,7 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event, en
   })
   .addViewSubmissionHandler(ASSIGNMENT_DELEGATE_VIEW, assignmentViewSubmissionHandler);
 
-function uniqueRequest(task: Task, kind: "complete" | "delete"): string {
+function uniqueRequest(task: Task, kind: "complete" | "incomplete" | "delete"): string {
   const ids = Object.entries(task.participation?.requests ?? {}).filter(([, request]) =>
     request.kind === kind && request.status === "pending"
   ).map(([id]) => id);

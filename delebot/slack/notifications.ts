@@ -83,6 +83,7 @@ export interface AssignmentInvitation {
   note?: string;
   closedBy?: string;
   completionNotified?: boolean;
+  reassigned?: boolean;
   modalNonce?: string;
   modalId?: string;
   decision?: {
@@ -249,6 +250,8 @@ function validateBatch(value: unknown, expectedId: string): NotificationBatch {
           !/^\d+\.\d+$/.test(invitation.messageTs)) ||
         (invitation.messageRemoved !== undefined &&
           typeof invitation.messageRemoved !== "boolean") ||
+        (invitation.reassigned !== undefined &&
+          typeof invitation.reassigned !== "boolean") ||
         (invitation.delegatedTo !== undefined &&
           !strings(invitation.delegatedTo, /^[UWS][A-Z0-9]+$/)) ||
         (invitation.returnedBy !== undefined &&
@@ -387,7 +390,10 @@ async function reconcileInvitations(
               }*\n\n✅ Completed. This invitation is closed.`,
               blocks: [],
             });
-            if (!result.ok && result.error !== "message_not_found") {
+            if (
+              !result.ok &&
+              !["message_not_found", "message_not_modified"].includes(result.error ?? "")
+            ) {
               failed.add(invitation.recipientId);
               continue;
             }
@@ -425,7 +431,10 @@ async function reconcileInvitations(
               }*\n\n✅ Accepted by <@${task.assignmentTree.acceptedBy}>. This invitation is closed.`,
               blocks: [],
             });
-            if (!result.ok && result.error !== "message_not_found") {
+            if (
+              !result.ok &&
+              !["message_not_found", "message_not_modified"].includes(result.error ?? "")
+            ) {
               failed.add(invitation.recipientId);
               continue;
             }
@@ -436,6 +445,45 @@ async function reconcileInvitations(
             batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
             await store.save(batch);
           }
+          continue;
+        }
+      }
+      if (
+        !task.deleted && !task.completed && client.chat.update &&
+        (invitation.reassigned ||
+          (["pending", "accepted"].includes(invitation.status) &&
+            !currentBinding(task, batch, invitation.recipientId)))
+      ) {
+        const access = context.loadAccess
+          ? await context.loadAccess(
+            task as Task,
+            invitation.recipientId,
+            batch.workspaceId,
+          )
+          : { userId: invitation.recipientId, teamIds: [] };
+        if (
+          access.userId === invitation.recipientId && canViewTask(task as Task, access)
+        ) {
+          const text = `*Task #${task.number}: ${
+            escape(task.name)
+          }*\n\n↪️ Assignment changed. This invitation has been replaced; no further response is needed here.`;
+          const result = await client.chat.update({
+            channel: invitation.channelId,
+            ts: invitation.messageTs,
+            text,
+            blocks: [],
+          });
+          if (
+            !result.ok &&
+            !["message_not_found", "message_not_modified"].includes(result.error ?? "")
+          ) {
+            failed.add(invitation.recipientId);
+            continue;
+          }
+          invitation.reassigned = true;
+          invitation.status = "cancelled";
+          batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
+          await store.save(batch);
           continue;
         }
       }

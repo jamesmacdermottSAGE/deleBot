@@ -147,11 +147,36 @@ function state(
 }
 
 export function requestStatusText(task: Task, request: TaskActionRequest): string {
-  const kind = request.kind === "complete" ? "Completion" : "Deletion";
+  const kind = request.kind === "complete"
+    ? "Completion"
+    : request.kind === "incomplete"
+    ? "Reopening"
+    : "Deletion";
   const status = request.status === "pending" ? "requested" : `request ${request.status}`;
-  return `${taskTitle(task)}\n\n${kind} ${status}.${
+  const emoji = request.status === "approved"
+    ? "✅"
+    : request.status === "rejected" || request.status === "cancelled"
+    ? "❌"
+    : "⏳";
+  return `${taskTitle(task)}\n\n${emoji} ${kind} ${status}.${
     request.status === "approved" && request.kind === "delete" ? " Task deleted." : ""
   }`;
+}
+
+export function collaborationStatusText(
+  task: Task,
+  delivery: ParticipationDelivery,
+): string {
+  const statuses = delivery.recipients.map((user) => {
+    const invitation = task.participation?.collaborators[user];
+    const status = invitation?.eventKey === delivery.reference
+      ? invitation.status
+      : "cancelled";
+    return `<@${user}> ${
+      status === "accepted" ? "✅" : status === "pending" ? "⏳" : "❌"
+    } ${status}`;
+  });
+  return `${taskTitle(task)}\n\nCollaboration requested.\n${statuses.join("\n")}`;
 }
 
 function textFor(
@@ -166,7 +191,11 @@ function textFor(
   }
   const request = task.participation!.requests[delivery.reference];
   return `<@${request.requestedBy}> requests ${
-    request.kind === "complete" ? "completion" : "deletion"
+    request.kind === "complete"
+      ? "completion"
+      : request.kind === "incomplete"
+      ? "reopening"
+      : "deletion"
   } of task ${title}.\n\nOnly someone in the task's Access field can approve this request.`;
 }
 
@@ -199,7 +228,8 @@ export async function notifyParticipation(
     for (const request of Object.values(current.participation.requests)) {
       if (
         request.status === "pending" &&
-        (current.deleted || (current.completed && request.kind === "complete"))
+        (current.deleted || (current.completed && request.kind === "complete") ||
+          (!current.completed && request.kind === "incomplete"))
       ) {
         request.status = "cancelled";
         closedRequests = true;
@@ -244,6 +274,25 @@ export async function notifyParticipation(
       delivery.workspaceId ??= workspaceId;
       const workspace = delivery.workspaceId;
       delivery.deliveries ??= {};
+      for (const message of delivery.confirmations ?? []) {
+        try {
+          const access = await accessFor(current, message.userId, workspace, context);
+          const updated = await client.chat.update({
+            channel: message.channelId,
+            ts: message.messageTs,
+            text: canAccessTask(current, access)
+              ? collaborationStatusText(current, delivery)
+              : "This task is no longer available.",
+            blocks: [],
+          });
+          if (
+            !updated.ok &&
+            !["message_not_found", "message_not_modified"].includes(updated.error ?? "")
+          ) failed.add(message.userId);
+        } catch {
+          failed.add(message.userId);
+        }
+      }
       const users = new Set<string>();
       const request = current.participation.requests[delivery.reference];
       const principals = delivery.kind === "approval"
@@ -298,7 +347,9 @@ export async function notifyParticipation(
             ? "This task is no longer available."
             : delivery.kind === "approval" && request
             ? requestStatusText(current, request)
-            : `${taskTitle(current)}\n\nCollaboration ${nextStatus}.`;
+            : `${taskTitle(current)}\n\n${
+              nextStatus === "accepted" ? "✅" : "❌"
+            } Collaboration ${nextStatus}.`;
           if (visible && context.rememberTask && !binding.contextSaved) {
             await context.rememberTask(
               binding.channelId,
@@ -481,7 +532,20 @@ export async function handleParticipationAction(
       dependencies.repository,
     );
     notifications.failed = [...new Set([...notifications.failed, ...assignments.failed])];
-    if (dependencies.displays) await dependencies.displays.refresh(current);
+    if (dependencies.displays) {
+      const text = isCollaboration
+        ? `${taskTitle(current)} <@${action.userId}> ${
+          action.actionId === COLLAB_ACCEPT ? "✅ accepted" : "❌ rejected"
+        } collaboration.`
+        : requestStatusText(current, current.participation!.requests[delivery.reference]);
+      const refreshFailed = await dependencies.displays.refresh(current, {
+        eventKey: `${context.channelId}:${context.messageTs}`,
+        text,
+        sourceChannel: action.channelId,
+        sourceThread: action.messageTs,
+      });
+      if (refreshFailed) notifications.failed.push("task_displays");
+    }
     if (
       dependencies.notificationStore && dependencies.client.functions &&
       !notifications.failed.length

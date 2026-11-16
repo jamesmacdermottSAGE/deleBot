@@ -12,7 +12,7 @@
 - `^^` means "makes request update"
 - `^+ , ^!` means "accepts/rejects update request
 
-## Bug set 1
+## Bug Set 1
 
 - Access me in task thread not working - fix me keyword
 - Access me returns huge paragraph - fix prev bug and shorten return paragraph
@@ -20,7 +20,7 @@
 - All messages should display the task number and name, i.e. if a task is deleted or a completion request is rejected, it should show the name and number of the task involved
 - Continuing on this: user should be able to reply in thread, e.g. "assign x", in response to any task-related message, i.e. "task 123 completion rejected"
 
-## Bug set 2
+## Bug Set 2
 
 - Ensure deadlock prevention - implement locks on tasks?
 - Reassigning a task already assigned to someone reopens the assignment request for the original assignee - add a new response for that. Currently it displays the new assignment accept/reject message; we want a new case
@@ -46,3 +46,47 @@
 - A user with access should always be able to edit a task, regardless of whether they are a creator or collaborator
 - The collaboration request message should update once the invitee has responded, i.e. accepted or rejected the collaboration
 - Update messages should be shown to everyone, not just in response to the thread the task was edited in. For example, `x -> y`, `y <-> x+ | x^` = y should show that update in their own thread
+
+## Bug Set 3
+
+- Notify the user when their task is deleted, and identify the user who deleted it in the deletion message (e.g. "Deleted by ...").
+- Fix the task acceptance form remaining open after clicking Accept, even when the task is accepted and assigned.
+- Investigate the "Task saved. Earlier task messages could not be refreshed; list the task again for its latest state." popup.
+- Improve bot response speed.
+- Fix deleted tasks continuing to display their previous version. Terminal output:
+
+  ```text
+  2026-11-12 15:07:21 [error] [Fn0CE0CG6C0M] (Trace=Tr0CGQU94MU7) Function 'Handle a DeleBot task command' (app function) failed
+          Reply sent, but I couldn't remember its task context. Use the task number for your next update.
+  2026-11-12 15:07:21 [error] [Wf0CE5FQ82CS] (Trace=Tr0CGQU94MU7) Workflow step 'Handle a DeleBot task command' failed
+  2026-11-12 15:07:21 [error] [Wf0CE5FQ82CS] (Trace=Tr0CGQU94MU7) Workflow 'DeleBot replies' failed
+          Reply sent, but I couldn't remember its task context. Use the task number for your next update.
+  2026-11-12 15:07:21 [error] [Fn0CDQA0AD71] (Trace=Tr0CGQU94MU7) Function 'DeleBot replies' (workflow function) failed
+          Reply sent, but I couldn't remember its task context. Use the task number for your next update.
+  ```
+
+- When access is initiated, grant access only to the creator. Add `access all` to grant access to everyone, rather than granting everyone access at task creation.
+- When a completion request is made with `x^(access = x) -> y, y^^(complete = true), x^+`, send the completion request only to the person who made the request. The request message should update instead of being posted again, so the requestee does not receive a duplicate. Apply the same behavior to collaboration requests, and send the assignee a confirmation that updates rather than creating multiple messages.
+- Allow an optional message when rejecting requests (e.g. deletion or reopening requests) to provide more information to the requestee. Add the keyword `reopen`, identical to `incomplete`.
+- Remove task numbers from messages except for initial task creation and task lists. For example, a request should show the task name followed by the request, rather than the long task number and name.
+- Update the delegation text box to accept only person or team mentions, with no free text. Consider allowing multiple mentions.
+- Fix the assignment message delivery/update failure after using `ls` on a task bounceback: "Your response was saved, but some assignment messages could not be delivered or updated. Retry this response, or update the task to retry delivery."
+- Investigate the `restricted_action_read_only_channel` error when sending a reply in a DM, which seems to occur after the server has been running while the computer is off or idle:
+
+  ```text
+  09:59:45 [error] [Fn0CE0CG6C0M] (Trace=Tr0CHHJL04JV) Function 'Handle a DeleBot task command' (app function) failed
+  Cannot send reply: restricted_action_read_only_channel
+  ```
+
+- Remove the `clear` function and replace it with a `space` keyword that prints a large block in the chat to help users separate information in their DM.
+- Fix collaboration rejection failing with "I could not apply this response. Please try again." Terminal output:
+
+  ```text
+  2026-11-13 11:48:34 [error] [Fn0CE0CG6C0M] (Trace=Tr0CHL88C9L4) Function 'Handle a DeleBot task command' (app function) failed
+          Reply sent, but I couldn't remember its task context. Use the task number for your next update.
+  2026-11-13 11:48:34 [error] [Wf0CE5FQ82CS] (Trace=Tr0CHL88C9L4) Workflow step 'Handle a DeleBot task command' failed
+  2026-11-13 11:48:34 [error] [Wf0CE5FQ82CS] (Trace=Tr0CHL88C9L4) Workflow 'DeleBot replies' failed
+          Reply sent, but I couldn't remember its task context. Use the task number for your next update.
+  ```
+
+- When a task is assigned to two people, show a rejection message in the thread when either assignee rejects. Currently, the message appears for the first assignee but not the second.

@@ -21,7 +21,7 @@ export interface CollaborationInvitation {
 }
 
 export interface TaskActionRequest {
-  kind: "complete" | "delete";
+  kind: "complete" | "incomplete" | "delete";
   requestedBy: string;
   status: "pending" | "approved" | "rejected" | "cancelled";
   eventKey: string;
@@ -36,6 +36,7 @@ export interface ParticipationDelivery {
   reference: string;
   deliveries?: Record<string, ParticipationBinding>;
   workspaceId?: string;
+  confirmations?: Array<{ channelId: string; messageTs: string; userId: string }>;
 }
 
 export interface ParticipationBinding {
@@ -91,7 +92,7 @@ export function parseParticipation(value: unknown): TaskParticipation {
   for (const [id, entry] of Object.entries(value.requests)) {
     if (
       !isKey(id) || !record(entry) ||
-      !["complete", "delete"].includes(entry.kind as string) ||
+      !["complete", "incomplete", "delete"].includes(entry.kind as string) ||
       !["pending", "approved", "rejected", "cancelled"].includes(
         entry.status as string,
       ) || !isUser(entry.requestedBy) || !isKey(entry.eventKey) ||
@@ -134,6 +135,18 @@ export function parseParticipation(value: unknown): TaskParticipation {
       entry.kind === "collaboration" && entry.recipients.some((user) => !isUser(user))
     ) {
       throw new Error("Invalid collaboration delivery recipients.");
+    }
+    if (
+      entry.confirmations !== undefined &&
+      (!Array.isArray(entry.confirmations) ||
+        !entry.confirmations.every((message) =>
+          record(message) && typeof message.channelId === "string" &&
+          /^[CDG][A-Z0-9]+$/.test(message.channelId) &&
+          typeof message.messageTs === "string" && /^\d+\.\d+$/.test(message.messageTs) &&
+          isUser(message.userId)
+        ))
+    ) {
+      throw new Error("Invalid collaboration confirmation.");
     }
     if (entry.deliveries !== undefined) {
       if (!record(entry.deliveries)) throw new Error("Invalid participation bindings.");
@@ -282,7 +295,7 @@ export function taskActionApprovers(task: ParticipatingTask): string[] {
 /** An unauthorized viewer asks permitted people to complete or delete; the task stays unchanged until approval. */
 async function requestTaskActionUnlocked(
   task: ParticipatingTask,
-  kind: "complete" | "delete",
+  kind: "complete" | "incomplete" | "delete",
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
@@ -296,7 +309,7 @@ async function requestTaskActionUnlocked(
       requestId: participation.deliveryEvents[key]?.reference ?? key,
     };
   }
-  if (!["complete", "delete"].includes(kind)) {
+  if (!["complete", "incomplete", "delete"].includes(kind)) {
     throw new TaskCommandError("Choose completion or deletion.");
   }
   if (canManageTask(task, access)) {
@@ -306,6 +319,9 @@ async function requestTaskActionUnlocked(
   }
   if (kind === "complete" && task.completed) {
     throw new TaskCommandError("This task is already complete.");
+  }
+  if (kind === "incomplete" && !task.completed) {
+    throw new TaskCommandError("This task is already incomplete.");
   }
   const existing = Object.entries(participation.requests).find(([, request]) =>
     request.kind === kind && request.requestedBy === context.userId &&
@@ -366,9 +382,9 @@ async function respondToTaskActionUnlocked(
     appliedEvents: [...task.appliedEvents ?? [], key],
   };
   if (decision === "approve") {
-    if (request.kind === "complete") {
-      next.completed = true;
-      next.status = "completed";
+    if (request.kind === "complete" || request.kind === "incomplete") {
+      next.completed = request.kind === "complete";
+      next.status = next.completed ? "completed" : "open";
     } else next.deleted = true;
     for (const other of Object.values(participation.requests)) {
       if (other.status !== "pending") continue;
@@ -430,7 +446,7 @@ export async function respondToCollaboration(
 
 export async function requestTaskAction(
   task: ParticipatingTask,
-  kind: "complete" | "delete",
+  kind: "complete" | "incomplete" | "delete",
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
@@ -484,6 +500,37 @@ export async function rememberRequestConfirmation(
         entry.channelId === message.channelId && entry.messageTs === message.messageTs
       )
     ) request.confirmations.push(message);
+    const next = { ...current, participation };
+    await repository.save(next);
+    return next;
+  });
+}
+
+/** Remember the inviter's request so it reflects every invitee's eventual answer. */
+export async function rememberCollaborationConfirmation(
+  task: Task,
+  eventKey: string,
+  message: { channelId: string; messageTs: string; userId: string },
+  repository: TaskRepository,
+): Promise<Task> {
+  return await freshMutation(task, repository, async (current) => {
+    const participation = metadata(current);
+    const delivery = participation.deliveryEvents[eventKey];
+    if (
+      delivery?.kind !== "collaboration" ||
+      !delivery.recipients.every((user) =>
+        participation.collaborators[user]?.eventKey === eventKey &&
+        participation.collaborators[user]?.invitedBy === message.userId
+      )
+    ) {
+      throw new TaskCommandError("This collaboration confirmation is not available.");
+    }
+    delivery.confirmations ??= [];
+    if (
+      !delivery.confirmations.some((entry) =>
+        entry.channelId === message.channelId && entry.messageTs === message.messageTs
+      )
+    ) delivery.confirmations.push(message);
     const next = { ...current, participation };
     await repository.save(next);
     return next;
