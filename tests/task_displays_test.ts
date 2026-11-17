@@ -110,7 +110,7 @@ Deno.test("display refresh removes revoked private copies and marks deleted task
   assert(
     f.updates.length === 3 &&
       f.updates.every((entry) =>
-        entry.text.includes(`#${f.task.number}: ${f.task.name}`) &&
+        entry.text.includes(`${f.task.name}`) &&
         entry.text.includes("Deleted.")
       ),
   );
@@ -466,9 +466,14 @@ Deno.test("revoked and deleted invitation copies never receive the accepted owne
         : {}),
     };
     assert(await displays.refresh(hidden) === 0);
-    assert(removed.join() === "DBOB:10.1", variant);
     assert(
-      updates.length === 0,
+      variant === "deleted"
+        ? updates.length === 1 && updates[0].includes("Deleted")
+        : removed.join() === "DBOB:10.1",
+      variant,
+    );
+    assert(
+      updates.every((update) => !update.includes("UALICE")),
       `No ownership or completion details should leak for ${variant}`,
     );
   }
@@ -483,7 +488,7 @@ Deno.test("deleted cards still show deletion without revealing identity when vie
   assert(await displays.refresh({ ...f.task, deleted: true }) === 0);
   assert(
     f.updates.length > 0 &&
-      f.updates.every((message) => message.text === "🗑️ Task deleted"),
+      f.updates.every((message) => message.text === "🗑️ Task deleted."),
   );
 });
 

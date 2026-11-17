@@ -18,6 +18,7 @@ export interface CollaborationInvitation {
   status: "pending" | "accepted" | "rejected";
   invitedBy: string;
   eventKey: string;
+  rejectionNote?: string;
 }
 
 export interface TaskActionRequest {
@@ -26,6 +27,7 @@ export interface TaskActionRequest {
   status: "pending" | "approved" | "rejected" | "cancelled";
   eventKey: string;
   resolvedBy?: string;
+  rejectionNote?: string;
   confirmations?: Array<{ channelId: string; messageTs: string; userId: string }>;
 }
 
@@ -46,6 +48,7 @@ export interface ParticipationBinding {
   channelId?: string;
   messageTs?: string;
   contextSaved?: boolean;
+  renderedText?: string;
 }
 
 export interface TaskParticipation {
@@ -84,7 +87,9 @@ export function parseParticipation(value: unknown): TaskParticipation {
     if (
       !isUser(id) || !record(entry) ||
       !["pending", "accepted", "rejected"].includes(entry.status as string) ||
-      !isUser(entry.invitedBy) || !isKey(entry.eventKey)
+      !isUser(entry.invitedBy) || !isKey(entry.eventKey) ||
+      (entry.rejectionNote !== undefined &&
+        (typeof entry.rejectionNote !== "string" || entry.rejectionNote.length > 2000))
     ) {
       throw new Error("Invalid collaboration invitation.");
     }
@@ -96,7 +101,9 @@ export function parseParticipation(value: unknown): TaskParticipation {
       !["pending", "approved", "rejected", "cancelled"].includes(
         entry.status as string,
       ) || !isUser(entry.requestedBy) || !isKey(entry.eventKey) ||
-      (entry.resolvedBy !== undefined && !isUser(entry.resolvedBy))
+      (entry.resolvedBy !== undefined && !isUser(entry.resolvedBy)) ||
+      (entry.rejectionNote !== undefined &&
+        (typeof entry.rejectionNote !== "string" || entry.rejectionNote.length > 2000))
     ) {
       throw new Error("Invalid task action request.");
     }
@@ -160,6 +167,8 @@ export function parseParticipation(value: unknown): TaskParticipation {
           (binding.channelId !== undefined &&
             (typeof binding.channelId !== "string" ||
               !/^D[A-Z0-9]+$/.test(binding.channelId))) ||
+          (binding.renderedText !== undefined &&
+            typeof binding.renderedText !== "string") ||
           (binding.contextSaved !== undefined &&
             typeof binding.contextSaved !== "boolean") ||
           (binding.messageTs !== undefined &&
@@ -255,6 +264,7 @@ async function respondToCollaborationUnlocked(
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
+  note?: string,
 ): Promise<MutationResult> {
   const key = authorizeViewer(task, context, access);
   if (task.appliedEvents?.includes(key)) return { task, updated: false };
@@ -276,6 +286,9 @@ async function respondToCollaborationUnlocked(
     );
   }
   invitation.status = decision === "accept" ? "accepted" : "rejected";
+  if (decision === "reject" && note?.trim()) {
+    invitation.rejectionNote = validatedNote(note);
+  }
   const next: ParticipatingTask = {
     ...task,
     participation,
@@ -358,6 +371,7 @@ async function respondToTaskActionUnlocked(
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
+  note?: string,
 ): Promise<MutationResult> {
   const key = authorizeViewer(task, context, access);
   if (!canManageTask(task, access)) {
@@ -376,6 +390,7 @@ async function respondToTaskActionUnlocked(
   }
   request.status = decision === "approve" ? "approved" : "rejected";
   request.resolvedBy = context.userId;
+  if (decision === "reject" && note?.trim()) request.rejectionNote = validatedNote(note);
   const next: ParticipatingTask = {
     ...task,
     participation,
@@ -385,7 +400,10 @@ async function respondToTaskActionUnlocked(
     if (request.kind === "complete" || request.kind === "incomplete") {
       next.completed = request.kind === "complete";
       next.status = next.completed ? "completed" : "open";
-    } else next.deleted = true;
+    } else {
+      next.deleted = true;
+      next.deletedBy = context.userId;
+    }
     for (const other of Object.values(participation.requests)) {
       if (other.status !== "pending") continue;
       if (other.kind === request.kind) {
@@ -434,13 +452,21 @@ export async function respondToCollaboration(
   repository: TaskRepository,
   access: TaskAccess,
   invitationEventKey?: string,
+  note?: string,
 ): Promise<MutationResult> {
   return await freshMutation(task, repository, (current) => {
     if (
       invitationEventKey &&
       current.participation?.collaborators[access.userId]?.eventKey !== invitationEventKey
     ) throw new TaskCommandError("This collaboration invitation has been replaced.");
-    return respondToCollaborationUnlocked(current, decision, context, repository, access);
+    return respondToCollaborationUnlocked(
+      current,
+      decision,
+      context,
+      repository,
+      access,
+      note,
+    );
   });
 }
 
@@ -465,6 +491,7 @@ export async function respondToTaskAction(
   context: TaskContext,
   repository: TaskRepository,
   access: TaskAccess,
+  note?: string,
 ): Promise<MutationResult> {
   return await freshMutation(
     task,
@@ -477,6 +504,7 @@ export async function respondToTaskAction(
         context,
         repository,
         access,
+        note,
       ),
   );
 }
@@ -535,4 +563,13 @@ export async function rememberCollaborationConfirmation(
     await repository.save(next);
     return next;
   });
+}
+
+function validatedNote(note: string): string {
+  if (typeof note !== "string" || note.trim().length > 2000) {
+    throw new TaskCommandError(
+      "Keep the rejection message to 2,000 characters or fewer.",
+    );
+  }
+  return note.trim();
 }

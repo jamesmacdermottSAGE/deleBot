@@ -391,7 +391,7 @@ Deno.test("request confirmations survive datastore reload and display rejection 
     message.channel === "DBOB" && message.ts === "12.1"
   )!;
   assert(
-    update.text.includes(`#${restored.number}: Review &lt;script&gt;`) &&
+    update.text.includes(`Review &lt;script&gt;`) &&
       update.text.includes("Completion request rejected"),
   );
 });
@@ -436,7 +436,7 @@ Deno.test("deletion approvals identify the deleted task and preserve the approve
   );
   const decision = f.updates.at(-1)!;
   assert(
-    decision.text.includes(`#${task.number}: Review &lt;script&gt;`) &&
+    decision.text.includes(`Review &lt;script&gt;`) &&
       decision.text.includes("Deletion request approved") &&
       decision.text.includes("Task deleted"),
   );

@@ -1,3 +1,4 @@
+import { retrySlack } from "./retry.ts";
 import { withKeyLock } from "../tasks/mutation.ts";
 import { SlackTaskRepository } from "../tasks/repository.ts";
 import { SlackDmContexts } from "./dm_context.ts";
@@ -49,6 +50,7 @@ export interface TaskUpdateNotice {
   text: string;
   sourceChannel: string;
   sourceThread: string;
+  notifyNewAssignees?: boolean;
 }
 export interface TaskDisplays {
   track(
@@ -139,18 +141,22 @@ export class SlackTaskDisplays implements TaskDisplays {
     part = 0,
     threadTs = ts,
   ) {
-    const result = await this.client.apps.datastore.put({
-      datastore: TaskDisplaysDatastore.name,
-      item: {
-        id: `${channel}:${ts}`,
-        task_id: taskId,
-        channel_id: channel,
-        message_ts: ts,
-        user_id: user,
-        part,
-        thread_ts: threadTs,
-      },
-    });
+    const result = await retrySlack(
+      "task_displays.put",
+      () =>
+        this.client.apps.datastore.put({
+          datastore: TaskDisplaysDatastore.name,
+          item: {
+            id: `${channel}:${ts}`,
+            task_id: taskId,
+            channel_id: channel,
+            message_ts: ts,
+            user_id: user,
+            part,
+            thread_ts: threadTs,
+          },
+        }),
+    );
     if (!result.ok) throw new Error("Cannot track task message.");
   }
   async refresh(task: Task, notice?: TaskUpdateNotice): Promise<number> {
@@ -168,23 +174,38 @@ export class SlackTaskDisplays implements TaskDisplays {
       { batch: NotificationBatch; invitation: AssignmentInvitation }
     >();
     const store = new SlackNotificationStore(this.client);
+    let recoverLegacy = true;
     const notificationCursors = new Set<string>();
     let notificationCursor: string | undefined;
     do {
-      const page = await this.client.apps.datastore.query({
-        datastore: "assignment_notifications",
-        expression: "#task = :task",
-        expression_attributes: { "#task": "task_id" },
-        expression_values: { ":task": task.id },
-        limit: 100,
-        ...(notificationCursor ? { cursor: notificationCursor } : {}),
-      });
+      const page = await retrySlack(
+        "task_displays.query",
+        () =>
+          this.client.apps.datastore.query({
+            datastore: "assignment_notifications",
+            expression: "#task = :task",
+            expression_attributes: { "#task": "task_id" },
+            expression_values: { ":task": task.id },
+            limit: 100,
+            ...(notificationCursor ? { cursor: notificationCursor } : {}),
+          }),
+      );
       if (!page.ok || !Array.isArray(page.items)) {
-        throw new Error("Cannot identify assignment invitations.");
+        recoverLegacy = false;
+        console.warn(
+          JSON.stringify({ event: "invitation_query_failed", taskId: task.id }),
+        );
+        break;
       }
       for (const item of page.items) {
         if (typeof item.id !== "string") throw new Error("Invalid assignment record.");
-        const batch = await store.get(item.id);
+        let batch: NotificationBatch | null;
+        try {
+          batch = store.fromRecord(item, item.id);
+        } catch {
+          recoverLegacy = false;
+          continue;
+        }
         if (!batch || batch.taskId !== task.id) continue;
         for (const invitation of Object.values(batch.invitations ?? {})) {
           if (invitation.channelId && invitation.messageTs) {
@@ -210,14 +231,18 @@ export class SlackTaskDisplays implements TaskDisplays {
     const cursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      const page = await this.client.apps.datastore.query({
-        datastore: TaskDisplaysDatastore.name,
-        expression: "#task = :task",
-        expression_attributes: { "#task": "task_id" },
-        expression_values: { ":task": task.id },
-        limit: 100,
-        ...(cursor ? { cursor } : {}),
-      });
+      const page = await retrySlack(
+        "task_displays.query",
+        () =>
+          this.client.apps.datastore.query({
+            datastore: TaskDisplaysDatastore.name,
+            expression: "#task = :task",
+            expression_attributes: { "#task": "task_id" },
+            expression_values: { ":task": task.id },
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          }),
+      );
       if (!page.ok || !Array.isArray(page.items)) {
         throw new Error("Cannot load displayed task messages.");
       }
@@ -231,18 +256,25 @@ export class SlackTaskDisplays implements TaskDisplays {
     cursor = undefined;
     cursors.clear();
     do {
-      const page = await this.client.apps.datastore.query({
-        datastore: "task_conversations",
-        expression: "contains(#tasks, :task)",
-        expression_attributes: { "#tasks": "task_ids" },
-        expression_values: { ":task": task.id },
-        limit: 100,
-        ...(cursor ? { cursor } : {}),
-      });
+      const page = await retrySlack(
+        "task_displays.query",
+        () =>
+          this.client.apps.datastore.query({
+            datastore: "task_conversations",
+            expression: "contains(#tasks, :task)",
+            expression_attributes: { "#tasks": "task_ids" },
+            expression_values: { ":task": task.id },
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          }),
+      );
       if (!page.ok || !Array.isArray(page.items)) {
-        throw new Error("Cannot load earlier task contexts.");
+        console.warn(
+          JSON.stringify({ event: "legacy_context_query_failed", taskId: task.id }),
+        );
+        break;
       }
-      for (const context of page.items) {
+      for (const context of recoverLegacy ? page.items : []) {
         if (context.message_kind !== undefined && context.message_kind !== "card") {
           continue;
         }
@@ -269,6 +301,14 @@ export class SlackTaskDisplays implements TaskDisplays {
       if (cursor && cursors.has(cursor)) throw new Error("Repeated task context cursor.");
       if (cursor) cursors.add(cursor);
     } while (cursor);
+    const accessCache = new Map<string, ReturnType<typeof this.loadAccess>>();
+    const loadAccess = (user: string, workspace = workspaceId) => {
+      const key = `${user}:${workspace ?? ""}`;
+      if (!accessCache.has(key)) {
+        accessCache.set(key, this.loadAccess(task, user, workspace));
+      }
+      return accessCache.get(key)!;
+    };
     let failed = 0;
     for (const row of rows) {
       if (invitations.has(`${row.channel_id}:${row.message_ts}`)) continue;
@@ -282,8 +322,8 @@ export class SlackTaskDisplays implements TaskDisplays {
       }
       try {
         const access = task.deleted
-          ? await this.loadAccess(task, row.user_id, workspaceId).catch(() => undefined)
-          : await this.loadAccess(task, row.user_id, workspaceId);
+          ? await loadAccess(row.user_id).catch(() => undefined)
+          : await loadAccess(row.user_id);
         const maySeeIdentity = !!access &&
           canAccessTask({ ...task, deleted: false }, access);
         const visible = !!access && canAccessTask(task, access);
@@ -305,8 +345,10 @@ export class SlackTaskDisplays implements TaskDisplays {
             channel: row.channel_id,
             ts: row.message_ts,
             text: maySeeIdentity
-              ? `${taskTitle(task)}\n\n🗑️ Deleted.`
-              : "🗑️ Task deleted",
+              ? `${taskTitle(task)}\n\n🗑️ Deleted${
+                task.deletedBy ? ` by <@${task.deletedBy}>` : ""
+              }.`
+              : `🗑️ Task deleted${task.deletedBy ? ` by <@${task.deletedBy}>` : ""}.`,
             blocks: [],
             unfurl_links: false,
             unfurl_media: false,
@@ -338,11 +380,23 @@ export class SlackTaskDisplays implements TaskDisplays {
       if (invitation.status !== "pending" || invitation.messageRemoved) continue;
       try {
         if (task.deleted) {
-          const removed = await this.client.chat.delete({
+          const access = await loadAccess(invitation.recipientId, batch.workspaceId)
+            .catch(() => undefined);
+          const visible = !!access && canAccessTask({ ...task, deleted: false }, access);
+          const removed = await this.client.chat.update({
             channel: invitation.channelId!,
             ts: invitation.messageTs!,
+            text: `${visible ? taskTitle(task) : "Task"}\n\n🗑️ Deleted${
+              task.deletedBy ? ` by <@${task.deletedBy}>` : ""
+            }.`,
+            blocks: [],
+            unfurl_links: false,
+            unfurl_media: false,
           });
-          if (!removed.ok && removed.error !== "message_not_found") failed++;
+          if (
+            !removed.ok &&
+            !["message_not_found", "message_not_modified"].includes(removed.error ?? "")
+          ) failed++;
           continue;
         }
         const access = await this.loadAccess(
@@ -448,7 +502,9 @@ export class SlackTaskDisplays implements TaskDisplays {
         if (batch.eventKey === notice.eventKey && invitation.status === "pending") {
           newlyInvited.add(invitation.recipientId);
         }
-        add(invitation.channelId, invitation.messageTs, invitation.recipientId);
+        if (!invitation.messageRemoved) {
+          add(invitation.channelId, invitation.messageTs, invitation.recipientId);
+        }
       }
       for (const delivery of Object.values(task.participation?.deliveryEvents ?? {})) {
         for (const message of delivery.confirmations ?? []) {
@@ -459,20 +515,24 @@ export class SlackTaskDisplays implements TaskDisplays {
         }
       }
       for (const destination of destinations.values()) {
-        if (newlyInvited.has(destination.user)) continue;
+        if (newlyInvited.has(destination.user) && !notice.notifyNewAssignees) continue;
         if (
           destination.channel === notice.sourceChannel &&
           destination.thread === notice.sourceThread
         ) continue;
         try {
-          const access = await this.loadAccess(task, destination.user, workspaceId);
+          const access = await loadAccess(destination.user);
           if (!canAccessTask({ ...task, deleted: false }, access)) continue;
           const id =
             `update:${task.id}:${notice.eventKey}:${destination.channel}:${destination.user}`;
-          const saved = await this.client.apps.datastore.get({
-            datastore: TaskDisplaysDatastore.name,
-            id,
-          });
+          const saved = await retrySlack(
+            "task_displays.get",
+            () =>
+              this.client.apps.datastore.get({
+                datastore: TaskDisplaysDatastore.name,
+                id,
+              }),
+          );
           if (!saved.ok) throw new Error("Cannot check update delivery.");
           if (saved.item?.kind === "update") continue;
           const bytes = new Uint8Array(
@@ -490,20 +550,44 @@ export class SlackTaskDisplays implements TaskDisplays {
             unfurl_links: false,
             unfurl_media: false,
           });
-          if (!result.ok || !result.ts) throw new Error("Cannot send task update.");
-          if (this.rememberTask) {
-            await this.rememberTask(
-              destination.channel,
-              result.ts,
-              destination.user,
-              task.id,
+          if (
+            !result.ok &&
+            [
+              "message_not_found",
+              "thread_not_found",
+              "channel_not_found",
+              "is_archived",
+              "restricted_action_read_only_channel",
+            ].includes(result.error ?? "")
+          ) continue;
+          if (!result.ok || !result.ts) {
+            throw new Error(
+              `Cannot send task update: ${result.error ?? "missing_timestamp"}`,
             );
           }
-          const stored = await this.client.apps.datastore.put({
-            datastore: TaskDisplaysDatastore.name,
-            item: { id, task_id: task.id, kind: "update" },
-          });
+          const stored = await retrySlack(
+            "task_displays.put",
+            () =>
+              this.client.apps.datastore.put({
+                datastore: TaskDisplaysDatastore.name,
+                item: { id, task_id: task.id, kind: "update" },
+              }),
+          );
           if (!stored.ok) throw new Error("Cannot save update delivery.");
+          try {
+            if (this.rememberTask) {
+              await this.rememberTask(
+                destination.channel,
+                result.ts,
+                destination.user,
+                task.id,
+              );
+            }
+          } catch {
+            console.warn(
+              JSON.stringify({ event: "update_context_save_failed", taskId: task.id }),
+            );
+          }
         } catch {
           failed++;
         }

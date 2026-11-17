@@ -9,9 +9,7 @@ import {
 import type { AssignmentSubmission } from "./actions.ts";
 import { DefineFunction, Schema, SlackFunction } from "deno-slack-sdk/mod.ts";
 import { resetTaskDatabase } from "../tasks/reset.ts";
-import { clearDmHistory } from "./clear.ts";
 import { taskAccessLoader } from "./access_context.ts";
-import { SlackAPI } from "deno-slack-api/mod.ts";
 import { canManageTask } from "../tasks/access.ts";
 import {
   inviteCollaborators,
@@ -26,7 +24,10 @@ import {
   handleParticipationAction,
   notifyParticipation,
   PARTICIPATION_ACTION_IDS,
+  PARTICIPATION_REJECT_VIEW,
+  participationBlockActionHandler,
   type ParticipationClient,
+  participationViewSubmissionHandler,
   requestStatusText,
 } from "./participation_messages.ts";
 import { type TaskDisplays, taskDisplays } from "./task_displays.ts";
@@ -186,20 +187,6 @@ export async function handleMessage(
   resetDatabase?: () => Promise<{ tasks: number; notifications: number }>,
   dmContexts?: DmContexts,
   displays?: TaskDisplays,
-  clearConversation?: (
-    channel: string,
-    userId: string,
-    botUserId: string,
-    boundary: string,
-    threadTs?: string,
-  ) => Promise<
-    {
-      deleted: number;
-      failed: number;
-      remaining?: boolean;
-      userMessagesRemaining?: boolean;
-    }
-  >,
 ): Promise<MessageResult> {
   const ignored = { outputs: { ignored: true } };
   if (event.bot_id || event.subtype || !event.user_id || !event.message_ts) {
@@ -272,6 +259,7 @@ export async function handleMessage(
   let identifiedTask: Task | undefined;
   let includeTaskIdentity = true;
   let requestConfirmationId: string | undefined;
+  let approvalResponseId: string | undefined;
   let listedTasks: Task[] = [];
   let threadList = false;
   let updateNotice: string | undefined;
@@ -280,47 +268,12 @@ export async function handleMessage(
   let replyWorkspaceId: string | undefined;
   if (teamMenu) {
     replies = [teamMenu];
-  } else if (command.kind === "clear-chat") {
-    if (!isDm) {
-      replies = [
-        "Use `clear` in your direct message with DeleBot to remove its messages from that chat.",
-      ];
-    } else if (!clearConversation) replies = ["Chat clearing is not configured."];
-    else {
-      try {
-        const result = await clearConversation(
-          event.channel_id,
-          event.user_id,
-          identity.user_id,
-          event.message_ts,
-          event.thread_ts && event.thread_ts !== event.message_ts
-            ? event.thread_ts
-            : undefined,
-        );
-        shownTaskIds = [];
-        replies = [
-          `Cleared ${result.deleted} messages from this ${
-            event.thread_ts && event.thread_ts !== event.message_ts ? "DM thread" : "DM"
-          }. ${
-            result.userMessagesRemaining !== false
-              ? "User messages require your Slack user authorization and remain until it is configured. "
-              : ""
-          }Saved tasks are unchanged.${
-            result.remaining
-              ? " More history remains; send clear again to continue from the saved position."
-              : ""
-          }${
-            result.failed
-              ? " Some messages or cleanup records could not be cleared; run clear again to retry."
-              : ""
-          }`,
-        ];
-      } catch {
-        replies = [
-          "I couldn't finish clearing this DM. Run `clear` again to retry. Slack only lets me delete DeleBot's own messages; your messages and saved tasks remain.",
-        ];
-      }
-    }
+  } else if (command.kind === "space") {
+    replies = [
+      isDm
+        ? `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${"⠀\n".repeat(45)}━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
+        : "Use `space` in your direct message with DeleBot.",
+    ];
   } else if (command.kind === "reset") {
     if (!resetDatabase) {
       replies = ["Database reset is not configured."];
@@ -385,7 +338,6 @@ export async function handleMessage(
           command.query.teamId === "all";
       if (!skipTeams) {
         try {
-          workspaceId = await resolveWorkspace(client, event.channel_id, sender.user);
           const references = command.kind === "create" ? selectedTeams : [
             ...await repository.referencedTeamIds(),
             ...selectedTeams,
@@ -398,7 +350,10 @@ export async function handleMessage(
               ) ?? []
               : []),
           ];
-          snapshot = await teamDirectory.load(event.user_id, workspaceId, references);
+          if (references.length) {
+            workspaceId = await resolveWorkspace(client, event.channel_id, sender.user);
+            snapshot = await teamDirectory.load(event.user_id, workspaceId, references);
+          }
         } catch (error) {
           membershipWarning = error instanceof TaskReferenceError
             ? "I couldn't read the teams attached to saved tasks."
@@ -478,7 +433,7 @@ export async function handleMessage(
         shownTaskIds = [task.id];
         listedTasks = [task];
         hasTaskCards = true;
-        replies = [formatTask(task, teamNames)];
+        replies = [formatTask(task, teamNames, false)];
       } else if (command.kind === "delete") {
         const target = await resolveDmTarget(
           command.number,
@@ -512,14 +467,14 @@ export async function handleMessage(
           ];
         } else {
           await deleteTask(target, context, repository, access);
-          changedTask = { ...target, deleted: true };
+          changedTask = { ...target, deleted: true, deletedBy: event.user_id };
           privateReply = !isDm && !isPublicTask(target);
-          replies = [`✅ ${taskTitle(target)} Deleted.`];
+          replies = [`🗑️ ${taskTitle(target)} Deleted by <@${event.user_id}>.`];
           shownTaskIds = [target.id];
           if (notifications) {
             try {
               const cleanup = await notifyTaskAssignments(
-                { ...target, deleted: true },
+                changedTask,
                 workspaceId,
                 notifications.client,
                 notifications.store,
@@ -589,6 +544,7 @@ export async function handleMessage(
           const approvalRequestId = command.kind === "approval-response"
             ? command.requestId ?? uniqueRequest(target, command.kindOfAction)
             : undefined;
+          approvalResponseId = approvalRequestId;
           const result = command.kind === "collaborate"
             ? await inviteCollaborators(
               target,
@@ -604,6 +560,8 @@ export async function handleMessage(
               context,
               repository,
               access,
+              undefined,
+              command.note,
             )
             : command.kind === "approval-response"
             ? await respondToTaskAction(
@@ -613,6 +571,7 @@ export async function handleMessage(
               context,
               repository,
               access,
+              command.note,
             )
             : command.kind === "update" &&
                 (command.patch.completed !== undefined ||
@@ -682,12 +641,7 @@ export async function handleMessage(
           }
         }
         const stillVisible = canAccessTask(task, access);
-        const quiet = command.kind !== "create" && !!event.thread_ts &&
-          event.thread_ts !== event.message_ts;
-        const shortReply = quiet || !!requestConfirmationId ||
-          command.kind === "approval-response" ||
-          command.kind === "collaboration-response" || command.kind === "collaborate" ||
-          command.kind === "update";
+        const shortReply = command.kind !== "create";
         includeTaskIdentity = stillVisible || !!task.deleted;
         hasTaskCards = stillVisible && !shortReply;
         changedTask = task;
@@ -708,7 +662,7 @@ export async function handleMessage(
                     : "✅"
                 } ${taskTitle(task)} ${acknowledgement}.`
               : `${acknowledgement} task #${task.number}.\n\n${
-                formatTask(task, teamNames)
+                formatTask(task, teamNames, command.kind === "create")
               }`,
           ]
           : [
@@ -717,7 +671,9 @@ export async function handleMessage(
                 ? `${
                   taskTitle(task)
                 } — Deleted after its creator rejected the returned assignment.`
-                : `${taskTitle(task)} — Deleted.`)
+                : `${taskTitle(task)} — Deleted by <@${
+                  task.deletedBy ?? event.user_id
+                }>.`)
               : "Changes saved. Your viewing permissions no longer include this task.",
           ];
         if (command.kind !== "create") updateNotice = replies[0];
@@ -814,15 +770,20 @@ export async function handleMessage(
     }
   }
 
-  if (displays && (changedTask || listedTasks.length)) {
+  if (displays && changedTask && command.kind !== "create") {
     try {
       let failed = 0;
       for (const task of changedTask ? [changedTask] : listedTasks) {
         failed += await displays.refresh(
           task,
-          updateNotice
+          updateNotice && !requestConfirmationId &&
+            !["collaborate", "collaboration-response", "approval-response"].includes(
+              command.kind,
+            )
             ? {
               eventKey: mutationKey(context),
+              notifyNewAssignees: command.kind === "response" &&
+                command.decision.kind === "reject",
               text: updateNotice,
               sourceChannel: event.channel_id,
               sourceThread: context.threadTs!,
@@ -875,8 +836,52 @@ export async function handleMessage(
       }
     } catch { /* Never expose a private task based only on a stale thread binding. */ }
   }
+  let existingReply:
+    | { channelId: string; messageTs: string; userId?: string }
+    | undefined;
+  if (changedTask?.participation) {
+    const participation = changedTask.participation;
+    if (requestConfirmationId) {
+      existingReply = participation.requests[requestConfirmationId]?.confirmations?.find((
+        message,
+      ) => message.userId === event.user_id);
+    }
+    if (command.kind === "collaborate") {
+      existingReply = Object.values(participation.deliveryEvents).findLast((delivery) =>
+        delivery.kind === "collaboration" &&
+        delivery.recipients.length === command.users.length &&
+        command.users.every((user) => delivery.recipients.includes(user))
+      )?.confirmations?.find((message) => message.userId === event.user_id);
+    }
+    if (
+      command.kind === "collaboration-response" || command.kind === "approval-response"
+    ) {
+      const delivery = command.kind === "collaboration-response"
+        ? participation
+          .deliveryEvents[participation.collaborators[event.user_id]?.eventKey]
+        : Object.values(participation.deliveryEvents).find((delivery) =>
+          delivery.kind === "approval" &&
+          delivery.reference ===
+            approvalResponseId
+        );
+      const binding = delivery?.deliveries?.[event.user_id];
+      if (binding?.channelId && binding.messageTs) {
+        existingReply = { channelId: binding.channelId, messageTs: binding.messageTs };
+      }
+    }
+  }
+  if (existingReply && notifications?.client.chat.update) {
+    // notifyParticipation has already updated this same confirmation or invitation.
+    return {
+      outputs: { ignored: false, reply_ts: existingReply.messageTs },
+      ...(interactive ? { interactive: true } : {}),
+    };
+  }
   const namedTask = changedTask ?? identifiedTask;
-  if (namedTask && includeTaskIdentity) {
+  if (
+    namedTask && includeTaskIdentity && command.kind !== "create" &&
+    command.kind !== "list"
+  ) {
     replies = replies.map((reply) =>
       reply.includes(taskTitle(namedTask)) ? reply : `${taskTitle(namedTask)}\n\n${reply}`
     );
@@ -884,7 +889,7 @@ export async function handleMessage(
   let replyChannel = event.channel_id;
   const sourceThread = event.thread_ts || event.message_ts;
   let replyThread: string | undefined = sourceThread;
-  if (command.kind === "clear-chat") replyThread = undefined;
+  if (command.kind === "space") replyThread = undefined;
   // Lists are task pickers in the main DM; individual lookups and mutations
   // create or continue the thread of the user's message.
   if (
@@ -956,16 +961,36 @@ export async function handleMessage(
       replyTs = response.message_ts;
       continue;
     }
-    const response = await client.chat.postMessage({
+    let response = await client.chat.postMessage({
       channel: replyChannel,
       text: reply,
       ...(replyThread ? { thread_ts: replyThread } : {}),
       unfurl_links: false,
       unfurl_media: false,
     });
+    if (
+      !response.ok && isDm &&
+      ["restricted_action_read_only_channel", "channel_not_found", "is_archived"]
+        .includes(response.error ?? "")
+    ) {
+      const opened = await client.conversations.open({ users: event.user_id });
+      if (opened.ok && opened.channel?.id && /^D[A-Z0-9]+$/.test(opened.channel.id)) {
+        if (opened.channel.id !== replyChannel) replyThread = undefined;
+        replyChannel = opened.channel.id;
+        response = await client.chat.postMessage({
+          channel: replyChannel,
+          text: reply,
+          ...(replyThread ? { thread_ts: replyThread } : {}),
+          unfurl_links: false,
+          unfurl_media: false,
+        });
+      }
+    }
     if (!response.ok) {
       return {
-        error: `Cannot send reply: ${response.error ?? "unknown_error"}`,
+        error: response.error === "restricted_action_read_only_channel"
+          ? "Slack is refusing messages in this DM. Restart DeleBot and check that the app Messages tab allows messages. Your saved task changes are retained."
+          : `Cannot send reply: ${response.error ?? "unknown_error"}`,
         ...(interactive ? { interactive: true } : {}),
       };
     }
@@ -985,15 +1010,17 @@ export async function handleMessage(
         );
         parts.set(ids[0], part + 1);
       } catch {
-        return {
-          error:
-            "Task reply sent, but automatic message refresh could not be enabled. List the task again to retry.",
-          ...(interactive ? { interactive: true } : {}),
-        };
+        console.warn(
+          JSON.stringify({ event: "task_display_tracking_failed", taskId: ids[0] }),
+        );
       }
     }
     if (dmContexts && shownTaskIds !== undefined) {
       try {
+        const bindings = new Map<
+          string,
+          { user: string; key: string; ids: string[]; kind: "card" | "context" }
+        >();
         for (
           const key of new Set([
             ...(isDm || directReply ? ["latest"] : []),
@@ -1001,23 +1028,28 @@ export async function handleMessage(
             ...(replyTs ? [replyTs] : []),
           ])
         ) {
-          await dmContexts.save(
-            replyChannel,
+          bindings.set(`${key}:${event.user_id}`, {
             key,
-            event.user_id,
-            key === replyTs ? ids ?? [] : shownTaskIds,
-            key === replyTs && hasTaskCards ? "card" : "context",
-          );
+            user: event.user_id,
+            ids: key === replyTs ? ids ?? [] : shownTaskIds,
+            kind: key === replyTs && hasTaskCards ? "card" : "context",
+          });
         }
         if (replyTs && ids?.length) {
-          await dmContexts.save(replyChannel, replyTs, "*", ids, "context");
+          bindings.set(`${replyTs}:*`, { key: replyTs, user: "*", ids, kind: "context" });
+        }
+        const savedBindings = await Promise.allSettled(
+          [...bindings.values()].map(({ key, user, ids, kind }) =>
+            dmContexts.save(replyChannel, key, user, ids, kind)
+          ),
+        );
+        if (savedBindings.some((result) => result.status === "rejected")) {
+          throw new Error("Context persistence failed.");
         }
       } catch {
-        return {
-          error:
-            "Reply sent, but I couldn't remember its task context. Use the task number for your next update.",
-          ...(interactive ? { interactive: true } : {}),
-        };
+        console.warn(
+          JSON.stringify({ event: "task_context_save_failed", taskId: namedTask?.id }),
+        );
       }
     }
     if (
@@ -1098,13 +1130,38 @@ export const MessageFunction = DefineFunction({
   },
 });
 
-export default SlackFunction(MessageFunction, async ({ inputs, client, event, env }) => {
+export default SlackFunction(MessageFunction, async ({ inputs, client, event }) => {
   try {
     if (inputs.delegation_submission) {
       const payload = JSON.parse(inputs.delegation_submission);
       const dependencies = productionDependencies(client);
       dependencies.deliveryExecutionId = event.function_execution_id;
       let result;
+      if (payload?.kind === "participation_action") {
+        const action = payload.action;
+        if (
+          !action || action.userId !== inputs.user_id ||
+          typeof action.value !== "string" || typeof action.actionId !== "string" ||
+          (action.note !== undefined &&
+            (typeof action.note !== "string" || action.note.length > 2000))
+        ) return { error: "Invalid request response." };
+        const response = await handleParticipationAction(action, {
+          client,
+          repository: dependencies.repository,
+          loadAccess: dependencies.loadAccess,
+          displays: dependencies.displays,
+          notificationStore: dependencies.store,
+          rememberTask: dependencies.rememberTask,
+        });
+        if (!response.ok && response.error) {
+          await client.chat.postEphemeral({
+            channel: action.channelId,
+            user: action.userId,
+            text: response.error,
+          });
+        }
+        return { outputs: { ignored: false } };
+      }
       if (payload?.kind === "assignment_action") {
         const action = payload.action;
         if (
@@ -1154,27 +1211,6 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event, en
       () => resetTaskDatabase(client),
       new SlackDmContexts(client),
       taskDisplays(client),
-      (channel, userId, botUserId, boundary, threadTs) => {
-        const configured: unknown = env.SLACK_CLEAR_USER_TOKENS
-          ? JSON.parse(env.SLACK_CLEAR_USER_TOKENS)
-          : {};
-        const token =
-          configured && typeof configured === "object" && !Array.isArray(configured)
-            ? (configured as Record<string, unknown>)[userId]
-            : undefined;
-        if (
-          token !== undefined && (typeof token !== "string" || !token.startsWith("xoxp-"))
-        ) throw new Error("Invalid requester authorization configuration.");
-        return clearDmHistory(
-          client,
-          channel,
-          userId,
-          botUserId,
-          boundary,
-          threadTs,
-          typeof token === "string" ? SlackAPI(token) : undefined,
-        );
-      },
     );
     // Interactive assignment messages remain active until their recipients respond.
     if (result.interactive) return { completed: false };
@@ -1186,44 +1222,33 @@ export default SlackFunction(MessageFunction, async ({ inputs, client, event, en
     };
   }
 }).addBlockActionsHandler(ASSIGNMENT_ACTION_IDS, assignmentBlockActionHandler)
-  .addBlockActionsHandler(PARTICIPATION_ACTION_IDS, async ({ body, action, client }) => {
-    const repository = new SlackTaskRepository(client);
-    const raw = action as unknown as {
-      action_id?: string;
-      value?: string;
-      action_ts?: string;
-    };
-    const container = body.container as { channel_id?: string; message_ts?: string };
-    const result = await handleParticipationAction({
-      actionId: raw.action_id ?? "",
-      value: raw.value ?? "",
-      userId: body.user.id,
-      channelId: container.channel_id ?? "",
-      messageTs: container.message_ts ?? "",
-      executionId: body.function_data.execution_id,
-      actionTs: raw.action_ts,
-    }, {
-      client,
-      repository,
-      displays: taskDisplays(client),
-      notificationStore: new SlackNotificationStore(client),
-      loadAccess: taskAccessLoader(client),
-      rememberTask: async (channel, ts, userId, taskId) => {
-        await new SlackDmContexts(client).save(
-          channel,
-          ts,
-          userId,
-          [taskId],
-          "invitation",
-        );
-      },
-    });
-    if (!result.ok && result.error && container.channel_id) {
-      await client.chat.postEphemeral({
-        channel: container.channel_id,
-        user: body.user.id,
-        text: result.error,
+  .addBlockActionsHandler(PARTICIPATION_ACTION_IDS, participationBlockActionHandler)
+  .addViewSubmissionHandler(PARTICIPATION_REJECT_VIEW, participationViewSubmissionHandler)
+  .addBlockSuggestionHandler("teams", async ({ body, client }) => {
+    try {
+      const view = body.view as { private_metadata?: string } | undefined;
+      const metadata = JSON.parse(view?.private_metadata ?? "{}");
+      if (metadata.recipientId !== body.user.id) return { options: [] };
+      const batch = await new SlackNotificationStore(client).get(metadata.batchId);
+      const groups = await client.usergroups.list({
+        include_disabled: false,
+        ...(batch?.workspaceId ? { team_id: batch.workspaceId } : {}),
       });
+      if (!groups.ok) return { options: [] };
+      const query = (body.value ?? "").toLowerCase().replace(/^@/, "");
+      return {
+        options: (groups.usergroups ?? []).filter((
+          group: { id?: string; handle?: string; date_delete?: number },
+        ) =>
+          group.id && group.handle && !group.date_delete &&
+          group.handle.toLowerCase().includes(query)
+        ).slice(0, 100).map((group: { id: string; handle: string }) => ({
+          text: { type: "plain_text", text: `@${group.handle}` },
+          value: group.id!,
+        })),
+      };
+    } catch {
+      return { options: [] };
     }
   })
   .addViewSubmissionHandler(ASSIGNMENT_DELEGATE_VIEW, assignmentViewSubmissionHandler);

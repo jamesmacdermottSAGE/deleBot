@@ -1,8 +1,16 @@
 # Bug Sets
 
+## Index
+
+- [Key](#key)
+- [Bug Set 1](#bug-set-1)
+- [Bug Set 2](#bug-set-2)
+- [Bug Set 3](#bug-set-3)
+- [Bug Set 4](#bug-set-4)
+
 ## Key
 
-- `->` means "delegates to" -  this takes highest priority
+- `->` means "delegates to" - this takes highest priority
 - `,` means "then"
 - `<->` means "collaborates with"
 - `+` means "accepts"
@@ -10,7 +18,7 @@
 - `|` separates branches
 - `^` means "updates task"
 - `^^` means "makes request update"
-- `^+ , ^!` means "accepts/rejects update request
+- `^+ , ^!` means "accepts/rejects update request"
 
 ## Bug Set 1
 
@@ -90,3 +98,50 @@
   ```
 
 - When a task is assigned to two people, show a rejection message in the thread when either assignee rejects. Currently, the message appears for the first assignee but not the second.
+
+## Bug Set 4
+
+- Fix task deletion displaying a second message instead of only updating the original. Send deletion notifications in DMs so users can see them without opening the thread; also notify users about amendments.
+
+  Example:
+
+  ```text
+  DeleBot Dev (local) [11:45 AM]
+  test
+
+  :wastebasket: Deleted by @JamesM2.
+  ```
+
+- Include who amended a task in the amendment message, and replace the tick emoji with a unique amendment emoji.
+- Investigate the assignment message delivery/update failure:
+
+  ```text
+  Your response was saved, but some assignment messages could not be delivered or updated. Retry this response, or update the task to retry delivery.
+  ```
+
+- Fix the bounceback case where `x -> y(t1, t2, t3, t4)`, `y(+t1, !t2, !t3, +t4)` sends the task back to `x`, but `x` does not receive a decision notification to accept or delete it. The equivalent `t2` case works as expected.
+- Ensure accepted assignees can make collaboration requests, while access is still required to delete and complete tasks. For example, with `x^(access = x) -> y+`, `y <-> x`, `y` incorrectly receives "Only the accepted assignee can invite collaborators."
+- Add a `block` command (for example, `block x`) to prevent editing field `x` unless the user has been granted access.
+- Blank action buttons after they are clicked or while processing (for example, accepting a task or rejecting a collaboration request) to prevent repeated clicks from breaking the bot.
+- Improve rejection response speed.
+- Update the `space` message: remove the two lines at the top and bottom so it appears as a large blank message, and increase its size to fill computer screens and look like a new DM.
+- Investigate the error when running `delete all`; it may be related to the computer being switched off or idle:
+
+  ```text
+  2026-11-17 09:37:55 [info] [Wf0CE5FQ82CS] (Trace=Tr0CJ82Y1G75) Event trigger successfully started execution of function 'DeleBot replies'
+  2026-11-17 09:37:55 [info] [Fn0CDQA0AD71] (Trace=Tr0CJ82Y1G75) Function 'DeleBot replies' (app function) started
+  2026-11-17 09:37:55 [info] [Wf0CE5FQ82CS] (Trace=Tr0CJ82Y1G75) Workflow 'DeleBot replies' started
+  2026-11-17 09:37:55 [info] [Wf0CE5FQ82CS] (Trace=Tr0CJ82Y1G75) Workflow step 1 of 1 started
+  2026-11-17 09:37:55 [error] [Fn0CE0CG6C0M] (Trace=Tr0CJ82Y1G75) Function 'Handle a DeleBot task command' (app function) failed
+          event_dispatch_failed
+  2026-11-17 09:37:56 [error] [Wf0CE5FQ82CS] (Trace=Tr0CJ82Y1G75) Workflow step 'Handle a DeleBot task command' failed
+  2026-11-17 09:37:56 [error] [Wf0CE5FQ82CS] (Trace=Tr0CJ82Y1G75) Workflow 'DeleBot replies' failed
+          Function failed to execute
+  2026-11-17 09:37:56 [error] [Fn0CDQA0AD71] (Trace=Tr0CJ82Y1G75) Function 'DeleBot replies' (app function) failed
+          Function failed to execute
+  ```
+
+- When a user rejects any request, notify them in their DM (for example, "You rejected task t").
+- Add priority emojis: two exclamation mark emojis for `p1`, one for `p2`, and none for other priority values.
+- Shorten the README substantially and remove comments from files.
+- (Follow-up to Bug Set 3) When a task assigned to two people is rejected by both, show the second person's rejection in the original creation thread before continuing the usual bounceback procedure. The first person's rejection currently appears; the second person's does not.

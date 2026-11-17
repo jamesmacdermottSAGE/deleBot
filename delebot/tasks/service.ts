@@ -175,7 +175,9 @@ async function createTaskUnlocked(
     priority: draft.priority ?? null,
     completed: draft.completed ?? false,
     viewPerms: draft.viewPerms === undefined ? ["all"] : [...new Set(draft.viewPerms)],
-    editPerms: draft.editPerms === undefined ? ["all"] : [...new Set(draft.editPerms)],
+    editPerms: draft.editPerms === undefined
+      ? [context.userId]
+      : [...new Set(draft.editPerms)],
   };
   if (draft.matchPerms) {
     if (draft.editPerms !== undefined) {
@@ -458,7 +460,7 @@ async function deleteTaskUnlocked(
   if (context.userId !== access.userId || !canManageTask(task, access)) {
     throw new TaskAccessError("You need view and edit permission to delete this task.");
   }
-  await repository.delete(task);
+  await repository.delete({ ...task, deletedBy: context.userId });
 }
 
 export type AssignmentDecision = {

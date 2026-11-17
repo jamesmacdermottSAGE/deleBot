@@ -20,6 +20,7 @@ export type NotificationTask =
       | "assignmentBased"
       | "createdBy"
       | "deleted"
+      | "deletedBy"
       | "assignmentResponses"
       | "assignmentTree"
       | "assignmentEventNodes"
@@ -83,6 +84,7 @@ export interface AssignmentInvitation {
   note?: string;
   closedBy?: string;
   completionNotified?: boolean;
+  deletionNotified?: boolean;
   reassigned?: boolean;
   modalNonce?: string;
   modalId?: string;
@@ -295,7 +297,10 @@ export class SlackNotificationStore implements NotificationStore {
     });
     if (!result.ok) throw new Error("Cannot read assignment notification state.");
     if (!result.item || Object.keys(result.item).length === 0) return null;
-    const item = result.item;
+    return this.fromRecord(result.item, id);
+  }
+
+  fromRecord(item: Record<string, unknown>, id: string): NotificationBatch {
     if (item.id !== id || typeof item.state !== "string") {
       throw new Error("Invalid notification state.");
     }
@@ -385,9 +390,7 @@ async function reconcileInvitations(
             const result = await client.chat.update({
               channel: invitation.channelId,
               ts: invitation.messageTs,
-              text: `*Task #${task.number}: ${
-                escape(task.name)
-              }*\n\n✅ Completed. This invitation is closed.`,
+              text: `*${escape(task.name)}*\n\n✅ Completed. This invitation is closed.`,
               blocks: [],
             });
             if (
@@ -426,7 +429,7 @@ async function reconcileInvitations(
             const result = await client.chat.update({
               channel: invitation.channelId,
               ts: invitation.messageTs,
-              text: `*Task #${task.number}: ${
+              text: `*${
                 escape(task.name)
               }*\n\n✅ Accepted by <@${task.assignmentTree.acceptedBy}>. This invitation is closed.`,
               blocks: [],
@@ -464,7 +467,7 @@ async function reconcileInvitations(
         if (
           access.userId === invitation.recipientId && canViewTask(task as Task, access)
         ) {
-          const text = `*Task #${task.number}: ${
+          const text = `*${
             escape(task.name)
           }*\n\n↪️ Assignment changed. This invitation has been replaced; no further response is needed here.`;
           const result = await client.chat.update({
@@ -486,6 +489,39 @@ async function reconcileInvitations(
           await store.save(batch);
           continue;
         }
+      }
+      if (task.deleted && client.chat.update) {
+        if (!invitation.deletionNotified) {
+          const access = context.loadAccess
+            ? await context.loadAccess(
+              { ...task, deleted: false } as Task,
+              invitation.recipientId,
+              batch.workspaceId,
+            ).catch(() => undefined)
+            : { userId: invitation.recipientId, teamIds: [] };
+          const visible = !!access && access.userId === invitation.recipientId &&
+            canViewTask({ ...task, deleted: false } as Task, access);
+          const updated = await client.chat.update({
+            channel: invitation.channelId,
+            ts: invitation.messageTs,
+            text: `${visible ? `*${escape(task.name)}*` : "Task"}\n\n🗑️ Deleted${
+              task.deletedBy ? ` by <@${task.deletedBy}>` : ""
+            }.`,
+            blocks: [],
+          });
+          if (
+            !updated.ok &&
+            !["message_not_found", "message_not_modified"].includes(updated.error ?? "")
+          ) {
+            failed.add(invitation.recipientId);
+            continue;
+          }
+          invitation.deletionNotified = true;
+          invitation.status = "cancelled";
+          batch.cancelled = [...new Set([...batch.cancelled, invitation.recipientId])];
+          await store.save(batch);
+        }
+        continue;
       }
       let remove = task.deleted || invitation.status === "cancelled" ||
         invitation.status === "rejected";
@@ -629,22 +665,22 @@ export function assignmentNotificationText(
       completed: false,
       ...task,
     };
-    return formatTask(card, teamNames) +
+    return formatTask(card, teamNames, false) +
       (note?.trim() ? `\n\n*Note:* ${escape(note.trim())}` : "");
   }
   return [
     creatorReturn
-      ? `Your task *#${task.number}: ${
+      ? `Your task *${
         escape(task.name)
       }* has come back to you because its delegation branches were rejected.`
       : returnedBy
-      ? `Task *#${task.number}: ${
+      ? `Task *${
         escape(task.name)
       }* was returned to you after <@${returnedBy}> rejected it.`
-      : `You have been assigned task *#${task.number}: ${escape(task.name)}*.`,
+      : `You have been assigned task *${escape(task.name)}*.`,
     creatorReturn
       ? "Choose *Accept*, *Delete*, or *Delegate*. You can also reply here with `accept`, `delete`, or `delegate @person @team`."
-      : `Reply here with \`accept\`, \`reject\`, \`delegate @person\`, or \`done\`. You can also send \`${task.number} done\` directly to DeleBot.`,
+      : `Reply here with \`accept\`, \`reject\`, \`delegate @person\`, or \`done\`. `,
     ...(!creatorReturn && note?.trim() ? [`*Note:* ${escape(note.trim())}`] : []),
   ].join("\n\n");
 }
@@ -953,7 +989,9 @@ async function notifyAssignmentsUnlocked(
         try {
           await context.rememberTask(dm.channel.id, sent.ts, recipient, task.id);
         } catch {
-          failed.add(recipient);
+          console.warn(
+            JSON.stringify({ event: "assignment_context_save_failed", taskId: task.id }),
+          );
         }
       }
       try {

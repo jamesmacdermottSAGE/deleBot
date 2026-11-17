@@ -8,7 +8,7 @@ export const GREETING = [
   "Reply in a task’s thread with `accept`, `reject`, `delegate @person`, edits, `complete`, or `incomplete`. A number also works: `123 complete`.",
   "*Help:* `task ?` for creation, editing and delegation; `ls ?` for list filters.",
   "Owners invite collaborators with `collab @person`. Without Access, complete/incomplete/delete send approval requests.",
-  "*Clear:* clears the DM or current DM thread. Your own messages require Slack user authorization; tasks remain.",
+  "*Space:* `space` adds a large visual separator in your DM.",
 ].join("\n\n");
 
 export const UNKNOWN_COMMAND =
@@ -21,7 +21,7 @@ function escapeText(text: string): string {
 
 /** A consistent identity for task notices, confirmations, and decisions. */
 export function taskTitle(task: Pick<Task, "number" | "name">): string {
-  return `*Task #${task.number}: ${escapeText(task.name)}*`;
+  return `*${escapeText(task.name)}*`;
 }
 
 function mention(userId: string): string {
@@ -155,9 +155,13 @@ function link(url: string): string {
 }
 
 /** A task's complete details, used after creation and for individual lookups. */
-export function formatTask(task: Task, teamNames: Record<string, string> = {}): string {
+export function formatTask(
+  task: Task,
+  teamNames: Record<string, string> = {},
+  showNumber = true,
+): string {
   return [
-    `*Task #${task.number}: ${escapeText(task.name)}*`,
+    showNumber ? `*Task #${task.number}: ${escapeText(task.name)}*` : taskTitle(task),
     `*Assignees:* ${assignees(task, teamNames)}`,
     ...declinedSummary(task),
     ...(task.participation &&

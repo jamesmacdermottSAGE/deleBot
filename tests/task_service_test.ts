@@ -290,7 +290,7 @@ Deno.test("name-only creation defaults optional fields and preserves thread cont
   assert(task.assignees.length === 0 && task.teams.length === 0);
   assert(task.links.length === 0 && task.description === "");
   assert(task.dueDate === null && task.priority === null);
-  assert(task.viewPerms?.join() === "all" && task.editPerms?.join() === "all");
+  assert(task.viewPerms?.join() === "all" && task.editPerms?.join() === "UCREATOR");
   assert(!task.completed && task.status === "open" && task.assignmentBased);
   assert(task.threadTs === context.messageTs);
   const event = mutationKey(context);
@@ -619,7 +619,7 @@ Deno.test("unassigned tasks default to everyone and assignment does not change p
   assert(assigned.task.assignees.join() === "UCREATOR");
   assert(
     assigned.task.viewPerms?.join() === "all" &&
-      assigned.task.editPerms?.join() === "all",
+      assigned.task.editPerms?.join() === "UCREATOR",
   );
   assert(
     assigned.task.assignmentTree?.acceptedBy === "UCREATOR" &&
@@ -870,7 +870,12 @@ Deno.test("soon filters use London calendar days with inclusive bounds across cl
 
 Deno.test("public Access permits an unrelated viewer to edit details and complete", async () => {
   const repo = new MemoryTaskRepository();
-  const { task } = await createTask({ name: "Shared" }, context, repo, access);
+  const { task } = await createTask(
+    { name: "Shared", editPerms: ["all"] },
+    context,
+    repo,
+    access,
+  );
   const stranger = { userId: "USTRANGER", teamIds: [] };
   const edited = await updateTask(
     task,
@@ -1153,7 +1158,8 @@ Deno.test("clearing fields resets defaults without deleting the task or clearing
   );
   assert(!result.task.completed && result.task.status === "open");
   assert(
-    result.task.viewPerms?.join() === "all" && result.task.editPerms?.join() === "all",
+    result.task.viewPerms?.join() === "all" &&
+      result.task.editPerms?.join() === "all",
   );
   assert(isPublicTask(result.task));
 });
@@ -1388,7 +1394,7 @@ Deno.test("delegation swaps only the actor, records new invitations and rejects 
   );
   assert(
     delegated.task.viewPerms?.join() === "all" &&
-      delegated.task.editPerms?.join() === "all",
+      delegated.task.editPerms?.join() === "UCREATOR",
   );
   const writes = repo.writes;
   assert(
@@ -1565,7 +1571,7 @@ Deno.test("fresh mutation reads preserve concurrent metadata edits and enforce a
     saved.description === "Added description" &&
       saved.links.join() === "https://example.com",
   );
-  await updateTask(saved, { editPerms: ["UALICE"] }, reply("9.3"), repo, access);
+  await updateTask(saved, { set: { editPerms: ["UALICE"] } }, reply("9.3"), repo, access);
   assert(
     await rejection(() => deleteTask(task, reply("9.4"), repo, access)) instanceof
       TaskAccessError,
@@ -1735,7 +1741,7 @@ Deno.test("creators administer access while completion and deletion always requi
 Deno.test("Access holders can explicitly reassign an owned task with fresh permission checks", async () => {
   const repo = new MemoryTaskRepository();
   const { task } = await createTask(
-    { name: "Protected owner", assignees: ["UALICE", "UBOB"] },
+    { name: "Protected owner", assignees: ["UALICE", "UBOB"], editPerms: ["all"] },
     context,
     repo,
     access,

@@ -139,6 +139,8 @@ function fromRecord(row: Record<string, unknown>): Task {
     (row.assigned_to !== undefined && !assignmentBased) ||
     typeof completed !== "boolean" ||
     (row.deleted !== undefined && typeof row.deleted !== "boolean") ||
+    (row.deleted_by !== undefined &&
+      (typeof row.deleted_by !== "string" || !/^[UW][A-Z0-9]+$/.test(row.deleted_by))) ||
     (row.view_perms !== undefined && !isTaskPermissions(row.view_perms)) ||
     (row.edit_perms !== undefined && !isTaskPermissions(row.edit_perms)) ||
     (row.thread_ts !== undefined &&
@@ -182,6 +184,7 @@ function fromRecord(row: Record<string, unknown>): Task {
     assignmentBased,
     completed,
     ...(row.deleted === undefined ? {} : { deleted: row.deleted as boolean }),
+    ...(typeof row.deleted_by === "string" ? { deletedBy: row.deleted_by } : {}),
     ...(row.view_perms === undefined
       ? {}
       : { viewPerms: [...row.view_perms as string[]] }),
@@ -299,6 +302,7 @@ function toRecord(task: Task): Record<string, unknown> {
       : {}),
     completed: task.completed,
     ...(task.deleted === undefined ? {} : { deleted: task.deleted }),
+    ...(task.deletedBy ? { deleted_by: task.deletedBy } : {}),
     ...(task.viewPerms === undefined ? {} : { view_perms: task.viewPerms }),
     ...(task.editPerms === undefined ? {} : { edit_perms: task.editPerms }),
     description: task.description,

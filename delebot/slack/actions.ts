@@ -103,6 +103,7 @@ export interface AssignmentSubmission {
   /** Compatibility with delegation dialogs opened before the combined field. */
   selectedUsers?: string[];
   teamText?: string;
+  selectedTeams?: string[];
 }
 export interface AssignmentActionResult {
   ok: boolean;
@@ -229,14 +230,25 @@ async function finishExecution(
 async function renderDecision(
   bound: BoundInvitation,
   dependencies: AssignmentDependencies,
+  finish = true,
 ): Promise<void> {
   const decision = bound.invitation.decision;
-  const notice = decision
+  const notice = bound.task.deleted
     ? {
-      eventKey: `${bound.invitation.channelId}:${decision.messageTs}`,
+      eventKey: `${bound.batch.id}:deleted`,
+      text: `${taskTitle(bound.task)}\n\n🗑️ Deleted${
+        bound.task.deletedBy ? ` by <@${bound.task.deletedBy}>` : ""
+      }.`,
       sourceChannel: bound.invitation.channelId!,
       sourceThread: bound.invitation.messageTs!,
-      text: `*Task #${bound.task.number}: ${
+    }
+    : decision
+    ? {
+      eventKey: `${bound.invitation.channelId}:${decision.messageTs}`,
+      notifyNewAssignees: decision.kind === "reject",
+      sourceChannel: bound.invitation.channelId!,
+      sourceThread: bound.invitation.messageTs!,
+      text: `*${
         escapeNotificationText(bound.task.name)
       }* <@${bound.invitation.recipientId}> ${
         decision.kind === "accept"
@@ -249,12 +261,47 @@ async function renderDecision(
       }.`,
     }
     : undefined;
-  if (dependencies.displays && await dependencies.displays.refresh(bound.task, notice)) {
-    throw new Error("Some task messages could not be refreshed.");
-  }
   const { invitation } = bound;
+  if (bound.task.deleted) {
+    const updated = await dependencies.client.chat.update({
+      channel: invitation.channelId!,
+      ts: invitation.messageTs!,
+      text: notice!.text,
+      blocks: [],
+    });
+    if (
+      !updated.ok &&
+      !["message_not_found", "message_not_modified"].includes(updated.error ?? "")
+    ) throw new Error("Cannot update deleted assignment message.");
+    if (finish) await finishExecution(bound, dependencies);
+    if (dependencies.displays) {
+      try {
+        await dependencies.displays.refresh(bound.task, notice);
+      } catch {
+        console.warn(
+          JSON.stringify({
+            event: "assignment_display_refresh_failed",
+            taskId: bound.task.id,
+          }),
+        );
+      }
+    }
+    return;
+  }
   if (invitation.closedBy) {
-    await finishExecution(bound, dependencies);
+    if (finish) await finishExecution(bound, dependencies);
+    if (dependencies.displays) {
+      try {
+        await dependencies.displays.refresh(bound.task, notice);
+      } catch {
+        console.warn(
+          JSON.stringify({
+            event: "assignment_display_refresh_failed",
+            taskId: bound.task.id,
+          }),
+        );
+      }
+    }
     return;
   }
   if (
@@ -285,9 +332,7 @@ async function renderDecision(
           /^S/.test(id) ? `<!subteam^${id}>` : `<@${id}>`
         ).join(", ")
       }`;
-    const text = `*Task #${bound.task.number}: ${
-      escapeNotificationText(bound.task.name)
-    }*\n\n${status}`;
+    const text = `*${escapeNotificationText(bound.task.name)}*\n\n${status}`;
     const result = await dependencies.client.chat.update({
       channel,
       ts,
@@ -303,7 +348,19 @@ async function renderDecision(
       );
     }
   }
-  await finishExecution(bound, dependencies);
+  if (finish) await finishExecution(bound, dependencies);
+  if (dependencies.displays) {
+    try {
+      await dependencies.displays.refresh(bound.task, notice);
+    } catch {
+      console.warn(
+        JSON.stringify({
+          event: "assignment_display_refresh_failed",
+          taskId: bound.task.id,
+        }),
+      );
+    }
+  }
 }
 
 async function currentAccess(
@@ -345,6 +402,7 @@ async function deliverDecision(
     bound.batch = reconciled;
     bound.invitation = invitation;
   }
+  await renderDecision(bound, dependencies, !delivery.failed.length);
   if (delivery.failed.length) {
     return {
       ok: false,
@@ -353,7 +411,6 @@ async function deliverDecision(
         "Your response was saved, but some assignment messages could not be delivered or updated. Retry this response, or update the task to retry delivery.",
     };
   }
-  await renderDecision(bound, dependencies);
   return { ok: true, interactive: delivery.interactive };
 }
 
@@ -594,7 +651,7 @@ export async function handleAssignmentAction(
         dependencies.repository,
         access,
       );
-      bound.task = { ...bound.task, deleted: true };
+      bound.task = { ...bound.task, deleted: true, deletedBy: action.userId };
       bound.invitation.status = "rejected";
       await dependencies.store.save(bound.batch);
       return await deliverDecision(bound, dependencies);
@@ -651,17 +708,31 @@ export async function handleAssignmentAction(
         blocks: [
           {
             type: "input",
-            block_id: "delegation_recipients",
-            label: { type: "plain_text", text: "People and teams" },
+            block_id: "delegation_people",
+            optional: true,
+            label: { type: "plain_text", text: "People" },
+            element: {
+              type: "multi_users_select",
+              action_id: "people",
+              max_selected_items: 20,
+              placeholder: { type: "plain_text", text: "Select people" },
+            },
+          },
+          {
+            type: "input",
+            block_id: "delegation_teams",
+            optional: true,
+            label: { type: "plain_text", text: "Teams" },
             hint: {
               type: "plain_text",
-              text: "Use @ to mention one or more people or teams (up to 20).",
+              text: "Choose at least one person or team; up to 20 recipients in total.",
             },
             element: {
-              type: "rich_text_input",
-              action_id: "recipients",
-              placeholder: { type: "plain_text", text: "@person @team" },
-              focus_on_load: true,
+              type: "multi_external_select",
+              action_id: "teams",
+              min_query_length: 0,
+              max_selected_items: 20,
+              placeholder: { type: "plain_text", text: "Select teams" },
             },
           },
           {
@@ -718,7 +789,15 @@ async function delegationTargets(
       (!Array.isArray(submission.selectedUsers) ||
         !submission.selectedUsers.every((id) => /^[UW][A-Z0-9]+$/.test(id))))
   ) return null;
-  const targets = new Set(submission.selectedUsers ?? []);
+  if (
+    submission.selectedTeams !== undefined &&
+    (!Array.isArray(submission.selectedTeams) ||
+      !submission.selectedTeams.every((id) => /^S[A-Z0-9]+$/.test(id)))
+  ) return null;
+  const targets = new Set([
+    ...submission.selectedUsers ?? [],
+    ...submission.selectedTeams ?? [],
+  ]);
   const text = submission.recipients !== undefined
     ? recipientMentions(submission.recipients)
     : (submission.teamText ?? "").trim();
@@ -956,6 +1035,10 @@ export async function assignmentViewSubmissionHandler(
     note: values.delegation_note?.note?.value ?? "",
     selectedUsers: values.delegation_people?.people?.selected_users ?? [],
     teamText: values.delegation_teams?.teams?.value ?? "",
+    selectedTeams:
+      values.delegation_teams?.teams?.selected_options?.map((option: { value: string }) =>
+        option.value
+      ) ?? [],
   };
   const result = await queueDelegationSubmission(submission, dispatch);
 
@@ -977,8 +1060,16 @@ export async function queueDelegationSubmission(
 ): Promise<AssignmentActionResult> {
   const text = submission.recipients !== undefined
     ? recipientMentions(submission.recipients)
-    : [...submission.selectedUsers ?? [], submission.teamText ?? ""].join(" ").trim();
+    : [
+      ...submission.selectedUsers ?? [],
+      ...submission.selectedTeams ?? [],
+      submission.teamText ?? "",
+    ].join(" ").trim();
   if (!text?.trim()) return { ok: false, error: "Mention at least one person or team." };
+  if (
+    new Set([...submission.selectedUsers ?? [], ...submission.selectedTeams ?? []]).size >
+      20
+  ) return { ok: false, error: "Choose at most 20 people and teams." };
   if (submission.note && submission.note.length > 2000) {
     return {
       ok: false,

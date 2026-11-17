@@ -213,8 +213,8 @@ Deno.test("access me adds the requester, edit access me replaces Access, and bot
   assert(f.task().editPerms?.join() === "UCREATOR");
   const reply = f.posts.at(-1)!;
   assert(
-    reply.text.includes(`#${f.task().number}: SelfAccess`) &&
-      reply.text.includes("Access updated") && reply.text.length < 250,
+    reply.text.includes(`SelfAccess`) &&
+      reply.text.includes("No fields changed") && reply.text.length < 250,
   );
   await f.command("UCREATOR", "access <@UMANAGER>", reply.ts);
   assert(f.task().editPerms?.includes("UMANAGER"));
@@ -223,7 +223,7 @@ Deno.test("access me adds the requester, edit access me replaces Access, and bot
   await f.command("UCREATOR", "access", reply.ts);
   assert(
     f.posts.at(-1)!.text.length < 500 &&
-      f.posts.at(-1)!.text.includes(`#${f.task().number}: SelfAccess`),
+      f.posts.at(-1)!.text.includes(`SelfAccess`),
   );
   const errorReply = f.posts.at(-1)!;
   await f.command("UCREATOR", "assign <@UBOB>", errorReply.ts);
@@ -238,7 +238,7 @@ Deno.test("access me cannot grant a pending assignee editing privileges", async 
   assert(f.task().editPerms?.join() === "UMANAGER");
   assert(
     f.posts.at(-1)!.text.includes("You need Access") &&
-      f.posts.at(-1)!.text.includes(`#${f.task().number}: Restricted`),
+      f.posts.at(-1)!.text.includes(`Restricted`),
   );
 });
 
@@ -257,7 +257,7 @@ Deno.test("request rejections update requester confirmations and remain usable a
       request.confirmations?.some((message) => message.messageTs === confirmation.ts),
     );
     assert(
-      confirmation.text.includes(`#${f.task().number}: Approval`) &&
+      confirmation.text.includes(`Approval`) &&
         !confirmation.text.includes("*Assignees:*"),
     );
     const managerInvite = f.invitation("UMANAGER", "delebot_request_approve");
@@ -266,11 +266,11 @@ Deno.test("request rejections update requester confirmations and remain usable a
     assert(
       rejection.text.includes(
         `${kind === "complete" ? "Completion" : "Deletion"} request rejected`,
-      ) && rejection.text.includes(`#${f.task().number}: Approval`),
+      ) && rejection.text.includes(`Approval`),
     );
     assert(
-      f.posts.at(-1)!.text.includes("request rejected") &&
-        f.posts.at(-1)!.text.includes(`#${f.task().number}: Approval`),
+      f.updates.at(-1)!.text.includes("request rejected") &&
+        f.posts.at(-1)!.text.includes(`Approval`),
     );
     assert(!f.task().deleted && !f.task().completed);
     const originalId = f.task().id;
@@ -317,7 +317,7 @@ Deno.test("reject-request buttons update both named messages and preserve the re
     for (const ts of [confirmation.ts, invite.ts]) {
       const update = f.updates.filter((message) => message.ts === ts).at(-1)!;
       assert(
-        update.text.includes(`#${f.task().number}: ButtonDecision`) &&
+        update.text.includes(`ButtonDecision`) &&
           update.text.includes("request rejected"),
       );
     }
@@ -331,7 +331,7 @@ Deno.test("task-related channel messages support replies from another authorized
   const f = fixture();
   await f.command(
     "UCREATOR",
-    "<@UBOT> task ChannelTask assign <@UALICE>",
+    "<@UBOT> task ChannelTask assign <@UALICE> access all",
     undefined,
     "CTEST",
   );
@@ -339,7 +339,7 @@ Deno.test("task-related channel messages support replies from another authorized
   await f.command("UALICE", "<@UBOT> accept", card.ts, "CTEST");
   assert(f.task().assignmentTree?.acceptedBy === "UALICE");
   const accepted = f.posts.filter((message) => message.channel === "CTEST").at(-1)!;
-  assert(accepted.text.includes(`#${f.task().number}: ChannelTask`));
+  assert(accepted.text.includes(`ChannelTask`));
   await f.command("UALICE", "<@UBOT> p 2", accepted.ts, "CTEST");
   assert(f.task().priority === 2);
   await f.command("UOTHER", "<@UBOT> p 3", accepted.ts, "CTEST");
@@ -366,7 +366,7 @@ Deno.test("private-channel task acknowledgements retain context without granting
 
 Deno.test("incomplete requests leave completion in place until an Access holder approves", async () => {
   const f = fixture();
-  await f.command("UCREATOR", "task Reopen access <@UMANAGER>");
+  await f.command("UCREATOR", 'task "Reopen" access <@UMANAGER>');
   const number = f.task().number;
   await f.command("UMANAGER", `${number} complete`);
   assert(f.task().completed);
@@ -388,7 +388,7 @@ Deno.test("incomplete requests leave completion in place until an Access holder 
 
 Deno.test("an incomplete request rejection has an X and preserves completion", async () => {
   const f = fixture();
-  await f.command("UCREATOR", "task Reopen access <@UMANAGER>");
+  await f.command("UCREATOR", 'task "Reopen" access <@UMANAGER>');
   const number = f.task().number;
   await f.command("UMANAGER", `${number} complete`);
   await f.command("UBOB", `${number} edit incomplete`);

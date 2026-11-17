@@ -110,7 +110,7 @@ Deno.test("assignment notifications include task details and notify each directl
   assert(result.failed.length === 0 && posts.length === 2);
   assert(opens.join() === "UJAMES,UCREATOR");
   assert(
-    posts.every((post) => post.channel.startsWith("D") && post.text.includes("#42")),
+    posts.every((post) => post.channel.startsWith("D") && !post.text.includes("#42")),
   );
   assert(posts[0].text.includes("&lt;!channel&gt; &amp; &lt;@UOTHER&gt;"));
   assert(!posts[0].text.includes("<!channel>"));

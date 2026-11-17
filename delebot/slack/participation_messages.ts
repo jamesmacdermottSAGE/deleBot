@@ -1,3 +1,4 @@
+import { delegationEndpoint, dispatchDelegation } from "./delegation_dispatch.ts";
 import { taskTitle } from "./messages.ts";
 import { canAccessTask, canManageTask } from "../tasks/access.ts";
 import type { Task, TaskAccess } from "../tasks/models.ts";
@@ -59,6 +60,7 @@ export interface ParticipationAction {
   messageTs: string;
   executionId: string;
   actionTs?: string;
+  note?: string;
 }
 export interface ParticipationDependencies {
   client: ParticipationClient;
@@ -159,8 +161,10 @@ export function requestStatusText(task: Task, request: TaskActionRequest): strin
     ? "❌"
     : "⏳";
   return `${taskTitle(task)}\n\n${emoji} ${kind} ${status}.${
-    request.status === "approved" && request.kind === "delete" ? " Task deleted." : ""
-  }`;
+    request.status === "approved" && request.kind === "delete"
+      ? ` Task deleted by <@${request.resolvedBy}>.`
+      : ""
+  }${request.rejectionNote ? `\n\n*Reason:* ${escape(request.rejectionNote)}` : ""}`;
 }
 
 export function collaborationStatusText(
@@ -174,7 +178,11 @@ export function collaborationStatusText(
       : "cancelled";
     return `<@${user}> ${
       status === "accepted" ? "✅" : status === "pending" ? "⏳" : "❌"
-    } ${status}`;
+    } ${status}${
+      invitation?.eventKey === delivery.reference && invitation.rejectionNote
+        ? ` — ${escape(invitation.rejectionNote)}`
+        : ""
+    }`;
   });
   return `${taskTitle(task)}\n\nCollaboration requested.\n${statuses.join("\n")}`;
 }
@@ -184,7 +192,7 @@ function textFor(
   delivery: ParticipationDelivery,
   userId: string,
 ): string {
-  const title = `*#${task.number}: ${escape(task.name)}*`;
+  const title = taskTitle(task);
   if (delivery.kind === "collaboration") {
     const invitation = task.participation!.collaborators[userId];
     return `<@${invitation.invitedBy}> invited you to collaborate on task ${title}.\n\nAccept or reject below, or reply with \`collab accept\` or \`collab reject\`. Collaboration does not change the assignee.`;
@@ -340,7 +348,29 @@ export async function notifyParticipation(
             (delivery.kind === "approval" && nextStatus === "pending" &&
               !canManageTask(current, access))
           ) nextStatus = "cancelled";
-          if (nextStatus === "pending") continue;
+          if (nextStatus === "pending") {
+            const text = textFor(current, delivery, userId);
+            if (binding.renderedText !== text) {
+              const updated = await client.chat.update({
+                channel: binding.channelId,
+                ts: binding.messageTs,
+                text,
+                blocks: blocks(current, eventKey, userId, binding, delivery, text),
+              });
+              if (
+                !updated.ok &&
+                !["message_not_found", "message_not_modified"].includes(
+                  updated.error ?? "",
+                )
+              ) {
+                failed.add(userId);
+                continue;
+              }
+              binding.renderedText = text;
+              await repository.save(current);
+            }
+            continue;
+          }
           binding.status = nextStatus;
           const visible = canAccessTask({ ...current, deleted: false }, access);
           const text = !visible
@@ -349,16 +379,13 @@ export async function notifyParticipation(
             ? requestStatusText(current, request)
             : `${taskTitle(current)}\n\n${
               nextStatus === "accepted" ? "✅" : "❌"
-            } Collaboration ${nextStatus}.`;
-          if (visible && context.rememberTask && !binding.contextSaved) {
-            await context.rememberTask(
-              binding.channelId,
-              binding.messageTs,
-              userId,
-              current.id,
-            );
-            binding.contextSaved = true;
-          }
+            } Collaboration ${nextStatus}.${
+              current.participation.collaborators[userId]?.rejectionNote
+                ? `\n\n*Reason:* ${
+                  escape(current.participation.collaborators[userId].rejectionNote!)
+                }`
+                : ""
+            }`;
           const updated = await client.chat.update({
             channel: binding.channelId,
             ts: binding.messageTs,
@@ -369,6 +396,24 @@ export async function notifyParticipation(
             !updated.ok &&
             !["message_not_found", "message_not_modified"].includes(updated.error ?? "")
           ) failed.add(userId);
+          try {
+            if (visible && context.rememberTask && !binding.contextSaved) {
+              await context.rememberTask(
+                binding.channelId,
+                binding.messageTs,
+                userId,
+                current.id,
+              );
+              binding.contextSaved = true;
+            }
+          } catch {
+            console.warn(
+              JSON.stringify({
+                event: "participation_context_save_failed",
+                taskId: current.id,
+              }),
+            );
+          }
           await repository.save(current);
         } catch {
           failed.add(userId);
@@ -414,6 +459,7 @@ export async function notifyParticipation(
             failed.add(userId);
             continue;
           }
+          if (context.executionId) await context.prepareInteractivity?.();
           const text = textFor(current, delivery, userId);
           const sent = await client.chat.postMessage(
             {
@@ -433,6 +479,7 @@ export async function notifyParticipation(
           }
           binding.channelId = dm.channel.id;
           binding.messageTs = sent.ts;
+          binding.renderedText = text;
           await repository.save(current);
           if (context.rememberTask) {
             await context.rememberTask(dm.channel.id, sent.ts, userId, current.id);
@@ -499,6 +546,7 @@ export async function handleParticipationAction(
           dependencies.repository,
           access,
           ref.eventKey,
+          action.note,
         )
         : await respondToTaskAction(
           task,
@@ -507,6 +555,7 @@ export async function handleParticipationAction(
           context,
           dependencies.repository,
           access,
+          action.note,
         );
       current = result.task;
     }
@@ -533,18 +582,29 @@ export async function handleParticipationAction(
     );
     notifications.failed = [...new Set([...notifications.failed, ...assignments.failed])];
     if (dependencies.displays) {
-      const text = isCollaboration
-        ? `${taskTitle(current)} <@${action.userId}> ${
-          action.actionId === COLLAB_ACCEPT ? "✅ accepted" : "❌ rejected"
-        } collaboration.`
-        : requestStatusText(current, current.participation!.requests[delivery.reference]);
-      const refreshFailed = await dependencies.displays.refresh(current, {
-        eventKey: `${context.channelId}:${context.messageTs}`,
-        text,
-        sourceChannel: action.channelId,
-        sourceThread: action.messageTs,
-      });
-      if (refreshFailed) notifications.failed.push("task_displays");
+      try {
+        await dependencies.displays.refresh(
+          current,
+          current.deleted
+            ? {
+              eventKey: `${context.channelId}:${context.messageTs}`,
+              text: requestStatusText(
+                current,
+                current.participation!.requests[delivery.reference],
+              ),
+              sourceChannel: action.channelId,
+              sourceThread: action.messageTs,
+            }
+            : undefined,
+        );
+      } catch {
+        console.warn(
+          JSON.stringify({
+            event: "participation_display_refresh_failed",
+            taskId: current.id,
+          }),
+        );
+      }
     }
     if (
       dependencies.notificationStore && dependencies.client.functions &&
@@ -578,7 +638,12 @@ export async function handleParticipationAction(
           function_execution_id: action.executionId,
           outputs: { ignored: false },
         });
-        if (!completed.ok) throw new Error("Cannot finish participation interaction.");
+        if (
+          !completed.ok &&
+          !["already_complete", "function_execution_already_completed"].includes(
+            completed.error ?? "",
+          )
+        ) throw new Error("Cannot finish participation interaction.");
         final.participation.completedExecutions = [
           ...new Set([
             ...final.participation.completedExecutions ?? [],
@@ -604,6 +669,102 @@ export async function handleParticipationAction(
       error: error instanceof TaskAccessError || error instanceof TaskCommandError
         ? error.message
         : "I could not apply this response. Please try again.",
+    };
+  }
+}
+
+export const PARTICIPATION_REJECT_VIEW = "delebot_participation_reject";
+
+/** Opening a rejection form does not change the request. The worker validates its original binding. */
+export async function participationBlockActionHandler(
+  { body, action, client }:
+    import("deno-slack-sdk/functions/interactivity/types.ts").ActionContext<
+      Record<string, unknown>
+    >,
+) {
+  const raw = action as unknown as {
+    action_id: string;
+    value: string;
+    action_ts?: string;
+  };
+  const container = body.container as { channel_id?: string; message_ts?: string };
+  const submitted: ParticipationAction = {
+    actionId: raw.action_id,
+    value: raw.value,
+    actionTs: raw.action_ts,
+    userId: body.user.id,
+    channelId: container.channel_id ?? "",
+    messageTs: container.message_ts ?? "",
+    executionId: body.function_data.execution_id,
+  };
+  try {
+    const workerUrl = await delegationEndpoint(client);
+    if ([COLLAB_REJECT, REQUEST_REJECT].includes(submitted.actionId)) {
+      const opened = await client.views.open({
+        interactivity_pointer: body.interactivity.interactivity_pointer,
+        view: {
+          type: "modal",
+          callback_id: PARTICIPATION_REJECT_VIEW,
+          title: { type: "plain_text", text: "Reject request" },
+          submit: { type: "plain_text", text: "Reject" },
+          close: { type: "plain_text", text: "Cancel" },
+          private_metadata: JSON.stringify({ action: submitted, workerUrl }),
+          blocks: [{
+            type: "input",
+            block_id: "rejection_note",
+            optional: true,
+            label: { type: "plain_text", text: "Reason (optional)" },
+            element: {
+              type: "plain_text_input",
+              action_id: "note",
+              multiline: true,
+              max_length: 2000,
+            },
+          }],
+        },
+      });
+      if (!opened.ok) throw new Error("Cannot open rejection form.");
+    } else {await dispatchDelegation(
+        workerUrl,
+        { kind: "participation_action", action: submitted },
+        submitted.channelId,
+        submitted.userId,
+      );}
+  } catch {
+    await client.chat.postEphemeral({
+      channel: submitted.channelId,
+      user: submitted.userId,
+      text: "Slack could not receive your response. Please retry.",
+    });
+  }
+}
+
+export async function participationViewSubmissionHandler(
+  { body, view }:
+    import("deno-slack-sdk/functions/interactivity/types.ts").ViewSubmissionContext<
+      Record<string, unknown>
+    >,
+  dispatch = dispatchDelegation,
+) {
+  try {
+    const metadata = JSON.parse(view.private_metadata ?? "");
+    const action = metadata.action as ParticipationAction;
+    const note = view.state.values.rejection_note?.note?.value ?? "";
+    if (
+      action?.userId !== body.user.id ||
+      ![COLLAB_REJECT, REQUEST_REJECT].includes(action.actionId) || note.length > 2000
+    ) throw new Error("Invalid rejection.");
+    await dispatch(
+      metadata.workerUrl,
+      { kind: "participation_action", action: { ...action, note } },
+      action.channelId,
+      action.userId,
+    );
+    return { response_action: "clear" as const };
+  } catch {
+    return {
+      response_action: "errors" as const,
+      errors: { rejection_note: "Slack could not receive your rejection. Please retry." },
     };
   }
 }

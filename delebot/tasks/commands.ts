@@ -40,10 +40,10 @@ export const TASK_CREATE_USAGE = [
   "Links, Jira links and GitHub links are separate fields. Repeat a field to add links. `edit jira https://…` replaces that field; `delete jira github` clears those fields.",
   '*Replace:* `edit name "New name"`, `edit assign @person`, `edit due 10/11/26 p 2 desc "New text"`, `edit access @team`, or `edit completed no` to reopen.',
   "*Clear:* `delete due p desc` clears only those fields. `delete` alone deletes the task. A task must keep its name.",
-  "*Delegate dialog:* mention one or more people and teams in the top field; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
-  "*Clear chat:* `clear` in a DM clears that chat; in a DM thread it clears only that thread. Large histories run in resumable batches: repeat clear when prompted. Your messages require your Slack user authorization to delete; without it only bot messages are removed. Saved tasks are unchanged.",
-  "*Complete:* `complete` completes a task. `incomplete` requests reopening it when you lack Access. Reply in the task's thread or specify its number, e.g. `123 complete`. Bare complete also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
-  "*Access:* `access me` adds yourself; `edit access me` replaces Access with yourself. `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Use `access all` for everyone. The creator, accepted assignee, accepted collaborators, and anyone with Access can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using complete, incomplete, or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve incomplete`, `approve delete`, or the matching `deny` command in the task thread. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
+  "*Delegate dialog:* select people and teams from the pickers; at least one recipient is required (up to 20). The optional note is sent with their invitations and omitted when blank.",
+  "*Space:* `space` prints a large visual separator in your DM.",
+  "*Complete:* `complete` completes a task. `incomplete` (or `reopen`) requests reopening it when you lack Access. Reply in the task's thread or specify its number, e.g. `123 complete`. Bare complete also works after selecting a single task; if several tasks were shown, use a thread or number. Numbers are automatic and non-consecutive.",
+  "*Access:* `access me` adds yourself; `edit access me` replaces Access with yourself. `access @person @team` adds people allowed to complete or delete the task; `edit access @person` replaces that policy. Access starts with the creator only. Use `access all` for everyone. The creator, accepted assignee, accepted collaborators, and anyone with Access can edit task details. Access changes additionally require being the creator or a current Access holder. A viewer without Access using complete, incomplete, or delete sends a request to access holders; they approve/decline using its buttons, or `approve complete`, `approve incomplete`, `approve delete`, or the matching `deny` command in the task thread. Add an optional explanation, e.g. `deny reopen More testing is needed`. `viewPerms` separately controls visibility; assignments never grant private viewing permission.",
   "*Collaborate:* the accepted owner can use `collab @person` to send a separate collaboration invitation. Recipients use its buttons or `collab accept` / `collab reject` in the task thread. `ls collab` lists accepted collaborations; collaborators are not assignees.",
   "*List:* `ls me` includes your direct and current team assignments; `ls @person` shows direct assignments and `ls @team` shows team assignments. Each task arrives as a separate DM message. Reply to its thread to update it. Run `ls ?` for all filters or `?` for a brief introduction.",
   "Quote names and descriptions containing field words. In a new task use fields directly instead of edit. New assignees who can access the task receive an invitation DM. Temporary development reset: `delete all` clears every saved task and assignment record.",
@@ -65,15 +65,16 @@ export type TaskCommand =
   }
   | { kind: "print"; number?: number }
   | { kind: "reset" }
-  | { kind: "clear-chat" }
+  | { kind: "space" }
   | { kind: "collaborate"; number?: number; users: string[] }
-  | { kind: "collaboration-response"; number?: number; accept: boolean }
+  | { kind: "collaboration-response"; number?: number; accept: boolean; note?: string }
   | {
     kind: "approval-response";
     number?: number;
     kindOfAction: "complete" | "incomplete" | "delete";
     approve: boolean;
     requestId?: string;
+    note?: string;
   }
   | { kind: "help"; topic: "general" | "create" | "list" }
   | { kind: "create"; name: string; patch: TaskPatch }
@@ -272,7 +273,7 @@ function operationAt(
     return { field: "githubLinks", size: 1 };
   }
   if (["complete", "done"].includes(word)) return { field: "done", size: 1 };
-  if (word === "incomplete") return { field: "incomplete", size: 1 };
+  if (word === "incomplete" || word === "reopen") return { field: "incomplete", size: 1 };
   if (word === "delete") return { field: "delete", size: 1 };
   if (word === "edit") return { field: "edit", size: 1 };
   if (word === "viewperms") return { field: "viewPerms", size: 1 };
@@ -740,7 +741,7 @@ export function parseTaskCommand(text: string): TaskCommand {
     .replace(/^#(\d+)(?=\s|$)/, "$1")
     .replace(/^\((\d+)\)(?=\s|$)/, "$1");
   if (command === "?") return { kind: "help", topic: "general" };
-  if (/^clear$/i.test(command)) return { kind: "clear-chat" };
+  if (/^space$/i.test(command)) return { kind: "space" };
   if (/^ls\s+collab$/i.test(command)) {
     return { kind: "list", query: { kind: "collaborator" } };
   }
@@ -750,11 +751,12 @@ export function parseTaskCommand(text: string): TaskCommand {
     if (participation[1] && !number) return invalid("Use a valid task number.");
     const word = participation[2].toLowerCase(), value = participation[3].trim();
     if (word === "collab") {
-      if (/^(accept|reject)$/i.test(value)) {
+      if (/^(accept|reject(?:\s+[\s\S]+)?)$/i.test(value)) {
         return {
           kind: "collaboration-response",
           ...(number ? { number } : {}),
-          accept: /^accept$/i.test(value),
+          accept: /^accept(?:\s|$)/i.test(value),
+          ...(/^reject\s/i.test(value) ? { note: value.replace(/^reject\s+/i, "") } : {}),
         };
       }
       const users = parseAssignees(value);
@@ -765,10 +767,19 @@ export function parseTaskCommand(text: string): TaskCommand {
       }
       return { kind: "collaborate", ...(number ? { number } : {}), users };
     }
-    const request = /^(complete|incomplete|done|delete)(?:\s+(\S+))?$/i.exec(value);
+    const request = /^(complete|incomplete|reopen|done|delete)(?:\s+([\s\S]+))?$/i.exec(
+      value,
+    );
     if (!request) {
       return invalid(
         "Use approve complete, approve delete, deny complete, or deny delete in the task thread.",
+      );
+    }
+    const tail = request[2]?.trim();
+    const explicitId = tail && /^([CDG][A-Z0-9]+:\d+\.\d+)(?:\s+([\s\S]+))?$/.exec(tail);
+    if (word === "approve" && tail && /\s/.test(tail)) {
+      return invalid(
+        "Use one request ID after approve, or omit it for the only pending request.",
       );
     }
     return {
@@ -776,11 +787,15 @@ export function parseTaskCommand(text: string): TaskCommand {
       ...(number ? { number } : {}),
       kindOfAction: /^delete$/i.test(request[1])
         ? "delete"
-        : /^incomplete$/i.test(request[1])
+        : /^(incomplete|reopen)$/i.test(request[1])
         ? "incomplete"
         : "complete",
       approve: word === "approve",
-      ...(request[2] ? { requestId: request[2] } : {}),
+      ...(word === "approve" && tail ? { requestId: tail } : {}),
+      ...(word === "deny" && explicitId ? { requestId: explicitId[1] } : {}),
+      ...(word === "deny" && (explicitId ? explicitId[2] : tail)
+        ? { note: (explicitId ? explicitId[2] : tail)!.replace(/^"([\s\S]*)"$/, "$1") }
+        : {}),
     };
   }
   if (/^delete\s+all$/i.test(command)) return { kind: "reset" };

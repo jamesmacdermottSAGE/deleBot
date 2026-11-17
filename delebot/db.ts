@@ -15,6 +15,7 @@ export const TasksDatastore = DefineDatastore({
     assignment_version: { type: Schema.types.integer },
     completed: { type: Schema.types.boolean },
     deleted: { type: Schema.types.boolean },
+    deleted_by: { type: Schema.slack.types.user_id },
     description: { type: Schema.types.string },
     due_date: { type: Schema.types.string },
     urgency: { type: Schema.types.integer },

@@ -1,3 +1,4 @@
+import { retrySlack } from "./retry.ts";
 import { DefineDatastore, Schema } from "deno-slack-sdk/mod.ts";
 
 export const DmContextsDatastore = DefineDatastore({
@@ -36,18 +37,24 @@ export class SlackDmContexts implements DmContexts {
   constructor(private client: Client) {}
   async get(channel: string, thread: string, user: string): Promise<string[]> {
     const id = `${channel}:${thread}:${user}`;
-    const result = await this.client.apps.datastore.get({
-      datastore: DmContextsDatastore.name,
-      id,
-    });
+    const result = await retrySlack(
+      "dm_context.get",
+      () =>
+        this.client.apps.datastore.get({
+          datastore: DmContextsDatastore.name,
+          id,
+        }),
+    );
     if (!result.ok) throw new Error("Cannot read DM task context.");
     if (!result.item || !Object.keys(result.item).length) return [];
     if (
       result.item.id !== id || result.item.user_id !== user ||
-      !Array.isArray(result.item.task_ids) ||
-      !result.item.task_ids.every((value) => typeof value === "string")
+      (result.item.task_ids !== undefined && !Array.isArray(result.item.task_ids)) ||
+      !((result.item.task_ids ?? []) as unknown[]).every((value) =>
+        typeof value === "string"
+      )
     ) throw new Error("Invalid DM context.");
-    return result.item.task_ids as string[];
+    return (result.item.task_ids ?? []) as string[];
   }
   async save(
     channel: string,
@@ -56,15 +63,19 @@ export class SlackDmContexts implements DmContexts {
     ids: string[],
     kind?: "card" | "context" | "invitation",
   ) {
-    const result = await this.client.apps.datastore.put({
-      datastore: DmContextsDatastore.name,
-      item: {
-        id: `${channel}:${thread}:${user}`,
-        user_id: user,
-        task_ids: [...new Set(ids)],
-        ...(kind ? { message_kind: kind } : {}),
-      },
-    });
+    const result = await retrySlack(
+      "dm_context.put",
+      () =>
+        this.client.apps.datastore.put({
+          datastore: DmContextsDatastore.name,
+          item: {
+            id: `${channel}:${thread}:${user}`,
+            user_id: user,
+            ...(ids.length ? { task_ids: [...new Set(ids)] } : {}),
+            ...(kind ? { message_kind: kind } : {}),
+          },
+        }),
+    );
     if (!result.ok) throw new Error("Cannot save DM task context.");
   }
 }

@@ -309,16 +309,16 @@ Deno.test("team creation invites each member, rejection retains the team, and ac
     );
     if (index === 0) {
       assert(repo.rows.get(task.id)!.assignees.join() === "SJSQUAD");
-      assert(f.posts.at(-1)!.text.includes("*Declined:* <@UALICE>"));
-      assert(f.posts.at(-1)!.text.includes("@jsquad"));
+      assert(f.posts.at(-1)!.text.includes("Assignment rejected"));
+      assert(!f.posts.at(-1)!.text.includes("*Assignees:*"));
     }
   }
   const updated = repo.rows.get(task.id)!;
   assert(updated.assignmentResponses?.UALICE.status === "rejected");
   assert(updated.assignmentResponses?.UBOB.status === "accepted");
   assert(updated.assignees.join() === "UBOB" && updated.teams.length === 0);
-  assert(f.posts.at(-1)!.text.includes("<@UBOB> ✅"));
-  assert(f.posts.at(-1)!.text.includes("*Assignees:* <@UBOB> ✅ Accepted"));
+  assert(f.posts.at(-1)!.text.includes("Assignment accepted"));
+  assert(!f.posts.at(-1)!.text.includes("*Assignees:*"));
   assert(!f.posts.at(-1)!.text.includes("*Accepted by:*"));
   assert(
     f.notificationPosts.length === 2,
@@ -611,7 +611,7 @@ Deno.test("membership failures block restricted creation and limit reads to safe
   }
   assert(reads === 2 && repo.writes === 0);
   assert(
-    posts.filter((p) => p.text.includes("couldn't verify")).length === 3 &&
+    posts.filter((p) => p.text.includes("couldn't verify")).length === 1 &&
       posts.every((p) => !p.text.includes("sensitive")),
   );
   assert(posts[0].channel === event.channel_id);
@@ -649,6 +649,7 @@ Deno.test("explicit all task creation needs no membership API and fallback lists
       assignees: ["SFRONTEND"],
       viewPerms: ["SFRONTEND"],
     }]);
+  repo.referencedTeamIds = () => Promise.resolve(["SFRONTEND"]);
   const before = posts.length;
   await handleMessage({ ...event, text: "<@UBOT> ls tasks" }, client, repo, failed);
   assert(Number(checks) === 1);
@@ -941,7 +942,7 @@ Deno.test("name-only creation and combined thread updates show current fields an
   await handleMessage({ ...event, text: "<@UBOT> task Review PRs" }, client, repo);
   const initial = [...repo.rows.values()][0];
   assert(initial.name === "Review PRs" && initial.assignees.length === 0);
-  assert(initial.viewPerms?.join() === "all" && initial.editPerms?.join() === "all");
+  assert(initial.viewPerms?.join() === "all" && initial.editPerms?.join() === "UHUMAN");
   assert(
     !initial.completed && initial.description === "" && initial.links.length === 0 &&
       initial.priority === null && initial.dueDate === null,
@@ -965,14 +966,17 @@ Deno.test("name-only creation and combined thread updates show current fields an
   assert(current.dueDate === "2026-11-06" && current.links.length === 2);
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   assert(
-    posts.at(-1)!.text.includes(`#${initial.number}`) &&
+    !posts.at(-1)!.text.includes(`#${initial.number}`) &&
       posts.at(-1)!.text.includes("updated") &&
       posts.at(-1)!.text.includes("Review PRs") &&
       !posts.at(-1)!.text.includes("*Assignees:*") &&
       !posts.at(-1)!.text.includes("https://b.example"),
   );
   assert(openedDms.join() === "UJAMES");
-  assert(notificationPosts.at(-1)!.text.includes(`#${initial.number}: Review PRs`));
+  assert(
+    notificationPosts.at(-1)!.text.includes("Review PRs") &&
+      !notificationPosts.at(-1)!.text.includes(`#${initial.number}`),
+  );
   await handleMessage(update, client, repo);
   assert(repo.writes === 2 && Number(notificationPosts.length) === 1);
   assert(posts.at(-1)!.text.includes("Already applied"));
@@ -1073,7 +1077,8 @@ Deno.test("work done completes the unique task in the current thread", async () 
   );
   assert([...repo.rows.values()][0].completed && repo.writes === 2);
   assert(
-    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("Completed.") &&
+    !posts.at(-1)!.text.includes("*Task #") &&
+      posts.at(-1)!.text.includes("Completed.") &&
       !posts.at(-1)!.text.includes("*Completed:*"),
   );
 });
@@ -1093,7 +1098,7 @@ Deno.test("print reprints current task details without editing or assigning it",
     repo,
   );
   assert(
-    posts.at(-1)!.text.startsWith("✅ *Task #") &&
+    posts.at(-1)!.text.startsWith("✅ *Print example*") &&
       posts.at(-1)!.text.includes("updated") &&
       !posts.at(-1)!.text.includes("Current description"),
   );
@@ -1104,7 +1109,7 @@ Deno.test("print reprints current task details without editing or assigning it",
     repo,
   );
   assert(
-    posts.at(-1)!.text.includes("*Task #") &&
+    !posts.at(-1)!.text.includes("*Task #") &&
       posts.at(-1)!.text.includes("Current description"),
   );
   assert(posts.at(-1)!.thread_ts === event.message_ts && repo.writes === writes);
@@ -1295,8 +1300,8 @@ Deno.test("thread deletion hides the task and delayed command replays cannot res
   await handleMessage(deletion, client, repo);
   assert(repo.writes === 2 && [...repo.rows.values()][0].deleted);
   assert(
-    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
-      posts.at(-1)!.text.includes("Deleted."),
+    posts.at(-1)!.text.includes(task.name) &&
+      posts.at(-1)!.text.includes("Deleted by"),
   );
   assert(posts.at(-1)!.thread_ts === event.message_ts);
   await handleMessage(deletion, client, repo);
@@ -1350,8 +1355,8 @@ Deno.test("numbered deletion denies an unassigned user and permits a current ass
   );
   assert(Number(repo.writes) === 2 && [...repo.rows.values()][0].deleted);
   assert(
-    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
-      posts.at(-1)!.text.includes("Deleted."),
+    posts.at(-1)!.text.includes(task.name) &&
+      posts.at(-1)!.text.includes("Deleted by"),
   );
   assert(posts.at(-1)!.channel === "COTHER" && posts.at(-1)!.thread_ts === "9.3");
 });
@@ -1543,7 +1548,7 @@ Deno.test("edit replaces complete fields and delete clears only the named fields
       replaced.dueDate === "2026-11-07",
   );
   assert(
-    posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("updated") &&
+    !posts.at(-1)!.text.includes("*Task #") && posts.at(-1)!.text.includes("updated") &&
       !posts.at(-1)!.text.includes("Old description"),
   );
   await handleMessage(
@@ -1835,8 +1840,8 @@ Deno.test("deleting a task removes its assignment controls without creating anot
   assert(repo.rows.get(task.id)?.deleted === true);
   assert(notificationPosts.length === 1 && notificationDeletes.length === 1);
   assert(
-    posts.at(-1)!.text.includes(`#${task.number}: ${task.name}`) &&
-      posts.at(-1)!.text.includes("Deleted."),
+    posts.at(-1)!.text.includes(task.name) &&
+      posts.at(-1)!.text.includes("Deleted by"),
   );
 });
 

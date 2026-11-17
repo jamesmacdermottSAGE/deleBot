@@ -338,7 +338,7 @@ Assignment invitations include **Accept**, **Reject**, and **Delegate** buttons:
   directly back to an ancestor rejects that branch; a creator return waits for the other
   branches to finish.
 - **Delegate** opens a modal with one required **People and teams** field. Use `@` to
-  mention people and Slack user groups together, up to 20 combined. Add an optional
+  select people and Slack user groups using the pickers, up to 20 combined. Add an optional
   **Note** below; it is included in each recipient's invitation and omitted when blank.
   Notes are limited to 2,000 characters. Delegation requires an active assignment and viewing permission.
   Direct recipients must already have view permission; delegation does not grant it.
@@ -368,27 +368,14 @@ can list those tasks with `ls collab`. Collaboration does not accept ownership o
 completion/deletion rights. Only the current accepted owner can issue new invitations;
 pending invitations from an owner who changed are closed.
 
-Type `clear` in the main DeleBot DM to clear that chat, or in a DM thread to clear only
-that thread. Channels are refused. The old global datastore scans are replaced with
-scoped queries and bounded work: at most two history pages and eight deletions per
-invocation. Large histories resume from saved progress when you repeat `clear`; the
-response explicitly reports remaining work. Saved tasks, other DMs, and other recipients'
-controls are preserved. Clearing removes stale selection/display records and cleared
-invitation controls. The acknowledgement is posted in the main DM because a cleared
-thread root may no longer exist.
+Type `space` in the main DeleBot DM to print a large visual separator. `clear` has
+been removed. No messages are deleted by `space`.
 
-Slack bot credentials can delete only bot-written messages. To also delete the requesting
-person's own messages, configure their separately authorized Slack user token locally:
-
-```dotenv
-SLACK_CLEAR_USER_TOKENS={"U_REQUESTER_ID":"xoxp-user-authorized-token"}
-```
-
-Set this in the private `.env` loaded by `slack run` (or hosted secret configuration),
-using a real user ID and a user token with `chat:write`. Do not put tokens in task text or
-source control. The bot checks `auth.test` and refuses a token belonging to a different
-user before reading or deleting anything. Without this configuration it reports that
-user messages remain. This does not authorize deleting other people's messages.
+Access starts with the creator only; use `access all` to allow everyone to complete
+or delete a task. Visibility remains controlled separately by `viewPerms`.
+`reopen` is an alias for `incomplete`. Request rejection buttons open an optional
+explanation form; text responses also support `deny reopen More testing is needed`.
+Delegation uses people and team pickers, with up to 20 selections in total.
 
 Each invitation belongs to its recipient. DeleBot checks current task permissions and
 assignment membership again when a button is used. Button availability depends on the
@@ -596,3 +583,15 @@ refresh. Returned assignments keep their distinct return message. Current assign
 only active branches (at most twelve rows); accepted tasks show one owner. Historical
 rejections appear in a separate **Declined** line, grouped by person with repeat counts
 and at most five names. The stored delegation tree remains complete.
+
+### Bug set 3 verification
+
+Restart `slack run` to register the new deletion-actor field and interactive handlers,
+and reopen any existing forms before testing. Existing Access policies are preserved;
+new tasks start with Access granted to their creator.
+
+`deno task test`, `deno task check`, and `deno task lint` cover request/message retries,
+in-place confirmations, deletion attribution, returned assignments, and DM recovery.
+A read-only DM reply is retried once after reopening the conversation. Persistent Slack
+posting restrictions still require checking the app's Messages-tab settings; the
+computer-idle scenario needs live testing.

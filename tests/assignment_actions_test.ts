@@ -249,7 +249,7 @@ Deno.test("accept updates the original DM with task identity and completes only 
   );
   assert(
     f.updates[0].text.includes("Accepted") &&
-      f.updates[0].text.includes(`#${f.task.number}`),
+      !f.updates[0].text.includes(`#${f.task.number}`),
   );
   assert(
     f.updates[0].text.includes("Review &lt;PRs&gt;") && f.updates[0].blocks.length === 0,
@@ -361,7 +361,7 @@ Deno.test("delegation updates its original DM and gives the new assignee an acti
   assert(f.invitation().invitation.status === "delegated");
   assert(
     f.updates[0].text.includes("Delegated to <@UBOB>") &&
-      f.updates[0].text.includes(`#${f.task.number}`),
+      !f.updates[0].text.includes(`#${f.task.number}`),
   );
   assert(
     f.posts.length === 2 && f.posts[1].channel === "DUBOB" &&
@@ -562,10 +562,12 @@ Deno.test("combined delegation mentions support people and teams and forward a n
     blocks: Array<{ block_id: string; optional?: boolean; element: { type: string } }>;
   };
   assert(
-    modal.blocks.length === 2 && modal.blocks[0].block_id === "delegation_recipients",
+    modal.blocks.length === 3 && modal.blocks[0].block_id === "delegation_people",
   );
-  assert(modal.blocks[0].element.type === "rich_text_input" && !modal.blocks[0].optional);
-  assert(modal.blocks[1].block_id === "delegation_note" && modal.blocks[1].optional);
+  assert(
+    modal.blocks[0].element.type === "multi_users_select" && modal.blocks[0].optional,
+  );
+  assert(modal.blocks[2].block_id === "delegation_note" && modal.blocks[2].optional);
   assert(f.invitation("UCAROL").invitation.note === "Please review <@UALICE> & confirm.");
 });
 
@@ -1081,4 +1083,48 @@ Deno.test("Slack Reject and creator Delete callbacks hand off before task mutati
     assert(result.ok, JSON.stringify(result));
   }
   assert(f.repository.rows.get(f.task.id)!.deleted);
+});
+
+Deno.test("native delegation pickers combine multiple people and teams without accepting arbitrary team values", async () => {
+  for (const selectedTeams of [["SBACKEND"], ["not a mention"]]) {
+    const f = await fixture();
+    assert(
+      (await handleAssignmentAction(f.action(ASSIGNMENT_DELEGATE), f.dependencies)).ok,
+    );
+    const result = await handleAssignmentSubmission({
+      privateMetadata:
+        (f.views.at(-1)!.view as { private_metadata: string }).private_metadata,
+      userId: "UALICE",
+      viewId: "V1",
+      executionId: "FXORIGIN",
+      selectedUsers: ["UBOB"],
+      selectedTeams,
+    }, f.dependencies);
+    assert(result.ok === (selectedTeams[0] === "SBACKEND"));
+    if (result.ok) {
+      assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UBOB,SBACKEND");
+    } else assert(f.repository.rows.get(f.task.id)!.assignees.join() === "UALICE");
+  }
+});
+
+Deno.test("a secondary card refresh failure cannot leave accepted invitation controls open", async () => {
+  const f = await fixture();
+  f.dependencies.displays = {
+    track: () => Promise.resolve(),
+    refresh: () => Promise.reject(new Error("old message unavailable")),
+  };
+  const result = await handleAssignmentAction(
+    f.action(ASSIGNMENT_ACCEPT),
+    f.dependencies,
+  );
+  assert(
+    result.ok &&
+      f.repository.rows.get(f.task.id)!.assignmentTree?.acceptedBy === "UALICE",
+  );
+  assert(
+    f.updates.some((message) =>
+      message.channel === "DUALICE" && message.text.includes("Accepted") &&
+      message.blocks.length === 0
+    ),
+  );
 });

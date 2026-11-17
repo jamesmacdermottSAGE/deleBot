@@ -54,6 +54,7 @@ export interface Task extends TaskInput {
   >;
   /** Retained to prevent delayed creation-event replays from restoring a deleted task. */
   deleted?: boolean;
+  deletedBy?: string;
 }
 export type TaskTarget =
   | { kind: "me" }

@@ -24,7 +24,8 @@ export function recipientMentions(value: unknown): string | undefined {
       ) {
         parts.push(`<!subteam^${element.usergroup_id}>`);
       } else if (element.type === "text" && typeof element.text === "string") {
-        parts.push(element.text);
+        if (!/^[\s,]*$/.test(element.text)) return undefined;
+        parts.push(" ");
       } else return undefined;
     }
     parts.push(" ");

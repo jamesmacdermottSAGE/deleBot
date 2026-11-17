@@ -204,7 +204,7 @@ export function transitionAssignmentTree(
     teams: assignees.filter((id) => /^S/.test(id)),
     assignmentTree: result.tree,
     assignmentResponses: responses,
-    ...(result.deleted ? { deleted: true } : {}),
+    ...(result.deleted ? { deleted: true, deletedBy: context.userId } : {}),
     ...(!task.assignmentBased
       ? {
         viewPerms: task.viewPerms ?? effectiveTaskViewPerms(task),
